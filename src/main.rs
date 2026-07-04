@@ -1,11 +1,4 @@
-mod config;
-mod hashing;
-mod category;
-mod catalog;
-mod volume;
-mod scanner;
-mod commands;
-
+use cleanupstorages::commands;
 use clap::{Parser, Subcommand};
 
 /// Reliable catalog + deduplication tool for messy external drives.
