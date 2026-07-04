@@ -696,12 +696,22 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
             container_chain TEXT,
             status         TEXT NOT NULL,
             first_seen_at  INTEGER NOT NULL,
-            last_seen_at   INTEGER NOT NULL,
-            UNIQUE(volume_id, relative_path, container_chain)
+            last_seen_at   INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_files_hash ON files(content_hash);
         CREATE INDEX IF NOT EXISTS idx_files_volume ON files(volume_id);
         CREATE INDEX IF NOT EXISTS idx_files_status ON files(status);
+
+        -- File identity uniqueness. SQLite treats NULL as DISTINCT in a plain
+        -- UNIQUE constraint, so a table-level UNIQUE(..., container_chain) would
+        -- NOT dedupe loose files (container_chain always NULL) and ON CONFLICT
+        -- would never fire. Partial unique indexes express the real key:
+        --   loose files    -> unique on (volume_id, relative_path)
+        --   archive entries -> unique on (volume_id, relative_path, container_chain)
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_files_loose_identity
+            ON files(volume_id, relative_path) WHERE container_chain IS NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_files_archived_identity
+            ON files(volume_id, relative_path, container_chain) WHERE container_chain IS NOT NULL;
 
         CREATE TABLE IF NOT EXISTS scan_errors (
             id         INTEGER PRIMARY KEY,
@@ -740,7 +750,7 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
 }
 ```
 
-Note: `UNIQUE(volume_id, relative_path, container_chain)` treats `NULL` container_chain values as distinct in SQLite, but loose files always have exactly one row per (volume, path) because we upsert by that key explicitly in Task 7 using `container_chain IS NULL`.
+Note: loose-file identity is enforced by the partial unique index `idx_files_loose_identity` on `(volume_id, relative_path) WHERE container_chain IS NULL`. Task 7's `upsert_file` targets this index via `ON CONFLICT(volume_id, relative_path) WHERE container_chain IS NULL`, which is why re-scanning updates the existing row instead of inserting a duplicate.
 
 - [ ] **Step 4: Add the `Catalog` handle in `src/catalog/mod.rs`**
 
@@ -938,7 +948,7 @@ impl Catalog {
                  content_hash, created_time, modified_time, accessed_time, category,
                  container_chain, status, first_seen_at, last_seen_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'active',?12,?12)
-             ON CONFLICT(volume_id, relative_path, container_chain) DO UPDATE SET
+             ON CONFLICT(volume_id, relative_path) WHERE container_chain IS NULL DO UPDATE SET
                  filename=excluded.filename, extension=excluded.extension,
                  size_bytes=excluded.size_bytes, content_hash=excluded.content_hash,
                  created_time=excluded.created_time, modified_time=excluded.modified_time,
