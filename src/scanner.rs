@@ -63,7 +63,19 @@ pub fn scan_volume(
     let mut in_batch = 0usize;
     cat.conn.execute_batch("BEGIN")?;
 
-    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(root) {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                let p = err
+                    .path()
+                    .map(|p| p.strip_prefix(root).unwrap_or(p).to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                cat.log_scan_error(Some(&identity.volume_id), &p, &format!("walk: {err}"), now)?;
+                summary.errors += 1;
+                continue;
+            }
+        };
         if !entry.file_type().is_file() {
             continue;
         }
