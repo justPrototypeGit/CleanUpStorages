@@ -5,6 +5,9 @@ use directories::ProjectDirs;
 pub struct Config {
     pub catalog_path: PathBuf,
     pub snapshot_retention: usize,
+    pub max_archive_depth: usize,
+    pub archive_entry_max_bytes: u64,
+    pub archive_ratio_cap: u64,
 }
 
 impl Config {
@@ -16,6 +19,9 @@ impl Config {
             return Ok(Config {
                 catalog_path: data_dir.join("catalog.db"),
                 snapshot_retention: 10,
+                max_archive_depth: 8,
+                archive_entry_max_bytes: 2 * 1024 * 1024 * 1024,
+                archive_ratio_cap: 200,
             });
         }
 
@@ -26,6 +32,9 @@ impl Config {
         Ok(Config {
             catalog_path: data_dir.join("catalog.db"),
             snapshot_retention: 10,
+            max_archive_depth: 8,
+            archive_entry_max_bytes: 2 * 1024 * 1024 * 1024,
+            archive_ratio_cap: 200,
         })
     }
 
