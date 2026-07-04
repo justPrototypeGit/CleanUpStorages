@@ -324,6 +324,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_stats_returns_shape() {
+        let (_t, db) = seed_catalog();
+        let v = get_json(&db, "/api/stats").await;
+        assert!(v["duplicate_groups"].is_number());
+        assert_eq!(v["volumes"][0]["label"], "Test HDD");
+    }
+
+    #[tokio::test]
     async fn index_page_has_search_ui_and_calls_api() {
         use axum::body::Body;
         use axum::http::Request;
