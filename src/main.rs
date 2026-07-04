@@ -35,6 +35,12 @@ enum Command {
     },
     /// Show catalog statistics (files, duplicate groups, per-volume totals).
     Status,
+    /// Start a local web UI (127.0.0.1) to search and browse the catalog.
+    Browse {
+        /// Do not try to open a browser automatically.
+        #[arg(long)]
+        no_open: bool,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -47,5 +53,6 @@ fn main() -> anyhow::Result<()> {
             commands::cmd_search(&query, category.as_deref(), volume.as_deref(), status.as_deref())
         }
         Command::Status => commands::cmd_status(),
+        Command::Browse { no_open } => commands::cmd_browse(!no_open),
     }
 }

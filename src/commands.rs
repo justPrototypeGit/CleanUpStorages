@@ -7,6 +7,7 @@ use crate::catalog::models::{Volume, FileStatus};
 use crate::volume::{self, ReadonlyMode};
 use crate::scanner;
 use crate::catalog::backup;
+use crate::web;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum ReadonlyFallback { Ask, Fingerprint, Skip }
@@ -94,4 +95,16 @@ pub fn cmd_status() -> anyhow::Result<()> {
         println!("  {label} [{id}]: {count} files, {} MiB", bytes / (1024 * 1024));
     }
     Ok(())
+}
+
+pub fn cmd_browse(open: bool) -> anyhow::Result<()> {
+    let cfg = Config::default_paths()?;
+    let cat = Catalog::open(&cfg.catalog_path)?;
+    if !cat.integrity_ok()? {
+        anyhow::bail!("catalog failed integrity check; restore the latest snapshot from {}",
+            cfg.backups_dir().display());
+    }
+    drop(cat); // handlers open their own short-lived connections
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    rt.block_on(web::serve(cfg.catalog_path.clone(), open))
 }

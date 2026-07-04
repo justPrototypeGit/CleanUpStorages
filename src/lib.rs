@@ -6,3 +6,4 @@ pub mod volume;
 pub mod scanner;
 pub mod commands;
 pub mod archive;
+pub mod web;
