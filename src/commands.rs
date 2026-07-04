@@ -48,8 +48,8 @@ pub fn cmd_scan(path: &Path, force: bool, fallback: ReadonlyFallback) -> anyhow:
     println!("Scanning {} (volume {}, id by {})...",
         path.display(), identity.label, identity.identified_by);
     let s = scanner::scan_volume(&cat, path, &identity, force, now)?;
-    println!("Done: {} hashed, {} unchanged, {} errors, {} newly missing.",
-        s.hashed, s.skipped, s.errors, s.marked_missing);
+    println!("Done: {} hashed, {} unchanged, {} errors, {} newly missing, {} archive entries.",
+        s.hashed, s.skipped, s.errors, s.marked_missing, s.archive_entries);
 
     let snap = backup::snapshot(&cfg.catalog_path, &cfg.backups_dir(), cfg.snapshot_retention, now)?;
     println!("Catalog snapshot: {}", snap.display());
@@ -73,8 +73,12 @@ pub fn cmd_search(query: &str, category: Option<&str>, volume: Option<&str>, sta
             FileStatus::Quarantined => "  [QUARANTINED]",
             FileStatus::Purged => "  [PURGED]",
         };
+        let location = match &f.container_chain {
+            Some(chain) => format!("{} › {}", f.relative_path, chain),
+            None => f.relative_path.clone(),
+        };
         println!("{}  [{}]  {}  ({} bytes){}",
-            f.relative_path, f.volume_id, f.category.as_str(), f.size_bytes, flag);
+            location, f.volume_id, f.category.as_str(), f.size_bytes, flag);
     }
     println!("{} match(es).", hits.len());
     Ok(())
