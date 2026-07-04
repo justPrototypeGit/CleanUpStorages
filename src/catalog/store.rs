@@ -59,13 +59,45 @@ impl Catalog {
         Ok(n > 0)
     }
 
-    /// Flag active loose files on this volume not touched by the current scan as missing.
+    /// Flag active files (loose or archived) on this volume not touched by the current scan as missing.
     pub fn mark_missing_scanned(&self, volume_id: &str, scan_started_at: i64, _now: i64) -> anyhow::Result<usize> {
         let n = self.conn.execute(
             "UPDATE files SET status='missing'
-             WHERE volume_id=?1 AND container_chain IS NULL
-               AND status='active' AND last_seen_at < ?2",
+             WHERE volume_id=?1 AND status='active' AND last_seen_at < ?2",
             params![volume_id, scan_started_at],
+        )?;
+        Ok(n)
+    }
+
+    /// Insert/update one archive entry (a file inside an archive). Identity is
+    /// (volume_id, archive_rel_path, container_chain) via idx_files_archived_identity.
+    pub fn upsert_archive_entry(&self, volume_id: &str, archive_rel_path: &str,
+        e: &crate::archive::ArchiveEntry, now: i64) -> anyhow::Result<()>
+    {
+        self.conn.execute(
+            "INSERT INTO files(volume_id, relative_path, filename, extension, size_bytes,
+                 content_hash, created_time, modified_time, accessed_time, category,
+                 container_chain, status, first_seen_at, last_seen_at)
+             VALUES (?1,?2,?3,?4,?5,?6,NULL,NULL,NULL,?7,?8,'active',?9,?9)
+             ON CONFLICT(volume_id, relative_path, container_chain)
+                 WHERE container_chain IS NOT NULL DO UPDATE SET
+                 filename=excluded.filename, extension=excluded.extension,
+                 size_bytes=excluded.size_bytes, content_hash=excluded.content_hash,
+                 category=excluded.category, status='active', last_seen_at=excluded.last_seen_at",
+            params![volume_id, archive_rel_path, e.filename, e.extension, e.size_bytes,
+                e.content_hash, Category::from_extension(&e.extension).as_str(), e.container_chain, now],
+        )?;
+        Ok(())
+    }
+
+    /// Refresh last_seen/status for every archive entry under one archive file (unchanged-archive skip).
+    pub fn touch_archive_entries(&self, volume_id: &str, archive_rel_path: &str, now: i64)
+        -> anyhow::Result<usize>
+    {
+        let n = self.conn.execute(
+            "UPDATE files SET last_seen_at=?3, status='active'
+             WHERE volume_id=?1 AND relative_path=?2 AND container_chain IS NOT NULL",
+            params![volume_id, archive_rel_path, now],
         )?;
         Ok(n)
     }
@@ -154,6 +186,17 @@ impl Catalog {
 mod tests {
     use crate::catalog::Catalog;
     use crate::catalog::models::*;
+    use crate::archive::ArchiveEntry;
+
+    fn mk_entry(chain: &str, hash: &str) -> ArchiveEntry {
+        ArchiveEntry {
+            container_chain: chain.into(),
+            filename: chain.rsplit(['/', '›']).next().unwrap().trim().into(),
+            extension: "jpg".into(),
+            size_bytes: 42,
+            content_hash: hash.into(),
+        }
+    }
 
     fn mk_file(vol: &str, path: &str, hash: &str) -> NewFile {
         NewFile {
@@ -226,5 +269,49 @@ mod tests {
         assert_eq!(label, "Test HDD");
         assert_eq!(*count, 2);
         assert_eq!(*bytes, 20); // 2 files * size_bytes 10
+    }
+
+    #[test]
+    fn archive_entry_upsert_is_idempotent_and_searchable() {
+        let (_t, cat) = open_tmp();
+        let e = mk_entry("photos.zip › vacation.jpg", "h-vac");
+        cat.upsert_archive_entry("vol-1", "backups/old.zip", &e, 200).unwrap();
+        cat.upsert_archive_entry("vol-1", "backups/old.zip", &e, 250).unwrap(); // same identity again
+        let hits = cat.search("vacation", None, None, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].container_chain.as_deref(), Some("photos.zip › vacation.jpg"));
+        assert_eq!(hits[0].relative_path, "backups/old.zip");
+    }
+
+    #[test]
+    fn archive_entry_dedupes_against_loose_file_by_hash() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_file(&mk_file("vol-1", "loose/vacation.jpg", "same"), 200).unwrap();
+        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("vacation.jpg", "same"), 200).unwrap();
+        assert_eq!(cat.duplicate_group_count().unwrap(), 1); // loose + archived share a hash
+    }
+
+    #[test]
+    fn missing_sweep_covers_archive_entries() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("gone.jpg", "h1"), 200).unwrap();
+        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("kept.jpg", "h2"), 200).unwrap();
+        // rescan at 300 re-sees only kept.jpg
+        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("kept.jpg", "h2"), 300).unwrap();
+        let n = cat.mark_missing_scanned("vol-1", 300, 300).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(cat.search("gone", None, None, Some("missing")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn touch_archive_entries_refreshes_all_under_archive() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("a.jpg", "h1"), 200).unwrap();
+        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("b.jpg", "h2"), 200).unwrap();
+        let touched = cat.touch_archive_entries("vol-1", "old.zip", 300).unwrap();
+        assert_eq!(touched, 2);
+        // after touch, a later sweep starting at 300 does NOT mark them missing
+        let n = cat.mark_missing_scanned("vol-1", 300, 300).unwrap();
+        assert_eq!(n, 0);
     }
 }
