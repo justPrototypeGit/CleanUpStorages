@@ -2,6 +2,19 @@ use crate::catalog::Catalog;
 use crate::catalog::models::*;
 use rusqlite::params;
 
+/// Optional filters for a catalog search/browse. All `None`/empty = match everything.
+#[derive(Default, Debug, Clone)]
+pub struct SearchFilters {
+    pub query: String,
+    pub category: Option<String>,
+    pub volume: Option<String>,
+    pub status: Option<String>,
+    pub min_size: Option<i64>,
+    pub max_size: Option<i64>,
+    pub modified_after: Option<i64>,
+    pub modified_before: Option<i64>,
+}
+
 impl Catalog {
     pub fn upsert_volume(&self, v: &Volume) -> anyhow::Result<()> {
         self.conn.execute(
@@ -133,27 +146,44 @@ impl Catalog {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Search by free text plus optional filters. Empty query returns all (filtered).
+    /// Back-compat wrapper: text + category/volume/status filters, limit 1000.
     pub fn search(&self, query: &str, category: Option<&str>, volume: Option<&str>, status: Option<&str>)
         -> anyhow::Result<Vec<FileRecord>>
     {
+        let f = SearchFilters {
+            query: query.to_string(),
+            category: category.map(str::to_string),
+            volume: volume.map(str::to_string),
+            status: status.map(str::to_string),
+            ..Default::default()
+        };
+        self.search_filtered(&f, 1000)
+    }
+
+    /// Full filtered search over the catalog.
+    pub fn search_filtered(&self, f: &SearchFilters, limit: usize) -> anyhow::Result<Vec<FileRecord>> {
         let mut sql = String::from(
             "SELECT id, volume_id, relative_path, filename, extension, size_bytes, content_hash,
                     created_time, modified_time, accessed_time, category, container_chain,
                     status, first_seen_at, last_seen_at FROM files WHERE 1=1",
         );
         let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        let q = query.trim();
+        let q = f.query.trim();
         if !q.is_empty() {
             sql.push_str(" AND id IN (SELECT rowid FROM files_fts WHERE files_fts MATCH ?)");
             // FTS prefix match on each token
             let match_expr = q.split_whitespace().map(|t| format!("{t}*")).collect::<Vec<_>>().join(" ");
             args.push(Box::new(match_expr));
         }
-        if let Some(c) = category { sql.push_str(" AND category = ?"); args.push(Box::new(c.to_string())); }
-        if let Some(v) = volume { sql.push_str(" AND volume_id = ?"); args.push(Box::new(v.to_string())); }
-        if let Some(s) = status { sql.push_str(" AND status = ?"); args.push(Box::new(s.to_string())); }
-        sql.push_str(" ORDER BY relative_path LIMIT 1000");
+        if let Some(c) = &f.category { sql.push_str(" AND category = ?"); args.push(Box::new(c.clone())); }
+        if let Some(v) = &f.volume { sql.push_str(" AND volume_id = ?"); args.push(Box::new(v.clone())); }
+        if let Some(s) = &f.status { sql.push_str(" AND status = ?"); args.push(Box::new(s.clone())); }
+        if let Some(n) = f.min_size { sql.push_str(" AND size_bytes >= ?"); args.push(Box::new(n)); }
+        if let Some(n) = f.max_size { sql.push_str(" AND size_bytes <= ?"); args.push(Box::new(n)); }
+        if let Some(n) = f.modified_after { sql.push_str(" AND modified_time >= ?"); args.push(Box::new(n)); }
+        if let Some(n) = f.modified_before { sql.push_str(" AND modified_time <= ?"); args.push(Box::new(n)); }
+        sql.push_str(" ORDER BY relative_path LIMIT ?");
+        args.push(Box::new(limit as i64));
 
         let mut stmt = self.conn.prepare(&sql)?;
         let arg_refs: Vec<&dyn rusqlite::types::ToSql> = args.iter().map(|b| b.as_ref()).collect();
@@ -186,6 +216,7 @@ impl Catalog {
 mod tests {
     use crate::catalog::Catalog;
     use crate::catalog::models::*;
+    use crate::catalog::store::SearchFilters;
     use crate::archive::ArchiveEntry;
 
     fn mk_entry(chain: &str, hash: &str) -> ArchiveEntry {
@@ -313,6 +344,29 @@ mod tests {
         // after touch, a later sweep starting at 300 does NOT mark them missing
         let n = cat.mark_missing_scanned("vol-1", 300, 300).unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn search_filtered_applies_size_and_status() {
+        let (_t, cat) = open_tmp();
+        let mut small = mk_file("vol-1", "small.txt", "h1"); small.size_bytes = 10;
+        let mut big = mk_file("vol-1", "big.txt", "h2"); big.size_bytes = 5000;
+        cat.upsert_file(&small, 200).unwrap();
+        cat.upsert_file(&big, 200).unwrap();
+
+        let f = SearchFilters { min_size: Some(1000), ..Default::default() };
+        let hits = cat.search_filtered(&f, 100).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].filename, "big.txt");
+    }
+
+    #[test]
+    fn search_filtered_empty_query_returns_all_filtered() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_file(&mk_file("vol-1", "a.txt", "h1"), 200).unwrap();
+        cat.upsert_file(&mk_file("vol-1", "b.txt", "h2"), 200).unwrap();
+        let hits = cat.search_filtered(&SearchFilters::default(), 100).unwrap();
+        assert_eq!(hits.len(), 2); // empty query = browse all
     }
 
     #[test]
