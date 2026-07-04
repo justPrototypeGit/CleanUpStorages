@@ -49,6 +49,16 @@ impl Catalog {
         Ok(())
     }
 
+    /// Refresh last_seen/status for an unchanged file without re-hashing. Returns true if a row matched.
+    pub fn touch_seen(&self, volume_id: &str, relative_path: &str, now: i64) -> anyhow::Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE files SET last_seen_at=?3, status='active'
+             WHERE volume_id=?1 AND relative_path=?2 AND container_chain IS NULL",
+            rusqlite::params![volume_id, relative_path, now],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Flag active loose files on this volume not touched by the current scan as missing.
     pub fn mark_missing_scanned(&self, volume_id: &str, scan_started_at: i64, _now: i64) -> anyhow::Result<usize> {
         let n = self.conn.execute(
