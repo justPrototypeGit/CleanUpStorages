@@ -5,7 +5,6 @@ use directories::ProjectDirs;
 pub struct Config {
     pub catalog_path: PathBuf,
     pub snapshot_retention: usize,
-    pub batch_size: usize,
 }
 
 impl Config {
@@ -17,7 +16,6 @@ impl Config {
             return Ok(Config {
                 catalog_path: data_dir.join("catalog.db"),
                 snapshot_retention: 10,
-                batch_size: 200,
             });
         }
 
@@ -28,7 +26,6 @@ impl Config {
         Ok(Config {
             catalog_path: data_dir.join("catalog.db"),
             snapshot_retention: 10,
-            batch_size: 200,
         })
     }
 
@@ -49,7 +46,6 @@ mod tests {
     fn defaults_are_sane() {
         let cfg = Config::default_paths().unwrap();
         assert_eq!(cfg.snapshot_retention, 10);
-        assert_eq!(cfg.batch_size, 200);
         assert!(cfg.catalog_path.ends_with("catalog.db"));
         // backups dir is a sibling "catalog.backups" of the catalog file
         assert!(cfg.backups_dir().ends_with("catalog.backups"));

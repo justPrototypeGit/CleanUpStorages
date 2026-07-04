@@ -70,19 +70,6 @@ impl Catalog {
         Ok(n)
     }
 
-    pub fn active_file_id(&self, volume_id: &str, relative_path: &str) -> anyhow::Result<Option<i64>> {
-        let row = self.conn.query_row(
-            "SELECT id FROM files WHERE volume_id=?1 AND relative_path=?2 AND container_chain IS NULL",
-            params![volume_id, relative_path],
-            |r| r.get::<_, i64>(0),
-        );
-        match row {
-            Ok(id) => Ok(Some(id)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
     pub fn log_scan_error(&self, volume_id: Option<&str>, path: &str, reason: &str, now: i64) -> anyhow::Result<()> {
         self.conn.execute(
             "INSERT INTO scan_errors(volume_id, path, reason, occurred_at) VALUES (?1,?2,?3,?4)",
