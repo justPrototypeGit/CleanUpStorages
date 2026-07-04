@@ -62,6 +62,18 @@ On first sight of a drive, the scanner writes a small hidden marker file to its 
 same physical drive regardless of the letter/mount point the OS assigns (E: today, F: tomorrow). Fully
 cross-platform; avoids inconsistent OS volume-serial APIs.
 
+**Read-only / write-protected / failing drives (can't write the marker):** the tool never silently fails or
+mis-identifies. When it cannot write the marker, it **pauses and asks the user per drive**:
+
+- **Proceed read-only** — identify the drive by a computed **fingerprint** (OS volume serial + total filesystem
+  size + label) instead of a marker. The catalog records that this volume is *marker-less, identified by
+  fingerprint* (slightly less robust than a marker across reformats, but never blocks a scan). The drive is
+  never written to.
+- **Skip this drive** — leave it uncatalogued for now.
+
+For unattended/batch scanning, a CLI flag can pre-answer this (e.g. `--readonly-fallback=fingerprint|skip`) so
+a run over many read-only drives isn't interrupted. Absent the flag, the default is to ask interactively.
+
 ## 5. Catalog data model
 
 - **`volumes`** — `volume_id` (UUID from marker), `label`, `first_seen_at`, `last_seen_at`.
@@ -75,6 +87,21 @@ cross-platform; avoids inconsistent OS volume-serial APIs.
 - **`actions_log`** — append-only audit trail of every consequential action (scan run, quarantine move,
   confirmation, repack, purge): old path/status → new path/status, timestamp, and context. The authoritative
   "what did the tool do, and when" record.
+
+## 5a. Catalog durability (the register is the crown jewel)
+
+The catalog is the only record of what lives on drives that aren't currently plugged in, so its own integrity is
+treated as critically as the user's files:
+
+- **WAL mode:** SQLite runs in write-ahead-logging mode for crash-resilient writes — an interrupted write
+  (crash, power loss, laptop sleep) cannot leave the database structurally corrupted.
+- **Auto-backup snapshots:** the tool saves a timestamped copy of the catalog **after each scan** and
+  **before every bulk/destructive operation** (quarantine batches, Case-4 repacks, purges), into a local
+  `catalog.backups/` directory (on the computer, not the HDDs). It keeps the last **N** snapshots (configurable)
+  and prunes older ones. If the live DB is ever corrupted or a bad operation slips through, the user can roll
+  back to the latest good snapshot.
+- **Integrity check:** the tool runs a quick `PRAGMA integrity_check` on startup and after bulk operations; a
+  failure surfaces immediately with guidance to restore from the latest snapshot.
 
 ## 6. Scanning behavior
 
@@ -182,7 +209,22 @@ cases are reported for the user to handle deliberately.
   drive to reclaim → then there's headroom for repacks/reorganization. Reclaim early, work incrementally, one
   drive at a time.
 
-## 12. Review GUI
+## 12. Register / search interface
+
+The catalog is only useful if the user can find things in it (goal #1: "find data without knowing what I
+have"). Search is exposed **two ways**, sharing the same catalog:
+
+- **Web UI search/browse screen** (in the same local web app as review): free-text match on
+  filename/path/keyword, with filters for drive/volume, `category`, date range, size, and `status`. Results
+  show the file's location — drive label + path, or full `container_chain` for archived items — **even for
+  drives not currently plugged in** (the catalog persists), and clearly flag `missing`/`quarantined` items.
+- **CLI search** (`cleanupstorages search <query> [--category …] [--volume …] [--status …]`): prints matching
+  files and their locations to the terminal for quick lookups without a browser.
+
+Both read the same catalog and present the same location info (including archive nesting and offline-drive
+results). Backed by a SQLite full-text index over filename/path for responsive search.
+
+## 13. Review GUI
 
 Local web page served at `127.0.0.1:PORT`. Duplicate groups are queued for review. Per group: a WinMerge-style
 side-by-side compare (image thumbnails/preview for photos, metadata diff for everything, full `container_chain`
@@ -190,16 +232,32 @@ for archived items) and a Tinder-style decision (keep-which / quarantine-which /
 "original to keep" defaults to the earliest creation time / most complete metadata, always user-overridable.
 Nothing is destructive until confirmed; every confirmation writes to `actions_log`.
 
-## 13. Phasing
+## 14. Phasing
 
-1. **Phase 1 — Catalog + exact dedup detection:** scanner (incl. recursive archives), catalog, duplicate report.
-   Useful on its own (full searchable inventory immediately).
+1. **Phase 1 — Catalog + exact dedup detection + search:** scanner (incl. recursive archives), catalog,
+   duplicate report, and the register search (CLI `search` + web browse screen). Useful on its own — the full
+   searchable inventory is available immediately, before any dedup review exists.
 2. **Phase 2 — Review GUI + soft-delete/quarantine + Case 1–4 workflows.**
 3. **Phase 3 — Reorganization** into a well-organized structure, always with confirmation. Target structure is
    deliberately **not** decided yet; the catalog captures enough metadata (category, dates, source volume,
    origin) to decide the scheme when we get there.
 
-## 14. Explicitly out of scope (for now)
+## 15. Configuration & defaults
+
+All tunables live in a config file (with CLI overrides). Sensible defaults, all adjustable:
+
+| Setting | Default | Notes |
+| --- | --- | --- |
+| Catalog location | `catalog.db` in the app's data dir on the computer | Never on the HDDs. |
+| Snapshot retention (`N`) | 10 | Number of `catalog.backups/` snapshots kept before pruning. |
+| Max archive nesting depth | 8 | Deeper branches logged to `scan_errors`, not descended. |
+| Zip-bomb ratio cap | e.g. 100× decompressed:compressed, + absolute size cap | Exceeding → logged + skipped. |
+| Review server bind | `127.0.0.1`, auto-selected free port | Localhost only, no network exposure. |
+| Read-only marker fallback | ask interactively | Overridable via `--readonly-fallback=fingerprint|skip`. |
+| Scratch location (Case-4 repack) | none until set; else pre-flight space check on the drive | Set to a drive with free space for repacks on near-full disks. |
+| Category mapping | extension → photo/document/academic/video/other | Default mapping, user-editable. |
+
+## 16. Explicitly out of scope (for now)
 
 - Near-duplicate (non-exact) detection — deferred to a later phase, always human-confirmed.
 - Automatic repacking of *nested* archives to remove inner entries — reported only.
