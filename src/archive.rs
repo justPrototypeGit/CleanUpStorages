@@ -71,6 +71,24 @@ fn read_capped<R: Read>(mut reader: R, cap: u64) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
+/// Stream-hash a reader in 64 KiB chunks, enforcing an actual-byte cap.
+/// Returns (lowercase-hex hash, bytes_read), or Err if the stream exceeds `cap`.
+fn hash_capped<R: Read>(mut reader: R, cap: u64) -> Result<(String, u64), String> {
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut total: u64 = 0;
+    loop {
+        let n = reader.read(&mut buf).map_err(|e| format!("read error: {e}"))?;
+        if n == 0 { break; }
+        total += n as u64;
+        if total > cap {
+            return Err(format!("zip bomb: decompressed content exceeds cap {cap}"));
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok((hasher.finalize().to_hex().to_string(), total))
+}
+
 /// Scan an archive (recursively) from a seekable reader. Leaf files are stream-hashed; nested
 /// archives are buffered (bounded by `limits.entry_max_bytes`) and descended into up to
 /// `limits.max_depth` levels. Entries exceeding the zip-bomb caps are skipped with an error note.
@@ -139,7 +157,7 @@ fn scan_level<R: Read + Seek>(reader: R, chain_prefix: &str, depth: usize,
             };
             result.entries.push(ArchiveEntry {
                 container_chain: chain.clone(), filename, extension,
-                size_bytes: uncompressed as i64, content_hash,
+                size_bytes: bytes.len() as i64, content_hash,
             });
             if depth >= limits.max_depth {
                 result.errors.push((chain, format!("max archive depth exceeded ({} levels)", limits.max_depth)));
@@ -147,15 +165,16 @@ fn scan_level<R: Read + Seek>(reader: R, chain_prefix: &str, depth: usize,
             }
             scan_level(std::io::Cursor::new(bytes), &chain, depth + 1, limits, result);
         } else {
-            // Leaf file: stream-hash directly, never buffering the whole entry into memory.
-            let content_hash = match hashing::hash_reader(&mut entry) {
-                Ok(h) => h,
-                Err(e) => { result.errors.push((chain, format!("read error: {e}"))); continue; }
-            };
-            result.entries.push(ArchiveEntry {
-                container_chain: chain, filename, extension,
-                size_bytes: uncompressed as i64, content_hash,
-            });
+            // Leaf file: stream-hash with an actual-byte cap (declared size may lie); record the TRUE length.
+            match hash_capped(&mut entry, limits.entry_max_bytes) {
+                Ok((content_hash, actual)) => {
+                    result.entries.push(ArchiveEntry {
+                        container_chain: chain, filename, extension,
+                        size_bytes: actual as i64, content_hash,
+                    });
+                }
+                Err(reason) => { result.errors.push((chain, reason)); }
+            }
         }
     }
 }

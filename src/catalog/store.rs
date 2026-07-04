@@ -96,7 +96,7 @@ impl Catalog {
     {
         let n = self.conn.execute(
             "UPDATE files SET last_seen_at=?3, status='active'
-             WHERE volume_id=?1 AND relative_path=?2 AND container_chain IS NOT NULL",
+             WHERE volume_id=?1 AND relative_path=?2 AND container_chain IS NOT NULL AND status='active'",
             params![volume_id, archive_rel_path, now],
         )?;
         Ok(n)
@@ -313,5 +313,20 @@ mod tests {
         // after touch, a later sweep starting at 300 does NOT mark them missing
         let n = cat.mark_missing_scanned("vol-1", 300, 300).unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn touch_does_not_resurrect_missing_archive_entries() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("a.jpg", "h1"), 200).unwrap();
+        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("gone.jpg", "h2"), 200).unwrap();
+        // rescan at 300 re-sees only a.jpg -> gone.jpg swept to missing
+        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("a.jpg", "h1"), 300).unwrap();
+        cat.mark_missing_scanned("vol-1", 300, 300).unwrap();
+        assert_eq!(cat.search("gone", None, None, Some("missing")).unwrap().len(), 1);
+        // a later incremental-skip touch must NOT resurrect gone.jpg
+        cat.touch_archive_entries("vol-1", "old.zip", 400).unwrap();
+        assert_eq!(cat.search("gone", None, None, Some("missing")).unwrap().len(), 1);
+        assert_eq!(cat.search("gone", None, None, Some("active")).unwrap().len(), 0);
     }
 }
