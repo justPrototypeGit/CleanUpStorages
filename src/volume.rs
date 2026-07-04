@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::path::Path;
 
-const MARKER: &str = ".cleanupstorages_id";
+pub const MARKER: &str = ".cleanupstorages_id";
 
 #[derive(Debug, Clone)]
 pub struct VolumeIdentity {
@@ -59,9 +59,10 @@ fn read_marker(root: &Path) -> Option<String> {
 }
 
 fn try_write_marker(root: &Path) -> std::io::Result<String> {
+    use std::fs::OpenOptions;
     let id = uuid::Uuid::new_v4().to_string();
     let p = root.join(MARKER);
-    let mut f = std::fs::File::create(&p)?;
+    let mut f = OpenOptions::new().write(true).create_new(true).open(&p)?;
     f.write_all(id.as_bytes())?;
     f.sync_all()?;
     Ok(id)
