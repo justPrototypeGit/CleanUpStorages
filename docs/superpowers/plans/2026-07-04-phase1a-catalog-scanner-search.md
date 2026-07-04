@@ -900,7 +900,6 @@ Expected: FAIL — methods not found.
 Replace `src/catalog/store.rs` contents:
 
 ```rust
-use std::collections::HashSet; // kept for signature compatibility if needed
 use crate::catalog::Catalog;
 use crate::catalog::models::*;
 use rusqlite::params;
@@ -1055,13 +1054,7 @@ impl Catalog {
         })
     }
 }
-
-// Silence unused import when HashSet is not referenced by signatures.
-#[allow(unused_imports)]
-use HashSet as _UnusedHashSet;
 ```
-
-Remove the unused `HashSet` import if `cargo build` warns; it is only there defensively. Prefer deleting the `use std::collections::HashSet;` line and the alias if unused.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
