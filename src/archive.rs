@@ -55,15 +55,41 @@ fn entry_extension(name: &str) -> String {
     }
 }
 
-/// Scan ONE archive level from a seekable reader. Leaf files are hashed; entries exceeding the
-/// zip-bomb caps are skipped with an error note. Nested archives are NOT descended here (Task 3).
+/// Join a parent chain and a child name with the guillemet separator.
+fn join_chain(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() { name.to_string() } else { format!("{prefix} › {name}") }
+}
+
+/// Read up to `cap` bytes; `Err` if the stream exceeds `cap` (bomb guard for buffering).
+fn read_capped<R: Read>(mut reader: R, cap: u64) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    let mut limited = (&mut reader).take(cap + 1);
+    limited.read_to_end(&mut buf).map_err(|e| format!("read error: {e}"))?;
+    if buf.len() as u64 > cap {
+        return Err(format!("zip bomb: nested archive exceeds cap {cap}"));
+    }
+    Ok(buf)
+}
+
+/// Scan an archive (recursively) from a seekable reader. Leaf files are stream-hashed; nested
+/// archives are buffered (bounded by `limits.entry_max_bytes`) and descended into up to
+/// `limits.max_depth` levels. Entries exceeding the zip-bomb caps are skipped with an error note.
 pub fn scan_archive<R: Read + Seek>(reader: R, limits: &ArchiveLimits) -> ArchiveScanResult {
     let mut result = ArchiveScanResult::default();
+    scan_level(reader, "", 1, limits, &mut result);
+    result
+}
+
+/// Scan one archive level. `chain_prefix` is the container chain of THIS archive ("" at top level);
+/// `depth` is 1 for a top-level archive. Recurses into nested `.zip` entries until `max_depth`.
+fn scan_level<R: Read + Seek>(reader: R, chain_prefix: &str, depth: usize,
+    limits: &ArchiveLimits, result: &mut ArchiveScanResult)
+{
     let mut archive = match zip::ZipArchive::new(reader) {
         Ok(a) => a,
         Err(e) => {
-            result.errors.push((String::new(), format!("unreadable archive: {e}")));
-            return result;
+            result.errors.push((chain_prefix.to_string(), format!("unreadable archive: {e}")));
+            return;
         }
     };
 
@@ -71,7 +97,8 @@ pub fn scan_archive<R: Read + Seek>(reader: R, limits: &ArchiveLimits) -> Archiv
         let mut entry = match archive.by_index(i) {
             Ok(e) => e,
             Err(e) => {
-                result.errors.push((format!("#{i}"), format!("unreadable archive entry: {e}")));
+                result.errors.push((join_chain(chain_prefix, &format!("#{i}")),
+                    format!("unreadable archive entry: {e}")));
                 continue;
             }
         };
@@ -79,44 +106,58 @@ pub fn scan_archive<R: Read + Seek>(reader: R, limits: &ArchiveLimits) -> Archiv
             continue;
         }
         let name = entry.name().to_string();
+        let chain = join_chain(chain_prefix, &name);
         let uncompressed = entry.size();
         let compressed = entry.compressed_size().max(1);
 
         // Zip-bomb guards (declared sizes).
         if uncompressed > limits.entry_max_bytes {
-            result.errors.push((
-                name.clone(),
-                format!("zip bomb: {uncompressed} bytes exceeds cap {}", limits.entry_max_bytes),
-            ));
+            result.errors.push((chain,
+                format!("zip bomb: {uncompressed} bytes exceeds cap {}", limits.entry_max_bytes)));
             continue;
         }
         if uncompressed / compressed > limits.ratio_cap {
-            result.errors.push((
-                name.clone(),
-                format!("zip bomb: ratio {} exceeds cap {}", uncompressed / compressed, limits.ratio_cap),
-            ));
+            result.errors.push((chain,
+                format!("zip bomb: ratio {} exceeds cap {}", uncompressed / compressed, limits.ratio_cap)));
             continue;
         }
 
         let filename = name.rsplit('/').next().unwrap_or(&name).to_string();
         let extension = entry_extension(&name);
-        let content_hash = match hashing::hash_reader(&mut entry) {
-            Ok(h) => h,
-            Err(e) => {
-                result.errors.push((name.clone(), format!("read error: {e}")));
+
+        if is_archive_name(&name) {
+            // Nested archive: buffer it (bounded) so we can BOTH hash it and re-open it with Seek
+            // to recurse. Only archives are buffered — large leaf files stream (see else branch).
+            let bytes = match read_capped(&mut entry, limits.entry_max_bytes) {
+                Ok(b) => b,
+                Err(reason) => { result.errors.push((chain, reason)); continue; }
+            };
+            let mut slice: &[u8] = &bytes;
+            let content_hash = match hashing::hash_reader(&mut slice) {
+                Ok(h) => h,
+                Err(e) => { result.errors.push((chain, format!("read error: {e}"))); continue; }
+            };
+            result.entries.push(ArchiveEntry {
+                container_chain: chain.clone(), filename, extension,
+                size_bytes: uncompressed as i64, content_hash,
+            });
+            if depth >= limits.max_depth {
+                result.errors.push((chain, format!("max archive depth exceeded ({} levels)", limits.max_depth)));
                 continue;
             }
-        };
-        result.entries.push(ArchiveEntry {
-            container_chain: name,
-            filename,
-            extension,
-            size_bytes: uncompressed as i64,
-            content_hash,
-        });
+            scan_level(std::io::Cursor::new(bytes), &chain, depth + 1, limits, result);
+        } else {
+            // Leaf file: stream-hash directly, never buffering the whole entry into memory.
+            let content_hash = match hashing::hash_reader(&mut entry) {
+                Ok(h) => h,
+                Err(e) => { result.errors.push((chain, format!("read error: {e}"))); continue; }
+            };
+            result.entries.push(ArchiveEntry {
+                container_chain: chain, filename, extension,
+                size_bytes: uncompressed as i64, content_hash,
+            });
+        }
     }
-
-    result
 }
 
 #[cfg(test)]
@@ -189,5 +230,49 @@ mod tests {
         assert!(res.entries.is_empty());
         assert_eq!(res.errors.len(), 1);
         assert!(res.errors[0].1.contains("zip bomb"), "reason: {}", res.errors[0].1);
+    }
+
+    // Wrap an existing zip's bytes as a single entry inside an outer zip.
+    fn nest_zip(inner_name: &str, inner_zip: Vec<u8>, alongside: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut zw = zip::ZipWriter::new(&mut buf);
+            let opts: zip::write::FileOptions<()> =
+                zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            zw.start_file(inner_name, opts).unwrap();
+            zw.write_all(&inner_zip).unwrap();
+            for (name, bytes) in alongside {
+                zw.start_file(*name, opts).unwrap();
+                zw.write_all(bytes).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    #[test]
+    fn descends_into_nested_archive() {
+        let inner = make_zip(&[("vacation.jpg", b"pixels")]);
+        let outer = nest_zip("photos.zip", inner, &[("readme.txt", b"hi")]);
+        let res = scan_archive(Cursor::new(outer), &limits());
+        assert!(res.errors.is_empty(), "errors: {:?}", res.errors);
+        // readme.txt (direct) + vacation.jpg (nested); the inner photos.zip itself is also an entry
+        let jpg = res.entries.iter().find(|e| e.filename == "vacation.jpg").unwrap();
+        assert_eq!(jpg.container_chain, "photos.zip › vacation.jpg");
+        assert!(res.entries.iter().any(|e| e.container_chain == "readme.txt"));
+        // the nested archive is itself catalogued as an entry (an identical inner zip is a dup)
+        assert!(res.entries.iter().any(|e| e.container_chain == "photos.zip"));
+    }
+
+    #[test]
+    fn stops_at_max_depth() {
+        let inner = make_zip(&[("deep.txt", b"x")]);
+        let outer = nest_zip("mid.zip", inner, &[]);
+        // max_depth = 1: the top archive's direct entries are scanned, but mid.zip is not descended.
+        let shallow = ArchiveLimits { max_depth: 1, entry_max_bytes: 2 * 1024 * 1024 * 1024, ratio_cap: 200 };
+        let res = scan_archive(Cursor::new(outer), &shallow);
+        assert!(res.entries.iter().any(|e| e.container_chain == "mid.zip")); // still catalogued as a file
+        assert!(!res.entries.iter().any(|e| e.filename == "deep.txt")); // not descended
+        assert!(res.errors.iter().any(|(_, r)| r.contains("max archive depth")));
     }
 }
