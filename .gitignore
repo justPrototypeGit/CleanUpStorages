@@ -22,3 +22,7 @@ desktop.ini
 /.idea/
 /.vscode/
 *.swp
+
+# Per-drive identity marker written by `volume::resolve` (created wherever a drive is scanned,
+# including the repo root during manual smoke tests)
+.cleanupstorages_id
