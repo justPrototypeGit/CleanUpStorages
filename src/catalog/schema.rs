@@ -27,12 +27,15 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
             container_chain TEXT,
             status         TEXT NOT NULL,
             first_seen_at  INTEGER NOT NULL,
-            last_seen_at   INTEGER NOT NULL,
-            UNIQUE(volume_id, relative_path, container_chain)
+            last_seen_at   INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_files_hash ON files(content_hash);
         CREATE INDEX IF NOT EXISTS idx_files_volume ON files(volume_id);
         CREATE INDEX IF NOT EXISTS idx_files_status ON files(status);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_files_loose_identity
+            ON files(volume_id, relative_path) WHERE container_chain IS NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_files_archived_identity
+            ON files(volume_id, relative_path, container_chain) WHERE container_chain IS NOT NULL;
 
         CREATE TABLE IF NOT EXISTS scan_errors (
             id         INTEGER PRIMARY KEY,
