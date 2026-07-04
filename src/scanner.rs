@@ -1,9 +1,11 @@
 use std::path::Path;
 use walkdir::WalkDir;
 
+use crate::archive::{self, ArchiveLimits};
 use crate::catalog::Catalog;
 use crate::catalog::models::NewFile;
 use crate::category::Category;
+use crate::config::Config;
 use crate::hashing;
 use crate::volume::VolumeIdentity;
 
@@ -17,6 +19,7 @@ pub struct ScanSummary {
     pub skipped: usize,
     pub errors: usize,
     pub marked_missing: usize,
+    pub archive_entries: usize,
 }
 
 /// Metadata timestamp (best-effort) as seconds since UNIX_EPOCH.
@@ -58,6 +61,7 @@ pub fn scan_volume(
     cat: &Catalog, root: &Path, identity: &VolumeIdentity, force: bool, now: i64,
 ) -> anyhow::Result<ScanSummary> {
     let scan_started_at = now;
+    let limits = ArchiveLimits::from_config(&Config::default_paths()?);
     let mut summary = ScanSummary::default();
     let mut in_batch = 0usize;
     cat.conn.execute_batch("BEGIN")?;
@@ -102,6 +106,9 @@ pub fn scan_volume(
             if let Some((old_size, old_mtime)) = cat.get_file_meta(&identity.volume_id, &rel)? {
                 if old_size == size && old_mtime == mtime.unwrap_or(0) {
                     cat.touch_seen(&identity.volume_id, &rel, now)?;
+                    if archive::is_archive_name(&rel) {
+                        cat.touch_archive_entries(&identity.volume_id, &rel, now)?;
+                    }
                     summary.skipped += 1;
                     in_batch += 1;
                     rotate_batch(cat, &mut in_batch)?;
@@ -138,11 +145,43 @@ pub fn scan_volume(
         summary.hashed += 1;
         in_batch += 1;
         rotate_batch(cat, &mut in_batch)?;
+
+        if archive::is_archive_name(&rel) {
+            descend_archive(cat, path, &rel, identity, &limits, now, &mut summary, &mut in_batch)?;
+        }
     }
 
     cat.conn.execute_batch("COMMIT")?;
     summary.marked_missing = cat.mark_missing_scanned(&identity.volume_id, scan_started_at, now)?;
     Ok(summary)
+}
+
+/// Open an on-disk archive file, catalog each entry, and log each non-fatal error.
+fn descend_archive(
+    cat: &Catalog, path: &Path, rel: &str, identity: &VolumeIdentity,
+    limits: &ArchiveLimits, now: i64, summary: &mut ScanSummary, in_batch: &mut usize,
+) -> anyhow::Result<()> {
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            cat.log_scan_error(Some(&identity.volume_id), rel, &format!("archive open: {e}"), now)?;
+            summary.errors += 1;
+            return Ok(());
+        }
+    };
+    let res = archive::scan_archive(file, limits);
+    for entry in &res.entries {
+        cat.upsert_archive_entry(&identity.volume_id, rel, entry, now)?;
+        summary.archive_entries += 1;
+        *in_batch += 1;
+        rotate_batch(cat, in_batch)?;
+    }
+    for (ctx, reason) in &res.errors {
+        let where_ = if ctx.is_empty() { rel.to_string() } else { format!("{rel} › {ctx}") };
+        cat.log_scan_error(Some(&identity.volume_id), &where_, reason, now)?;
+        summary.errors += 1;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -202,5 +241,52 @@ mod tests {
         assert_eq!(s.marked_missing, 1);
         assert_eq!(cat.search("gone", None, None, Some("missing")).unwrap().len(), 1);
         assert_eq!(cat.search("keep", None, None, Some("active")).unwrap().len(), 1);
+    }
+
+    use std::io::Write as _;
+
+    fn write_zip_file(path: &std::path::Path, files: &[(&str, &[u8])]) {
+        let f = fs::File::create(path).unwrap();
+        let mut zw = zip::ZipWriter::new(f);
+        let opts: zip::write::FileOptions<()> =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, bytes) in files {
+            zw.start_file(*name, opts).unwrap();
+            zw.write_all(bytes).unwrap();
+        }
+        zw.finish().unwrap();
+    }
+
+    #[test]
+    fn scan_catalogs_archive_entries() {
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        fs::create_dir_all(&root).unwrap();
+        write_zip_file(&root.join("photos.zip"), &[("trip/beach.jpg", b"sand"), ("note.txt", b"hi")]);
+
+        let s = scan_volume(&cat, &root, &ident(), false, 100).unwrap();
+        // the zip file itself is a loose hashed file
+        assert_eq!(s.hashed, 1);
+        // its two entries are catalogued
+        assert_eq!(s.archive_entries, 2);
+        // inner file is searchable, with its container chain
+        let hits = cat.search("beach", None, None, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].relative_path, "photos.zip");
+        assert_eq!(hits[0].container_chain.as_deref(), Some("trip/beach.jpg"));
+    }
+
+    #[test]
+    fn unchanged_archive_entries_survive_rescan() {
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        fs::create_dir_all(&root).unwrap();
+        write_zip_file(&root.join("a.zip"), &[("x.txt", b"one")]);
+        scan_volume(&cat, &root, &ident(), false, 100).unwrap();
+
+        // rescan unchanged: archive is skipped, but its entry must NOT be swept to missing
+        let s = scan_volume(&cat, &root, &ident(), false, 200).unwrap();
+        assert_eq!(s.marked_missing, 0);
+        assert_eq!(cat.search("x", None, None, Some("active")).unwrap().len(), 1);
     }
 }
