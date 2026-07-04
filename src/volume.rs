@@ -143,4 +143,42 @@ mod tests {
         assert_eq!(a, b);
         assert!(a.starts_with("fp-"));
     }
+
+    #[test]
+    fn readonly_fingerprint_fallback_does_not_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker_path = tmp.path().join(MARKER);
+
+        // Create .cleanupstorages_id as a directory to block file writes
+        std::fs::create_dir(&marker_path).unwrap();
+        assert!(marker_path.is_dir());
+
+        // Resolve should fall back to fingerprint and NOT write
+        let identity = resolve(tmp.path(), ReadonlyMode::Fingerprint)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(identity.identified_by, "fingerprint");
+        assert!(identity.volume_id.starts_with("fp-"));
+
+        // Marker should still be a directory (no file was written)
+        assert!(marker_path.is_dir());
+    }
+
+    #[test]
+    fn readonly_skip_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker_path = tmp.path().join(MARKER);
+
+        // Create .cleanupstorages_id as a directory to block file writes
+        std::fs::create_dir(&marker_path).unwrap();
+        assert!(marker_path.is_dir());
+
+        // Resolve should return Ok(None) when asked to skip
+        let result = resolve(tmp.path(), ReadonlyMode::Skip).unwrap();
+        assert!(result.is_none());
+
+        // Marker should still be a directory (no file was written)
+        assert!(marker_path.is_dir());
+    }
 }
