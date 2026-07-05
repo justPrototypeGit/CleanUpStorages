@@ -37,6 +37,7 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/search", get(api_search))
         .route("/api/volumes", get(api_volumes))
         .route("/api/stats", get(api_stats))
+        .route("/api/duplicates", get(api_duplicates))
         .with_state(state)
 }
 
@@ -231,6 +232,62 @@ async fn api_stats(State(state): State<AppState>)
     Ok(Json(StatsDto { duplicate_groups, volumes }))
 }
 
+#[derive(Serialize)]
+struct MemberDto {
+    id: i64, location: String, filename: String, volume_id: String, volume_label: String,
+    size_bytes: i64, category: String, created_time: Option<i64>, modified_time: Option<i64>,
+    status: String, is_loose: bool, mounted: bool,
+}
+
+#[derive(Serialize)]
+struct GroupDto { hash: String, suggested_keep_id: i64, members: Vec<MemberDto> }
+
+fn display_location(f: &FileRecord) -> String {
+    let base = f.original_path.as_deref().unwrap_or(&f.relative_path);
+    match &f.container_chain {
+        Some(chain) => format!("{base} › {chain}"),
+        None => base.to_string(),
+    }
+}
+
+/// Earliest-created (fallback earliest-modified, fallback smallest id) — keep the original.
+fn suggested_keep(members: &[FileRecord]) -> i64 {
+    members.iter().min_by_key(|f| (
+        f.created_time.unwrap_or(i64::MAX),
+        f.modified_time.unwrap_or(i64::MAX),
+        f.id,
+    )).map(|f| f.id).unwrap_or(0)
+}
+
+async fn api_duplicates(State(state): State<AppState>)
+    -> Result<Json<Vec<GroupDto>>, (axum::http::StatusCode, String)>
+{
+    let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
+    let labels: std::collections::HashMap<String, String> = cat.volume_stats().map_err(err500)?
+        .into_iter().map(|(id, label, _, _)| (id, label)).collect();
+    let groups = cat.duplicate_groups().map_err(err500)?;
+    let mut out = Vec::new();
+    for group in groups {
+        // Capture the shared content hash before consuming the group's rows.
+        let hash = group.first().map(|f| f.content_hash.clone()).unwrap_or_default();
+        let keep = suggested_keep(&group);
+        let members = group.into_iter().map(|f| {
+            let mounted = state.mounts.resolve(&f.volume_id).is_some();
+            MemberDto {
+                id: f.id, location: display_location(&f), filename: f.filename.clone(),
+                volume_label: labels.get(&f.volume_id).cloned().unwrap_or_default(),
+                volume_id: f.volume_id, size_bytes: f.size_bytes,
+                category: f.category.as_str().to_string(),
+                created_time: f.created_time, modified_time: f.modified_time,
+                status: f.status.as_str().to_string(),
+                is_loose: f.container_chain.is_none(), mounted,
+            }
+        }).collect::<Vec<_>>();
+        out.push(GroupDto { hash, suggested_keep_id: keep, members });
+    }
+    Ok(Json(out))
+}
+
 /// Serve the browse UI on 127.0.0.1 with an OS-assigned free port until the process is stopped.
 pub async fn serve(catalog_path: PathBuf, open: bool) -> anyhow::Result<()> {
     let app = build_router_with(AppState::new_live(catalog_path));
@@ -359,6 +416,63 @@ mod tests {
         let v = get_json(&db, "/api/stats").await;
         assert!(v["duplicate_groups"].is_number());
         assert_eq!(v["volumes"][0]["label"], "Test HDD");
+    }
+
+    use std::collections::HashMap;
+
+    // Seed a catalog with a duplicate pair of LOOSE files on one volume, plus a fake mounted drive.
+    fn seed_dupes() -> (tempfile::TempDir, PathBuf, AppState) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("c.db");
+        let drive = tmp.path().join("driveA");
+        std::fs::create_dir_all(&drive).unwrap();
+        std::fs::write(drive.join(".cleanupstorages_id"), "vol-1").unwrap();
+        {
+            let cat = crate::catalog::Catalog::open(&db).unwrap();
+            cat.upsert_volume(&crate::catalog::models::Volume {
+                volume_id: "vol-1".into(), label: "Photos HDD".into(), identified_by: "marker".into(),
+                first_seen_at: 1, last_seen_at: 1 }).unwrap();
+            let mk = |path: &str, created: i64| crate::catalog::models::NewFile {
+                volume_id: "vol-1".into(), relative_path: path.into(),
+                filename: path.rsplit('/').next().unwrap().into(), extension: "jpg".into(),
+                size_bytes: 10, content_hash: "DUP".into(), created_time: Some(created),
+                modified_time: Some(created), accessed_time: None,
+                category: crate::category::Category::Photo, container_chain: None };
+            cat.upsert_file(&mk("a.jpg", 1000), 100).unwrap();
+            cat.upsert_file(&mk("copy/a.jpg", 2000), 100).unwrap();
+        }
+        let mut mounts = HashMap::new();
+        mounts.insert("vol-1".to_string(), drive);
+        let state = AppState { catalog_path: db.clone(),
+            mounts: crate::mounts::MountResolver::Fixed(mounts), csrf_token: "T".into() };
+        (tmp, db, state)
+    }
+
+    async fn get_json_state(state: AppState, uri: &str) -> serde_json::Value {
+        use axum::body::Body; use axum::http::Request; use tower::ServiceExt;
+        let app = build_router_with(state);
+        let res = app.oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK, "uri {uri}");
+        let bytes = axum::body::to_bytes(res.into_body(), 5_000_000).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn api_duplicates_groups_with_suggested_keep_and_mounted() {
+        let (_t, _db, state) = seed_dupes();
+        let v = get_json_state(state, "/api/duplicates").await;
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["members"].as_array().unwrap().len(), 2);
+        // earliest created_time (1000) is a.jpg -> its id is the suggested keep
+        let members = arr[0]["members"].as_array().unwrap();
+        let keep = arr[0]["suggested_keep_id"].as_i64().unwrap();
+        let a = members.iter().find(|m| m["filename"] == "a.jpg").unwrap();
+        assert_eq!(a["id"].as_i64().unwrap(), keep);
+        assert_eq!(a["volume_label"], "Photos HDD");
+        assert_eq!(a["mounted"], true);
+        assert_eq!(a["is_loose"], true);
     }
 
     #[tokio::test]
