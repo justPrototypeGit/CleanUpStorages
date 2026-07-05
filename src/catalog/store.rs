@@ -165,7 +165,7 @@ impl Catalog {
         let mut sql = String::from(
             "SELECT id, volume_id, relative_path, filename, extension, size_bytes, content_hash,
                     created_time, modified_time, accessed_time, category, container_chain,
-                    status, first_seen_at, last_seen_at FROM files WHERE 1=1",
+                    status, first_seen_at, last_seen_at, original_path FROM files WHERE 1=1",
         );
         let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let q = f.query.trim();
@@ -211,6 +211,7 @@ impl Catalog {
             status: FileStatus::from_db(&r.get::<_, String>(12)?),
             first_seen_at: r.get(13)?,
             last_seen_at: r.get(14)?,
+            original_path: r.get(15)?,
         })
     }
 }
