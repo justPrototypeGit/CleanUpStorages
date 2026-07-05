@@ -13,7 +13,10 @@ pub struct PurgeOutcome {
 
 /// Empty the drive's `_ToDelete` quarantine and mark every quarantined row on the volume
 /// `purged`. Verifies the mount's marker equals `expected_volume_id` before touching anything.
-/// If `_ToDelete` is absent, this is a no-op success.
+/// If `_ToDelete` is absent, the delete itself is a no-op, but any rows still `quarantined`
+/// for this volume are reconciled to `purged` — a quarantined row with no corresponding file
+/// on disk means the file is already gone (e.g. the user emptied the folder manually), so the
+/// catalog is brought in line with reality rather than left stale.
 pub fn purge_volume(
     cat: &Catalog, mount_root: &Path, expected_volume_id: &str, now: i64,
 ) -> anyhow::Result<PurgeOutcome> {
@@ -92,5 +95,63 @@ mod tests {
             identified_by: "marker".into(), first_seen_at: 1, last_seen_at: 1 }).unwrap();
         let out = purge_volume(&cat, &root, "vol-1", 200).unwrap();
         assert_eq!(out, PurgeOutcome::default());
+    }
+
+    #[test]
+    fn wrong_marker_aborts_and_deletes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("drive");
+        fs::create_dir_all(root.join("_ToDelete/Photos")).unwrap();
+        fs::write(root.join(".cleanupstorages_id"), "vol-1").unwrap();
+        fs::write(root.join("_ToDelete/Photos/a.jpg"), b"DATA").unwrap();
+        let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
+        cat.upsert_volume(&Volume { volume_id: "vol-1".into(), label: "D".into(),
+            identified_by: "marker".into(), first_seen_at: 1, last_seen_at: 1 }).unwrap();
+
+        // expected volume id does NOT match the marker -> must bail, delete nothing
+        let res = purge_volume(&cat, &root, "vol-DIFFERENT", 200);
+        assert!(res.is_err());
+        assert!(root.join("_ToDelete/Photos/a.jpg").exists());
+    }
+
+    #[test]
+    fn missing_marker_aborts_and_deletes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("drive");
+        fs::create_dir_all(root.join("_ToDelete")).unwrap();
+        fs::write(root.join("_ToDelete/x"), b"DATA").unwrap();
+        // NO marker file written
+        let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
+        cat.upsert_volume(&Volume { volume_id: "vol-1".into(), label: "D".into(),
+            identified_by: "marker".into(), first_seen_at: 1, last_seen_at: 1 }).unwrap();
+
+        let res = purge_volume(&cat, &root, "vol-1", 200);
+        assert!(res.is_err());
+        assert!(root.join("_ToDelete/x").exists());
+    }
+
+    #[test]
+    fn reconciles_quarantined_rows_when_todelete_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("drive");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".cleanupstorages_id"), "vol-1").unwrap();
+        // NO _ToDelete directory on disk, but a quarantined row exists in the catalog
+        let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
+        cat.upsert_volume(&Volume { volume_id: "vol-1".into(), label: "D".into(),
+            identified_by: "marker".into(), first_seen_at: 1, last_seen_at: 1 }).unwrap();
+        let f = crate::catalog::models::NewFile {
+            volume_id: "vol-1".into(), relative_path: "_ToDelete/gone.jpg".into(),
+            filename: "gone.jpg".into(), extension: "jpg".into(), size_bytes: 4,
+            content_hash: "h".into(), created_time: None, modified_time: None, accessed_time: None,
+            category: crate::category::Category::Photo, container_chain: None };
+        cat.upsert_file(&f, 100).unwrap();
+        let id = cat.active_file_id("vol-1", "_ToDelete/gone.jpg").unwrap().unwrap();
+        cat.mark_quarantined(id, "_ToDelete/gone.jpg", "gone.jpg", 150).unwrap();
+
+        // _ToDelete absent -> delete is a no-op, but the quarantined row reconciles to purged
+        let out = purge_volume(&cat, &root, "vol-1", 200).unwrap();
+        assert_eq!(out.files_purged, 1);
+        assert_eq!(cat.get_file(id).unwrap().unwrap().status, FileStatus::Purged);
     }
 }
