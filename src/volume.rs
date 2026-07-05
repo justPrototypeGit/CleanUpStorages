@@ -2,6 +2,7 @@ use std::io::Write;
 use std::path::Path;
 
 pub const MARKER: &str = ".cleanupstorages_id";
+pub const QUARANTINE_DIR: &str = "_ToDelete";
 
 #[derive(Debug, Clone)]
 pub struct VolumeIdentity {
@@ -56,6 +57,11 @@ fn read_marker(root: &Path) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Read the drive's existing identity marker without creating one. None if absent/unreadable.
+pub fn read_volume_id(root: &Path) -> Option<String> {
+    read_marker(root)
 }
 
 fn try_write_marker(root: &Path) -> std::io::Result<String> {

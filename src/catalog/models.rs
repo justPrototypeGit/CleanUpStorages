@@ -67,6 +67,7 @@ pub struct FileRecord {
     pub status: FileStatus,
     pub first_seen_at: i64,
     pub last_seen_at: i64,
+    pub original_path: Option<String>,
 }
 
 #[cfg(test)]
