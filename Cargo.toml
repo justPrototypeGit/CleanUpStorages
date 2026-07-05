@@ -21,6 +21,9 @@ sysinfo = "0.30"
 anyhow = "1"
 thiserror = "1"
 zip = "2"
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
 
 [dev-dependencies]
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
