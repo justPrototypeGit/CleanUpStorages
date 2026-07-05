@@ -273,14 +273,38 @@ impl Catalog {
     }
 
     /// Move a file into quarantine: records where it moved to and where it came from.
+    /// Also clears container_chain, so an extracted archive entry becomes a proper
+    /// loose quarantined row (a no-op for files that were already loose).
     pub fn mark_quarantined(&self, id: i64, new_relative_path: &str, original_path: &str, now: i64)
         -> anyhow::Result<()>
     {
         self.conn.execute(
-            "UPDATE files SET status='quarantined', relative_path=?2, original_path=?3, last_seen_at=?4
-             WHERE id=?1",
+            "UPDATE files SET status='quarantined', relative_path=?2, original_path=?3,
+                 container_chain=NULL, last_seen_at=?4 WHERE id=?1",
             params![id, new_relative_path, original_path, now],
         )?;
+        Ok(())
+    }
+
+    /// An archive's currently-catalogued entries (active rows filed under this
+    /// relative_path with a non-null container_chain).
+    pub fn archive_entries(&self, volume_id: &str, archive_rel_path: &str) -> anyhow::Result<Vec<FileRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, volume_id, relative_path, filename, extension, size_bytes, content_hash,
+                    created_time, modified_time, accessed_time, category, container_chain,
+                    status, first_seen_at, last_seen_at, original_path FROM files
+             WHERE volume_id=?1 AND relative_path=?2 AND container_chain IS NOT NULL AND status='active'
+             ORDER BY id")?;
+        let rows = stmt.query_map(params![volume_id, archive_rel_path], Self::map_file_record)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Update a loose archive row's hash/size after a rebuild (repack).
+    pub fn update_archive_hash(&self, id: i64, content_hash: &str, size_bytes: i64, now: i64) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE files SET content_hash=?2, size_bytes=?3, last_seen_at=?4 WHERE id=?1",
+            params![id, content_hash, size_bytes, now])?;
         Ok(())
     }
 
@@ -577,5 +601,46 @@ mod tests {
         cat.touch_archive_entries("vol-1", "old.zip", 400).unwrap();
         assert_eq!(cat.search("gone", None, None, Some("missing")).unwrap().len(), 1);
         assert_eq!(cat.search("gone", None, None, Some("active")).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn archive_entries_lists_only_that_archives_entries() {
+        let (_t, cat) = open_tmp();
+        let e = |chain: &str, hash: &str| crate::archive::ArchiveEntry {
+            container_chain: chain.into(), filename: chain.rsplit('/').next().unwrap().into(),
+            extension: "jpg".into(), size_bytes: 5, content_hash: hash.into() };
+        cat.upsert_archive_entry("vol-1", "a.zip", &e("x.jpg", "h1"), 100).unwrap();
+        cat.upsert_archive_entry("vol-1", "a.zip", &e("y.jpg", "h2"), 100).unwrap();
+        cat.upsert_archive_entry("vol-1", "b.zip", &e("z.jpg", "h3"), 100).unwrap();
+        let es = cat.archive_entries("vol-1", "a.zip").unwrap();
+        assert_eq!(es.len(), 2);
+        assert!(es.iter().all(|r| r.relative_path == "a.zip" && r.container_chain.is_some()));
+    }
+
+    #[test]
+    fn mark_quarantined_clears_container_chain() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_archive_entry("vol-1", "a.zip",
+            &crate::archive::ArchiveEntry { container_chain: "x.jpg".into(), filename: "x.jpg".into(),
+                extension: "jpg".into(), size_bytes: 5, content_hash: "h1".into() }, 100).unwrap();
+        // find the entry row id
+        let id = cat.archive_entries("vol-1", "a.zip").unwrap()[0].id;
+        cat.mark_quarantined(id, "_ToDelete/a.zip/x.jpg", "a.zip › x.jpg", 200).unwrap();
+        let rec = cat.get_file(id).unwrap().unwrap();
+        assert_eq!(rec.status, FileStatus::Quarantined);
+        assert_eq!(rec.container_chain, None); // now a loose quarantined row
+        assert_eq!(rec.relative_path, "_ToDelete/a.zip/x.jpg");
+        assert_eq!(rec.original_path.as_deref(), Some("a.zip › x.jpg"));
+    }
+
+    #[test]
+    fn update_archive_hash_changes_hash_and_size() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_file(&mk_file("vol-1", "a.zip", "OLD"), 100).unwrap();
+        let id = cat.active_file_id("vol-1", "a.zip").unwrap().unwrap();
+        cat.update_archive_hash(id, "NEW", 999, 200).unwrap();
+        let rec = cat.get_file(id).unwrap().unwrap();
+        assert_eq!(rec.content_hash, "NEW");
+        assert_eq!(rec.size_bytes, 999);
     }
 }
