@@ -81,19 +81,24 @@ pub fn quarantine_files(
     Ok(out)
 }
 
-/// Compute a collision-free `_ToDelete/<origin>` relative path (adds ` (n)` before the extension).
+/// Compute a collision-free `_ToDelete/<origin>` relative path (adds ` (n)` before the
+/// extension of the LAST path segment only, preserving the directory).
 fn quarantine_dest(mount_root: &Path, origin_rel: &str) -> String {
     let base = format!("{QUARANTINE_DIR}/{origin_rel}");
     if !mount_root.join(&base).exists() {
         return base;
     }
-    // Split extension off the last path segment for suffixing.
-    let (stem, ext) = match base.rsplit_once('.') {
-        Some((s, e)) if !s.ends_with('/') => (s.to_string(), format!(".{e}")),
-        _ => (base.clone(), String::new()),
+    // Separate the directory prefix from the final segment, then split the segment's extension.
+    let (dir, seg) = match base.rsplit_once('/') {
+        Some((d, s)) => (format!("{d}/"), s.to_string()),
+        None => (String::new(), base.clone()),
+    };
+    let (stem, ext) = match seg.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
+        _ => (seg.clone(), String::new()),
     };
     for n in 1.. {
-        let candidate = format!("{stem} ({n}){ext}");
+        let candidate = format!("{dir}{stem} ({n}){ext}");
         if !mount_root.join(&candidate).exists() {
             return candidate;
         }
@@ -171,5 +176,21 @@ mod tests {
         assert!(err.is_err());
         assert!(root.join("Photos/a.jpg").exists()); // nothing moved
         let _ = tmp;
+    }
+
+    #[test]
+    fn collision_suffix_targets_last_segment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // dotted ANCESTOR dir, final segment has no extension
+        std::fs::create_dir_all(root.join("_ToDelete/my.backup")).unwrap();
+        std::fs::write(root.join("_ToDelete/my.backup/README"), b"x").unwrap();
+        let dest = quarantine_dest(root, "my.backup/README");
+        assert_eq!(dest, "_ToDelete/my.backup/README (1)");
+
+        // normal case: extension on the final segment
+        std::fs::write(root.join("_ToDelete/my.backup/note.txt"), b"y").unwrap();
+        let dest2 = quarantine_dest(root, "my.backup/note.txt");
+        assert_eq!(dest2, "_ToDelete/my.backup/note (1).txt");
     }
 }
