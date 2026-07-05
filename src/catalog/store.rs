@@ -252,14 +252,24 @@ impl Catalog {
         Ok(groups)
     }
 
-    /// True iff some `status='active'` row with this hash has an id not in `excluding`.
-    /// This is the "never remove the last copy" guard used before quarantining a duplicate.
-    pub fn active_survivor_exists(&self, hash: &str, excluding: &[i64]) -> anyhow::Result<bool> {
+    /// All currently-active rows sharing this content hash (loose or archived).
+    pub fn active_copies(&self, hash: &str) -> anyhow::Result<Vec<FileRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id FROM files WHERE content_hash=?1 AND status='active'")?;
-        let ids = stmt.query_map(params![hash], |r| r.get::<_, i64>(0))?
+            "SELECT id, volume_id, relative_path, filename, extension, size_bytes, content_hash,
+                    created_time, modified_time, accessed_time, category, container_chain,
+                    status, first_seen_at, last_seen_at, original_path FROM files
+             WHERE content_hash=?1 AND status='active' ORDER BY id")?;
+        let rows = stmt.query_map(rusqlite::params![hash], Self::map_file_record)?
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(ids.iter().any(|id| !excluding.contains(id)))
+        Ok(rows)
+    }
+
+    /// True if any loose row (any status) on this volume already uses this relative_path.
+    pub fn loose_path_taken(&self, volume_id: &str, relative_path: &str) -> anyhow::Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT count(*) FROM files WHERE volume_id=?1 AND relative_path=?2 AND container_chain IS NULL",
+            rusqlite::params![volume_id, relative_path], |r| r.get(0))?;
+        Ok(n > 0)
     }
 
     /// Move a file into quarantine: records where it moved to and where it came from.
@@ -515,18 +525,14 @@ mod tests {
     }
 
     #[test]
-    fn survivor_check_respects_exclusions() {
+    fn active_copies_returns_active_rows_for_hash() {
         let (_t, cat) = open_tmp();
         cat.upsert_file(&mk_file("vol-1", "a.txt", "same"), 200).unwrap();
         cat.upsert_file(&mk_file("vol-1", "b.txt", "same"), 200).unwrap();
-        let a = cat.active_file_id("vol-1", "a.txt").unwrap().unwrap();
-        let b = cat.active_file_id("vol-1", "b.txt").unwrap().unwrap();
-        // excluding one of two leaves a survivor
-        assert!(cat.active_survivor_exists("same", &[a]).unwrap());
-        // excluding both leaves none
-        assert!(!cat.active_survivor_exists("same", &[a, b]).unwrap());
-        // a unique hash has no survivor once excluded
-        assert!(!cat.active_survivor_exists("nope", &[]).unwrap());
+        cat.upsert_file(&mk_file("vol-1", "c.txt", "unique"), 200).unwrap();
+        assert_eq!(cat.active_copies("same").unwrap().len(), 2);
+        assert_eq!(cat.active_copies("unique").unwrap().len(), 1);
+        assert_eq!(cat.active_copies("none").unwrap().len(), 0);
     }
 
     #[test]

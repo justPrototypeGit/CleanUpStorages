@@ -4,8 +4,6 @@ use std::path::Path;
 use crate::catalog::Catalog;
 use crate::catalog::models::FileStatus;
 
-const QUARANTINE_DIR: &str = "_ToDelete";
-
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct QuarantineOutcome {
     pub quarantined: usize,
@@ -44,18 +42,28 @@ pub fn quarantine_files(
         {
             skip(cat, "not a loose active file on this volume".into(), &mut out)?; continue;
         }
-        // Exclude only this id (not the whole batch): each successful quarantine commits
-        // immediately, so a doomed sibling processed earlier in this same batch is already
-        // non-active by the time we get here and can't be mistaken for a survivor.
-        if !cat.active_survivor_exists(&rec.content_hash, &[id])? {
-            skip(cat, "no surviving active copy would remain".into(), &mut out)?; continue;
+        // Disk-aware "never remove the last copy" guard. Exclude only this id (not the whole
+        // batch): each successful quarantine commits immediately, so a doomed sibling processed
+        // earlier in this same batch is already non-active by the time we get here and can't be
+        // mistaken for a survivor. A survivor "counts" only if it is a different row AND either
+        // lives on a DIFFERENT volume (a genuinely separate physical copy we can't disk-check, so
+        // trust it) OR lives on THIS volume and its file physically exists on disk.
+        let survivor_ok = cat.active_copies(&rec.content_hash)?.iter().any(|s| {
+            s.id != id
+                && (s.volume_id != expected_volume_id
+                    || mount_root.join(&s.relative_path).exists())
+        });
+        if !survivor_ok {
+            skip(cat, "no surviving copy verified on disk (a same-drive duplicate may have been \
+                       deleted outside the tool — rescan the drive and retry)".into(), &mut out)?;
+            continue;
         }
 
         let src = mount_root.join(&rec.relative_path);
         if !src.is_file() {
             skip(cat, format!("file not found on disk at {}", rec.relative_path), &mut out)?; continue;
         }
-        let dest_rel = quarantine_dest(mount_root, &rec.relative_path);
+        let dest_rel = quarantine_dest(cat, mount_root, expected_volume_id, &rec.relative_path)?;
         let dest = mount_root.join(&dest_rel);
         if let Some(parent) = dest.parent() { std::fs::create_dir_all(parent)?; }
 
@@ -82,13 +90,17 @@ pub fn quarantine_files(
 }
 
 /// Compute a collision-free `_ToDelete/<origin>` relative path (adds ` (n)` before the
-/// extension of the LAST path segment only, preserving the directory).
-fn quarantine_dest(mount_root: &Path, origin_rel: &str) -> String {
-    let base = format!("{QUARANTINE_DIR}/{origin_rel}");
-    if !mount_root.join(&base).exists() {
-        return base;
-    }
-    // Separate the directory prefix from the final segment, then split the segment's extension.
+/// extension of the LAST path segment only, preserving the directory). A candidate is only
+/// acceptable when NEITHER the file exists on disk NOR a loose catalog row already claims it
+/// (e.g. a purged row still occupying the loose unique index) — avoiding a post-rename orphan.
+fn quarantine_dest(cat: &Catalog, mount_root: &Path, volume_id: &str, origin_rel: &str)
+    -> anyhow::Result<String>
+{
+    let base = format!("{}/{origin_rel}", crate::volume::QUARANTINE_DIR);
+    let taken = |cat: &Catalog, cand: &str| -> anyhow::Result<bool> {
+        Ok(mount_root.join(cand).exists() || cat.loose_path_taken(volume_id, cand)?)
+    };
+    if !taken(cat, &base)? { return Ok(base); }
     let (dir, seg) = match base.rsplit_once('/') {
         Some((d, s)) => (format!("{d}/"), s.to_string()),
         None => (String::new(), base.clone()),
@@ -98,10 +110,8 @@ fn quarantine_dest(mount_root: &Path, origin_rel: &str) -> String {
         _ => (seg.clone(), String::new()),
     };
     for n in 1.. {
-        let candidate = format!("{dir}{stem} ({n}){ext}");
-        if !mount_root.join(&candidate).exists() {
-            return candidate;
-        }
+        let cand = format!("{dir}{stem} ({n}){ext}");
+        if !taken(cat, &cand)? { return Ok(cand); }
     }
     unreachable!()
 }
@@ -182,15 +192,61 @@ mod tests {
     fn collision_suffix_targets_last_segment() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
+        let cat = Catalog::open(&root.join("c.db")).unwrap();
+        cat.upsert_volume(&Volume { volume_id: "vol-1".into(), label: "D".into(),
+            identified_by: "marker".into(), first_seen_at: 1, last_seen_at: 1 }).unwrap();
         // dotted ANCESTOR dir, final segment has no extension
         std::fs::create_dir_all(root.join("_ToDelete/my.backup")).unwrap();
         std::fs::write(root.join("_ToDelete/my.backup/README"), b"x").unwrap();
-        let dest = quarantine_dest(root, "my.backup/README");
+        let dest = quarantine_dest(&cat, root, "vol-1", "my.backup/README").unwrap();
         assert_eq!(dest, "_ToDelete/my.backup/README (1)");
 
         // normal case: extension on the final segment
         std::fs::write(root.join("_ToDelete/my.backup/note.txt"), b"y").unwrap();
-        let dest2 = quarantine_dest(root, "my.backup/note.txt");
+        let dest2 = quarantine_dest(&cat, root, "vol-1", "my.backup/note.txt").unwrap();
         assert_eq!(dest2, "_ToDelete/my.backup/note (1).txt");
+    }
+
+    #[test]
+    fn refuses_when_only_sibling_was_deleted_off_disk() {
+        let (tmp, cat, root) = fake_drive();
+        let root = std::path::PathBuf::from(root);
+        // user deletes the OTHER copy outside the tool; catalog still thinks it's active
+        std::fs::remove_file(root.join("copy_a.jpg")).unwrap();
+        let a = cat.active_file_id("vol-1", "Photos/a.jpg").unwrap().unwrap();
+        let out = quarantine_files(&cat, &root, "vol-1", &[a], 200).unwrap();
+        assert_eq!(out.quarantined, 0);
+        assert_eq!(out.skipped, 1);
+        assert!(root.join("Photos/a.jpg").exists()); // the last real copy is untouched
+        let _ = tmp;
+    }
+
+    #[test]
+    fn dest_avoids_catalog_collision_with_purged_row() {
+        let (tmp, cat, root) = fake_drive();
+        let root = std::path::PathBuf::from(root);
+        // Simulate a prior purge: a purged row already holds _ToDelete/Photos/a.jpg
+        let mut ghost = crate::catalog::models::NewFile {
+            volume_id: "vol-1".into(), relative_path: "_ToDelete/Photos/a.jpg".into(),
+            filename: "a.jpg".into(), extension: "jpg".into(), size_bytes: 9,
+            content_hash: "old".into(), created_time: None, modified_time: None, accessed_time: None,
+            category: crate::category::Category::Photo, container_chain: None };
+        cat.upsert_file(&ghost, 50).unwrap();
+        let ghost_id = cat.active_file_id("vol-1", "_ToDelete/Photos/a.jpg").unwrap().unwrap();
+        cat.mark_quarantined(ghost_id, "_ToDelete/Photos/a.jpg", "Photos/a.jpg", 60).unwrap();
+        cat.mark_purged(ghost_id, 70).unwrap();
+        let _ = &mut ghost;
+
+        // Now quarantine the live Photos/a.jpg (survivor copy_a.jpg exists on disk)
+        let a = cat.active_file_id("vol-1", "Photos/a.jpg").unwrap().unwrap();
+        let out = quarantine_files(&cat, &root, "vol-1", &[a], 200).unwrap();
+        assert_eq!(out.quarantined, 1);
+        let rec = cat.get_file(a).unwrap().unwrap();
+        // must NOT reuse the purged row's key; suffix goes before the extension of the
+        // last segment (established by `collision_suffix_targets_last_segment`).
+        assert_ne!(rec.relative_path, "_ToDelete/Photos/a.jpg");
+        assert_eq!(rec.relative_path, "_ToDelete/Photos/a (1).jpg");
+        assert!(root.join("_ToDelete/Photos/a (1).jpg").exists());
+        let _ = tmp;
     }
 }
