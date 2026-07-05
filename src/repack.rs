@@ -98,8 +98,20 @@ pub fn repack_entry(
     if let Some(p) = original_dest.parent() {
         std::fs::create_dir_all(p)?;
     }
-    std::fs::rename(&archive_path, &original_dest)?;
-    std::fs::rename(&tmp, &archive_path)?;
+    // Move the original aside. If this fails, the original is still in place — clean up and abort.
+    if let Err(e) = std::fs::rename(&archive_path, &original_dest) {
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&extract_path); // the net-1 copy extracted in step 8
+        anyhow::bail!("repack aborted: could not move the original archive aside ({e}); nothing changed");
+    }
+    // Move the verified rebuild into place. If this fails, ROLL BACK: restore the original so the
+    // archive path is never left empty, and remove the temp + the extracted copy.
+    if let Err(e) = std::fs::rename(&tmp, &archive_path) {
+        let _ = std::fs::rename(&original_dest, &archive_path); // put the original back
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&extract_path);
+        anyhow::bail!("repack aborted: swap failed ({e}); the original archive was restored, nothing changed");
+    }
 
     // 10. Catalog + audit.
     cat.mark_quarantined(
