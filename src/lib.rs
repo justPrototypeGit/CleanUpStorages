@@ -3,6 +3,7 @@ pub mod hashing;
 pub mod category;
 pub mod catalog;
 pub mod volume;
+pub mod mounts;
 pub mod scanner;
 pub mod quarantine;
 pub mod purge;
