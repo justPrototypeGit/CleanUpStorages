@@ -31,3 +31,10 @@ Not blockers — 1b shipped with the two catalog/zip-bomb correctness fixes appl
 - **Errored archive entry has no touch-protection.** Loose files that error mid-scan are protected from the missing-sweep via `touch_seen` (Phase 1a fix), but an archive whose descent fails after its mtime changed will have its entries swept to `missing` (non-destructive, self-heals on the next successful descent). Analogous to the directory-subtree limitation above.
 - **Encapsulation smells (carried):** `scan_volume` builds a second `Config` via `default_paths()` rather than receiving limits from the caller; `upsert_file`/`upsert_archive_entry` share an INSERT…ON CONFLICT skeleton; `descend_archive` has 8 positional params. Fold into the same "store/scanner encapsulation" cleanup as the Phase-1a `pub conn` follow-up.
 
+## Follow-ups logged from the Phase 1c (web browse) code review (2026-07-04)
+
+Shipped clean (all four review findings fixed: read-only per-request catalog open, FTS-token quoting, page error handling, quote-safe escaping). Remaining enhancements:
+
+- **Surface size/date filters in the browse UI.** `SearchFilters` and `/api/search` already accept `min_size`/`max_size`/`modified_after`/`modified_before`, but the page only exposes query + volume + category + status controls. Add size and date-range inputs to the header when wanted. (Date filtering uses `modified_time`, which is NULL for archive entries, so a date filter currently excludes archived content — decide whether that's desired or whether archive entries should inherit the containing archive's mtime.)
+- **When the review GUI arrives (Phase 2)**, it will add action endpoints (confirm-duplicate, quarantine) to this same server; those are the first *write* endpoints and will need care (CSRF is minimal on localhost, but the read-only-open split means write handlers must use the read-write `Catalog::open` deliberately).
+
