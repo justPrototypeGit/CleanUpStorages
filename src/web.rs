@@ -1,7 +1,10 @@
 //! Local, read-only web browse/search UI. Binds 127.0.0.1 only.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use axum::{Router, routing::get, extract::State, response::Html, Json, extract::Query};
+use axum::extract::Path as AxPath;
+use axum::response::{IntoResponse, Response};
+use axum::http::{StatusCode, header};
 use serde::{Serialize, Deserialize};
 use crate::catalog::Catalog;
 use crate::catalog::store::SearchFilters;
@@ -38,6 +41,7 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/volumes", get(api_volumes))
         .route("/api/stats", get(api_stats))
         .route("/api/duplicates", get(api_duplicates))
+        .route("/api/preview/:id", get(api_preview))
         .with_state(state)
 }
 
@@ -288,6 +292,60 @@ async fn api_duplicates(State(state): State<AppState>)
     Ok(Json(out))
 }
 
+/// Decode any supported image, downscale to fit `max_dim` on the longest side, re-encode as JPEG.
+fn thumbnail_jpeg(bytes: &[u8], max_dim: u32) -> anyhow::Result<Vec<u8>> {
+    let img = image::load_from_memory(bytes)?;
+    let thumb = img.thumbnail(max_dim, max_dim); // preserves aspect ratio, never upsizes past bounds
+    let mut out = std::io::Cursor::new(Vec::new());
+    thumb.write_to(&mut out, image::ImageFormat::Jpeg)?;
+    Ok(out.into_inner())
+}
+
+/// Read one top-level entry's bytes from a zip archive.
+fn read_zip_entry(archive_path: &Path, entry_name: &str) -> anyhow::Result<Vec<u8>> {
+    let file = std::fs::File::open(archive_path)?;
+    let mut zip = zip::ZipArchive::new(file)?;
+    let mut entry = zip.by_name(entry_name)?;
+    let mut buf = Vec::new();
+    std::io::Read::read_to_end(&mut entry, &mut buf)?;
+    Ok(buf)
+}
+
+const PREVIEW_MAX_DIM: u32 = 320;
+
+/// Photo thumbnail for a file that is: a photo, mounted, and either loose or a top-level
+/// archive entry (no nested-archive chain). Anything else — or a decode failure — is a 404,
+/// never a panic.
+async fn api_preview(State(state): State<AppState>, AxPath(id): AxPath<i64>) -> Response {
+    let not_found = |msg: &str| (StatusCode::NOT_FOUND, msg.to_string()).into_response();
+
+    let cat = match Catalog::open_readonly(&state.catalog_path) {
+        Ok(c) => c, Err(e) => return err500(e).into_response(),
+    };
+    let rec = match cat.get_file(id) {
+        Ok(Some(r)) => r, Ok(None) => return not_found("no such file"),
+        Err(e) => return err500(e).into_response(),
+    };
+    if rec.category != crate::category::Category::Photo {
+        return not_found("preview only for photos");
+    }
+    let Some(mount) = state.mounts.resolve(&rec.volume_id) else {
+        return not_found("drive not connected");
+    };
+
+    let bytes = match &rec.container_chain {
+        None => std::fs::read(mount.join(&rec.relative_path)).ok(),
+        Some(chain) if !chain.contains(" › ") => read_zip_entry(&mount.join(&rec.relative_path), chain).ok(),
+        Some(_) => return not_found("nested-archive preview not supported"),
+    };
+    let Some(bytes) = bytes else { return not_found("file unavailable") };
+
+    match thumbnail_jpeg(&bytes, PREVIEW_MAX_DIM) {
+        Ok(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
+        Err(_) => not_found("not a decodable image"),
+    }
+}
+
 /// Serve the browse UI on 127.0.0.1 with an OS-assigned free port until the process is stopped.
 pub async fn serve(catalog_path: PathBuf, open: bool) -> anyhow::Result<()> {
     let app = build_router_with(AppState::new_live(catalog_path));
@@ -473,6 +531,48 @@ mod tests {
         assert_eq!(a["volume_label"], "Photos HDD");
         assert_eq!(a["mounted"], true);
         assert_eq!(a["is_loose"], true);
+    }
+
+    fn tiny_png() -> Vec<u8> {
+        // 2x2 red PNG, generated via the image crate.
+        let img = image::RgbImage::from_pixel(2, 2, image::Rgb([255, 0, 0]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        buf.into_inner()
+    }
+
+    #[test]
+    fn thumbnail_downscales_and_encodes_jpeg() {
+        // a 100x40 image thumbnails to <=32px longest side, and the output decodes as JPEG.
+        let img = image::RgbImage::from_pixel(100, 40, image::Rgb([0, 128, 255]));
+        let mut src = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img).write_to(&mut src, image::ImageFormat::Png).unwrap();
+        let thumb = thumbnail_jpeg(&src.into_inner(), 32).unwrap();
+        let decoded = image::load_from_memory(&thumb).unwrap();
+        assert!(decoded.width() <= 32 && decoded.height() <= 32);
+        assert!(decoded.width() >= 1);
+    }
+
+    #[tokio::test]
+    async fn preview_returns_jpeg_for_loose_photo_on_mounted_drive() {
+        use axum::body::Body; use axum::http::Request; use tower::ServiceExt;
+        let (_t, db, state) = seed_dupes();
+        // write a real image at the loose path on the fake drive
+        let drive = match &state.mounts { crate::mounts::MountResolver::Fixed(m) => m["vol-1"].clone(), _ => unreachable!() };
+        std::fs::write(drive.join("a.jpg"), tiny_png()).unwrap();
+        // find a.jpg's id
+        let cat = crate::catalog::Catalog::open_readonly(&db).unwrap();
+        let id = cat.active_file_id("vol-1", "a.jpg").unwrap().unwrap();
+
+        let app = build_router_with(state);
+        let res = app.oneshot(Request::builder().uri(format!("/api/preview/{id}"))
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+        let ct = res.headers().get("content-type").unwrap().to_str().unwrap().to_string();
+        assert_eq!(ct, "image/jpeg");
+        let bytes = axum::body::to_bytes(res.into_body(), 5_000_000).await.unwrap();
+        assert!(image::load_from_memory(&bytes).is_ok());
     }
 
     #[tokio::test]
