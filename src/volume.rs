@@ -2,6 +2,7 @@ use std::io::Write;
 use std::path::Path;
 
 pub const MARKER: &str = ".cleanupstorages_id";
+pub const QUARANTINE_DIR: &str = "_ToDelete";
 
 #[derive(Debug, Clone)]
 pub struct VolumeIdentity {

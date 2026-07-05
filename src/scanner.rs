@@ -9,7 +9,6 @@ use crate::config::Config;
 use crate::hashing;
 use crate::volume::VolumeIdentity;
 
-const QUARANTINE_DIR: &str = "_ToDelete";
 const BATCH_SIZE: usize = 200;
 
 /// Outcome of one `scan_volume` pass.
@@ -31,7 +30,8 @@ fn unix_secs(t: std::io::Result<std::time::SystemTime>) -> Option<i64> {
 
 /// True if `path` is the identity marker file or lives under a `_ToDelete` quarantine dir.
 fn should_skip(path: &Path, file_name: &std::ffi::OsStr) -> bool {
-    file_name == crate::volume::MARKER || path.components().any(|c| c.as_os_str() == QUARANTINE_DIR)
+    file_name == crate::volume::MARKER
+        || path.components().any(|c| c.as_os_str() == crate::volume::QUARANTINE_DIR)
 }
 
 /// Path of `path` relative to `root`, normalized to forward slashes; `None` if not under `root`.

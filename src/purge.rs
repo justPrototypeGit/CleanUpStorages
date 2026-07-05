@@ -3,8 +3,6 @@
 use std::path::Path;
 use crate::catalog::Catalog;
 
-const QUARANTINE_DIR: &str = "_ToDelete";
-
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PurgeOutcome {
     pub files_purged: usize,
@@ -33,7 +31,7 @@ pub fn purge_volume(
     let bytes_reclaimed = cat.recoverable_bytes(expected_volume_id)?;
     let rows = cat.quarantined_rows(expected_volume_id)?;
 
-    let qdir = mount_root.join(QUARANTINE_DIR);
+    let qdir = mount_root.join(crate::volume::QUARANTINE_DIR);
     if qdir.exists() {
         std::fs::remove_dir_all(&qdir)?; // THE hard delete — user-initiated only.
     }
