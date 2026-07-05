@@ -8,6 +8,7 @@ use crate::volume::{self, ReadonlyMode};
 use crate::scanner;
 use crate::catalog::backup;
 use crate::web;
+use crate::{quarantine, purge};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum ReadonlyFallback { Ask, Fingerprint, Skip }
@@ -92,8 +93,62 @@ pub fn cmd_status() -> anyhow::Result<()> {
     println!("Duplicate groups (same content hash): {groups}");
     println!("Per-volume (active files):");
     for (id, label, count, bytes) in cat.volume_stats()? {
-        println!("  {label} [{id}]: {count} files, {} MiB", bytes / (1024 * 1024));
+        let recoverable = cat.recoverable_bytes(&id)?;
+        println!("  {label} [{id}]: {count} files, {} MiB (recoverable: {} MiB in _ToDelete)",
+            bytes / (1024 * 1024), recoverable / (1024 * 1024));
     }
+    Ok(())
+}
+
+pub fn cmd_duplicates() -> anyhow::Result<()> {
+    let cfg = Config::default_paths()?;
+    let cat = Catalog::open(&cfg.catalog_path)?;
+    let groups = cat.duplicate_groups()?;
+    if groups.is_empty() { println!("No duplicate groups."); return Ok(()); }
+    for group in &groups {
+        println!("hash {} — {} copies:", &group[0].content_hash[..16.min(group[0].content_hash.len())], group.len());
+        for f in group {
+            let loc = display_location(f);
+            println!("  #{}  {}  [{}]  {} bytes  {}",
+                f.id, loc, f.volume_id, f.size_bytes, f.status.as_str());
+        }
+    }
+    Ok(())
+}
+
+/// Where a file is / came from, for display.
+fn display_location(f: &crate::catalog::models::FileRecord) -> String {
+    let base = f.original_path.as_deref().unwrap_or(&f.relative_path);
+    match &f.container_chain {
+        Some(chain) => format!("{base} › {chain}"),
+        None => base.to_string(),
+    }
+}
+
+pub fn cmd_quarantine(mount: &Path, ids: &[i64]) -> anyhow::Result<()> {
+    let cfg = Config::default_paths()?;
+    let cat = Catalog::open(&cfg.catalog_path)?;
+    let vid = crate::volume::read_volume_id(mount)
+        .ok_or_else(|| anyhow::anyhow!("no identity marker at {}; scan the drive first", mount.display()))?;
+    let now = now_secs();
+    let out = quarantine::quarantine_files(&cat, mount, &vid, ids, now)?;
+    println!("Quarantined {} file(s), skipped {}.", out.quarantined, out.skipped);
+    let snap = backup::snapshot(&cfg.catalog_path, &cfg.backups_dir(), cfg.snapshot_retention, now)?;
+    println!("Catalog snapshot: {}", snap.display());
+    Ok(())
+}
+
+pub fn cmd_purge(mount: &Path) -> anyhow::Result<()> {
+    let cfg = Config::default_paths()?;
+    let cat = Catalog::open(&cfg.catalog_path)?;
+    let vid = crate::volume::read_volume_id(mount)
+        .ok_or_else(|| anyhow::anyhow!("no identity marker at {}", mount.display()))?;
+    let now = now_secs();
+    // snapshot BEFORE the irreversible delete
+    let snap = backup::snapshot(&cfg.catalog_path, &cfg.backups_dir(), cfg.snapshot_retention, now)?;
+    println!("Catalog snapshot (pre-purge): {}", snap.display());
+    let out = purge::purge_volume(&cat, mount, &vid, now)?;
+    println!("Purged {} file(s), reclaimed {} MiB.", out.files_purged, out.bytes_reclaimed / (1024*1024));
     Ok(())
 }
 

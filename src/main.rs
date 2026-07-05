@@ -41,6 +41,21 @@ enum Command {
         #[arg(long)]
         no_open: bool,
     },
+    /// List duplicate groups (files sharing a content hash), with ids to act on.
+    Duplicates,
+    /// Move confirmed-duplicate files (by id) to the drive's _ToDelete quarantine.
+    Quarantine {
+        /// Current mount path of the drive holding the files.
+        mount: std::path::PathBuf,
+        /// Catalog ids of the files to quarantine (from `duplicates`).
+        #[arg(required = true)]
+        ids: Vec<i64>,
+    },
+    /// Permanently delete a drive's _ToDelete quarantine and reclaim space.
+    Purge {
+        /// Current mount path of the drive to purge.
+        mount: std::path::PathBuf,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -54,5 +69,8 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Status => commands::cmd_status(),
         Command::Browse { no_open } => commands::cmd_browse(!no_open),
+        Command::Duplicates => commands::cmd_duplicates(),
+        Command::Quarantine { mount, ids } => commands::cmd_quarantine(&mount, &ids),
+        Command::Purge { mount } => commands::cmd_purge(&mount),
     }
 }
