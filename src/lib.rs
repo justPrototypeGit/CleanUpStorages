@@ -4,6 +4,7 @@ pub mod category;
 pub mod catalog;
 pub mod volume;
 pub mod scanner;
+pub mod quarantine;
 pub mod commands;
 pub mod archive;
 pub mod web;
