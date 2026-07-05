@@ -1,7 +1,8 @@
 //! Local, read-only web browse/search UI. Binds 127.0.0.1 only.
 
 use std::path::{Path, PathBuf};
-use axum::{Router, routing::get, extract::State, response::Html, Json, extract::Query};
+use axum::{Router, routing::{get, post}, extract::State, response::Html, Json, extract::Query};
+use axum::http::HeaderMap;
 use axum::extract::Path as AxPath;
 use axum::response::{IntoResponse, Response};
 use axum::http::{StatusCode, header};
@@ -42,6 +43,7 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/stats", get(api_stats))
         .route("/api/duplicates", get(api_duplicates))
         .route("/api/preview/:id", get(api_preview))
+        .route("/api/quarantine", post(api_quarantine))
         .with_state(state)
 }
 
@@ -346,6 +348,59 @@ async fn api_preview(State(state): State<AppState>, AxPath(id): AxPath<i64>) -> 
     }
 }
 
+#[derive(Deserialize)]
+struct QuarantineReq { quarantine_ids: Vec<i64> }
+
+#[derive(Serialize, Default)]
+struct QuarantineResultDto { quarantined: usize, skipped: usize, unmounted_volumes: Vec<String> }
+
+/// The web app's first write endpoint. All destructive safety (marker check, disk-aware
+/// last-copy guard, rename-only) lives in `quarantine::quarantine_files`; this handler is just
+/// the CSRF gate plus grouping requested ids by volume so the engine can be called per-mount.
+async fn api_quarantine(State(state): State<AppState>, headers: HeaderMap, body: Json<QuarantineReq>)
+    -> Result<Json<QuarantineResultDto>, (StatusCode, String)>
+{
+    // CSRF: require the per-run token (a cross-site page can't read it). Checked first, before
+    // any catalog access, so a bad/missing token does nothing.
+    let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
+    if !ok { return Err((StatusCode::FORBIDDEN, "missing or bad token".into())); }
+
+    let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map_err(err500)?.as_secs() as i64;
+
+    // Group requested ids by their volume.
+    let mut by_volume: std::collections::HashMap<String, Vec<i64>> = std::collections::HashMap::new();
+    for id in &body.quarantine_ids {
+        if let Some(rec) = cat.get_file(*id).map_err(err500)? {
+            by_volume.entry(rec.volume_id).or_default().push(*id);
+        }
+    }
+
+    let mut result = QuarantineResultDto::default();
+    for (volume_id, ids) in by_volume {
+        match state.mounts.resolve(&volume_id) {
+            Some(mount) => {
+                let out = crate::quarantine::quarantine_files(&cat, &mount, &volume_id, &ids, now)
+                    .map_err(err500)?;
+                result.quarantined += out.quarantined;
+                result.skipped += out.skipped;
+            }
+            None => {
+                result.skipped += ids.len();
+                result.unmounted_volumes.push(volume_id);
+            }
+        }
+    }
+
+    // Snapshot after the mutation (best-effort; a snapshot failure shouldn't fail the request).
+    if let Ok(cfg) = crate::config::Config::default_paths() {
+        let _ = crate::catalog::backup::snapshot(&cfg.catalog_path, &cfg.backups_dir(),
+            cfg.snapshot_retention, now);
+    }
+    Ok(Json(result))
+}
+
 /// Serve the browse UI on 127.0.0.1 with an OS-assigned free port until the process is stopped.
 pub async fn serve(catalog_path: PathBuf, open: bool) -> anyhow::Result<()> {
     let app = build_router_with(AppState::new_live(catalog_path));
@@ -615,6 +670,50 @@ mod tests {
         let res = app.oneshot(Request::builder().uri(format!("/api/preview/{id}"))
             .body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(res.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    async fn post_json(state: AppState, uri: &str, token: Option<&str>, body: serde_json::Value)
+        -> (axum::http::StatusCode, serde_json::Value)
+    {
+        use axum::body::Body; use axum::http::Request; use tower::ServiceExt;
+        let mut req = Request::builder().method("POST").uri(uri)
+            .header("content-type", "application/json");
+        if let Some(t) = token { req = req.header("x-cleanup-token", t); }
+        let app = build_router_with(state);
+        let res = app.oneshot(req.body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), 5_000_000).await.unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn quarantine_requires_csrf_token() {
+        let (_t, _db, state) = seed_dupes();
+        let (status, _) = post_json(state, "/api/quarantine", None,
+            serde_json::json!({"quarantine_ids":[1]})).await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn quarantine_moves_the_chosen_copy() {
+        let (_t, db, state) = seed_dupes();
+        // put real files on the fake drive so the disk-aware survivor check passes and the move works
+        let drive = match &state.mounts { crate::mounts::MountResolver::Fixed(m) => m["vol-1"].clone(), _ => unreachable!() };
+        std::fs::create_dir_all(drive.join("copy")).unwrap();
+        std::fs::write(drive.join("a.jpg"), b"DUP").unwrap();
+        std::fs::write(drive.join("copy/a.jpg"), b"DUP").unwrap();
+        let cat = crate::catalog::Catalog::open_readonly(&db).unwrap();
+        let victim = cat.active_file_id("vol-1", "copy/a.jpg").unwrap().unwrap();
+        drop(cat);
+
+        let (status, json) = post_json(state, "/api/quarantine", Some("T"),
+            serde_json::json!({"quarantine_ids":[victim]})).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(json["quarantined"], 1);
+        assert!(!drive.join("copy/a.jpg").exists());
+        assert!(drive.join("_ToDelete/copy/a.jpg").exists());
+        assert!(drive.join("a.jpg").exists()); // survivor stays
     }
 
     #[tokio::test]
