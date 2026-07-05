@@ -10,15 +10,34 @@ use crate::catalog::models::FileRecord;
 #[derive(Clone)]
 pub struct AppState {
     pub catalog_path: PathBuf,
+    pub mounts: crate::mounts::MountResolver,
+    pub csrf_token: String,
 }
 
+impl AppState {
+    /// Production state: live mount detection and a fresh random CSRF token.
+    pub fn new_live(catalog_path: PathBuf) -> AppState {
+        AppState {
+            catalog_path,
+            mounts: crate::mounts::MountResolver::Live,
+            csrf_token: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+}
+
+/// Convenience builder used by the CLI and existing tests (live mounts, random token).
 pub fn build_router(catalog_path: PathBuf) -> Router {
+    build_router_with(AppState::new_live(catalog_path))
+}
+
+/// The full router. New review routes are added here in later tasks.
+pub fn build_router_with(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/api/search", get(api_search))
         .route("/api/volumes", get(api_volumes))
         .route("/api/stats", get(api_stats))
-        .with_state(AppState { catalog_path })
+        .with_state(state)
 }
 
 async fn index(State(_state): State<AppState>) -> Html<&'static str> {
@@ -214,7 +233,7 @@ async fn api_stats(State(state): State<AppState>)
 
 /// Serve the browse UI on 127.0.0.1 with an OS-assigned free port until the process is stopped.
 pub async fn serve(catalog_path: PathBuf, open: bool) -> anyhow::Result<()> {
-    let app = build_router(catalog_path);
+    let app = build_router_with(AppState::new_live(catalog_path));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
     let url = format!("http://{}", listener.local_addr()?);
     println!("CleanUpStorages browse UI at {url}");
@@ -244,6 +263,13 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt; // for `oneshot`
+
+    #[test]
+    fn app_state_new_live_has_token_and_live_mounts() {
+        let s = AppState::new_live(PathBuf::from("x.db"));
+        assert!(!s.csrf_token.is_empty());
+        assert!(matches!(s.mounts, crate::mounts::MountResolver::Live));
+    }
 
     #[tokio::test]
     async fn index_returns_200_html() {
