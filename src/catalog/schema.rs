@@ -27,7 +27,8 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
             container_chain TEXT,
             status         TEXT NOT NULL,
             first_seen_at  INTEGER NOT NULL,
-            last_seen_at   INTEGER NOT NULL
+            last_seen_at   INTEGER NOT NULL,
+            original_path  TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_files_hash ON files(content_hash);
         CREATE INDEX IF NOT EXISTS idx_files_volume ON files(volume_id);
@@ -70,7 +71,22 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
             VALUES (new.id, new.filename, new.relative_path);
         END;
         "#,
-    )
+    )?;
+    ensure_column(conn, "files", "original_path", "TEXT")?;
+    Ok(())
+}
+
+/// Add `<table>.<column> <decl>` if it does not already exist (idempotent, data-preserving).
+fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> rusqlite::Result<()> {
+    let exists: i64 = conn.query_row(
+        "SELECT count(*) FROM pragma_table_info(?1) WHERE name=?2",
+        rusqlite::params![table, column],
+        |r| r.get(0),
+    )?;
+    if exists == 0 {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl};"))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -92,5 +108,30 @@ mod tests {
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('volumes','files','scan_errors','actions_log')",
             [], |r| r.get(0)).unwrap();
         assert_eq!(count, 4);
+    }
+
+    #[test]
+    fn migration_adds_original_path_to_preexisting_db() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("c.db");
+        // Simulate an OLD catalog created WITHOUT original_path.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE files (id INTEGER PRIMARY KEY, volume_id TEXT NOT NULL,
+                    relative_path TEXT NOT NULL, filename TEXT NOT NULL, extension TEXT NOT NULL,
+                    size_bytes INTEGER NOT NULL, content_hash TEXT NOT NULL, created_time INTEGER,
+                    modified_time INTEGER, accessed_time INTEGER, category TEXT NOT NULL,
+                    container_chain TEXT, status TEXT NOT NULL, first_seen_at INTEGER NOT NULL,
+                    last_seen_at INTEGER NOT NULL);",
+            ).unwrap();
+        }
+        // Opening through Catalog must migrate it in, not fail.
+        let cat = crate::catalog::Catalog::open(&db).unwrap();
+        let has_col: i64 = cat.conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('files') WHERE name='original_path'",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(has_col, 1);
+        assert!(cat.integrity_ok().unwrap());
     }
 }
