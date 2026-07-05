@@ -230,9 +230,8 @@ $("#confirm").addEventListener("click",async()=>{
   $("#confirm").disabled=true; $("#msg").textContent="Quarantining…";
   try{
     const res=await fetch("/api/quarantine",{method:"POST",headers:{"content-type":"application/json","x-cleanup-token":CSRF},body:JSON.stringify({quarantine_ids:victims})});
-    const j=await res.json();
-    if(!res.ok){ $("#msg").textContent="Error: "+(j&&j!==null?JSON.stringify(j):res.status); }
-    else{ let m=`Quarantined ${j.quarantined}, skipped ${j.skipped}.`; if(j.unmounted_volumes&&j.unmounted_volumes.length) m+=" Some drives not connected."; $("#msg").textContent=m; idx++; render(); }
+    if(!res.ok){ $("#msg").textContent="Error: "+(await res.text()); }
+    else{ const j=await res.json(); let m=`Quarantined ${j.quarantined}, skipped ${j.skipped}.`; if(j.unmounted_volumes&&j.unmounted_volumes.length) m+=" Some drives not connected."; if(j.errors&&j.errors.length) m+=" Errors: "+j.errors.join("; "); $("#msg").textContent=m; idx++; render(); }
   }catch(e){ $("#msg").textContent="Error: "+e; }
   $("#confirm").disabled=false;
 });
@@ -257,10 +256,7 @@ struct HitDto {
 
 impl From<FileRecord> for HitDto {
     fn from(f: FileRecord) -> HitDto {
-        let location = match &f.container_chain {
-            Some(chain) => format!("{} › {}", f.relative_path, chain),
-            None => f.relative_path.clone(),
-        };
+        let location = f.display_location();
         HitDto {
             location,
             relative_path: f.relative_path,
@@ -347,14 +343,6 @@ struct MemberDto {
 #[derive(Serialize)]
 struct GroupDto { hash: String, suggested_keep_id: i64, members: Vec<MemberDto> }
 
-fn display_location(f: &FileRecord) -> String {
-    let base = f.original_path.as_deref().unwrap_or(&f.relative_path);
-    match &f.container_chain {
-        Some(chain) => format!("{base} › {chain}"),
-        None => base.to_string(),
-    }
-}
-
 /// Earliest-created (fallback earliest-modified, fallback smallest id) — keep the original.
 fn suggested_keep(members: &[FileRecord]) -> i64 {
     members.iter().min_by_key(|f| (
@@ -371,15 +359,16 @@ async fn api_duplicates(State(state): State<AppState>)
     let labels: std::collections::HashMap<String, String> = cat.volume_stats().map_err(err500)?
         .into_iter().map(|(id, label, _, _)| (id, label)).collect();
     let groups = cat.duplicate_groups().map_err(err500)?;
+    let mounts = state.mounts.snapshot();
     let mut out = Vec::new();
     for group in groups {
         // Capture the shared content hash before consuming the group's rows.
         let hash = group.first().map(|f| f.content_hash.clone()).unwrap_or_default();
         let keep = suggested_keep(&group);
         let members = group.into_iter().map(|f| {
-            let mounted = state.mounts.resolve(&f.volume_id).is_some();
+            let mounted = mounts.contains_key(&f.volume_id);
             MemberDto {
-                id: f.id, location: display_location(&f), filename: f.filename.clone(),
+                id: f.id, location: f.display_location(), filename: f.filename.clone(),
                 volume_label: labels.get(&f.volume_id).cloned().unwrap_or_default(),
                 volume_id: f.volume_id, size_bytes: f.size_bytes,
                 category: f.category.as_str().to_string(),
@@ -451,7 +440,12 @@ async fn api_preview(State(state): State<AppState>, AxPath(id): AxPath<i64>) -> 
 struct QuarantineReq { quarantine_ids: Vec<i64> }
 
 #[derive(Serialize, Default)]
-struct QuarantineResultDto { quarantined: usize, skipped: usize, unmounted_volumes: Vec<String> }
+struct QuarantineResultDto {
+    quarantined: usize,
+    skipped: usize,
+    unmounted_volumes: Vec<String>,
+    errors: Vec<String>,
+}
 
 /// The web app's first write endpoint. All destructive safety (marker check, disk-aware
 /// last-copy guard, rename-only) lives in `quarantine::quarantine_files`; this handler is just
@@ -468,33 +462,41 @@ async fn api_quarantine(State(state): State<AppState>, headers: HeaderMap, body:
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .map_err(err500)?.as_secs() as i64;
 
-    // Group requested ids by their volume.
+    // Group requested ids by their volume; ids that don't resolve to a file are counted skipped.
     let mut by_volume: std::collections::HashMap<String, Vec<i64>> = std::collections::HashMap::new();
+    let mut missing = 0usize;
     for id in &body.quarantine_ids {
-        if let Some(rec) = cat.get_file(*id).map_err(err500)? {
-            by_volume.entry(rec.volume_id).or_default().push(*id);
+        match cat.get_file(*id).map_err(err500)? {
+            Some(rec) => by_volume.entry(rec.volume_id).or_default().push(*id),
+            None => missing += 1,
         }
     }
 
     let mut result = QuarantineResultDto::default();
+    result.skipped += missing;
+    let mounts = state.mounts.snapshot();
     for (volume_id, ids) in by_volume {
-        match state.mounts.resolve(&volume_id) {
-            Some(mount) => {
-                let out = crate::quarantine::quarantine_files(&cat, &mount, &volume_id, &ids, now)
-                    .map_err(err500)?;
-                result.quarantined += out.quarantined;
-                result.skipped += out.skipped;
+        if let Some(mount) = mounts.get(&volume_id) {
+            match crate::quarantine::quarantine_files(&cat, mount, &volume_id, &ids, now) {
+                Ok(out) => {
+                    result.quarantined += out.quarantined;
+                    result.skipped += out.skipped;
+                }
+                Err(e) => {
+                    result.skipped += ids.len();
+                    result.errors.push(format!("{volume_id}: {e}"));
+                }
             }
-            None => {
-                result.skipped += ids.len();
-                result.unmounted_volumes.push(volume_id);
-            }
+        } else {
+            result.skipped += ids.len();
+            result.unmounted_volumes.push(volume_id);
         }
     }
 
-    // Snapshot after the mutation (best-effort; a snapshot failure shouldn't fail the request).
+    // Snapshot the catalog this request actually mutated (best-effort; a snapshot failure
+    // shouldn't fail the request).
     if let Ok(cfg) = crate::config::Config::default_paths() {
-        let _ = crate::catalog::backup::snapshot(&cfg.catalog_path, &cfg.backups_dir(),
+        let _ = crate::catalog::backup::snapshot(&state.catalog_path, &cfg.backups_dir(),
             cfg.snapshot_retention, now);
     }
     Ok(Json(result))
@@ -813,6 +815,29 @@ mod tests {
         assert!(!drive.join("copy/a.jpg").exists());
         assert!(drive.join("_ToDelete/copy/a.jpg").exists());
         assert!(drive.join("a.jpg").exists()); // survivor stays
+    }
+
+    #[tokio::test]
+    async fn quarantine_reports_unmounted_volume_without_error() {
+        let (_t, db, state) = seed_dupes();
+        {
+            let cat = crate::catalog::Catalog::open(&db).unwrap();
+            cat.upsert_volume(&crate::catalog::models::Volume { volume_id: "vol-2".into(),
+                label: "Offline".into(), identified_by: "marker".into(), first_seen_at: 1, last_seen_at: 1 }).unwrap();
+            cat.upsert_file(&crate::catalog::models::NewFile {
+                volume_id: "vol-2".into(), relative_path: "x.jpg".into(), filename: "x.jpg".into(),
+                extension: "jpg".into(), size_bytes: 5, content_hash: "Z".into(), created_time: None,
+                modified_time: None, accessed_time: None, category: crate::category::Category::Photo,
+                container_chain: None }, 100).unwrap();
+        }
+        let cat = crate::catalog::Catalog::open_readonly(&db).unwrap();
+        let id = cat.active_file_id("vol-2", "x.jpg").unwrap().unwrap();
+        drop(cat);
+        let (status, json) = post_json(state, "/api/quarantine", Some("T"),
+            serde_json::json!({"quarantine_ids":[id]})).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(json["skipped"], 1);
+        assert!(json["unmounted_volumes"].as_array().unwrap().iter().any(|v| v=="vol-2"));
     }
 
     #[tokio::test]

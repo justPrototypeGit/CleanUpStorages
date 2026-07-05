@@ -20,6 +20,14 @@ impl MountResolver {
             MountResolver::Fixed(m) => m.get(volume_id).cloned(),
         }
     }
+
+    /// Snapshot the current volume_id → mount map once (avoids re-enumerating disks per lookup).
+    pub fn snapshot(&self) -> std::collections::HashMap<String, std::path::PathBuf> {
+        match self {
+            MountResolver::Live => live_mounts(),
+            MountResolver::Fixed(m) => m.clone(),
+        }
+    }
 }
 
 /// Build volume_id → root by reading the identity marker at each candidate root.
