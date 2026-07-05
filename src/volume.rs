@@ -58,6 +58,11 @@ fn read_marker(root: &Path) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Read the drive's existing identity marker without creating one. None if absent/unreadable.
+pub fn read_volume_id(root: &Path) -> Option<String> {
+    read_marker(root)
+}
+
 fn try_write_marker(root: &Path) -> std::io::Result<String> {
     use std::fs::OpenOptions;
     let id = uuid::Uuid::new_v4().to_string();
