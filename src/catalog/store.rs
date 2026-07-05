@@ -171,8 +171,11 @@ impl Catalog {
         let q = f.query.trim();
         if !q.is_empty() {
             sql.push_str(" AND id IN (SELECT rowid FROM files_fts WHERE files_fts MATCH ?)");
-            // FTS prefix match on each token
-            let match_expr = q.split_whitespace().map(|t| format!("{t}*")).collect::<Vec<_>>().join(" ");
+            // FTS prefix match on each token; quote as a literal string so punctuation
+            // (", (, -, :) in the query can't be parsed as FTS5 query syntax.
+            let match_expr = q.split_whitespace()
+                .map(|t| format!("\"{}\"*", t.replace('"', "\"\"")))
+                .collect::<Vec<_>>().join(" ");
             args.push(Box::new(match_expr));
         }
         if let Some(c) = &f.category { sql.push_str(" AND category = ?"); args.push(Box::new(c.clone())); }
@@ -367,6 +370,19 @@ mod tests {
         cat.upsert_file(&mk_file("vol-1", "b.txt", "h2"), 200).unwrap();
         let hits = cat.search_filtered(&SearchFilters::default(), 100).unwrap();
         assert_eq!(hits.len(), 2); // empty query = browse all
+    }
+
+    #[test]
+    fn search_tolerates_fts_special_chars() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_file(&mk_file("vol-1", "docs/report(final).pdf", "h1"), 200).unwrap();
+
+        let hits = cat.search("report(final)", None, None, None);
+        assert!(hits.is_ok(), "special-char query must not error: {hits:?}");
+        assert_eq!(hits.unwrap().len(), 1);
+
+        let lone_quote = cat.search("\"", None, None, None);
+        assert!(lone_quote.is_ok(), "lone quote query must not error: {lone_quote:?}");
     }
 
     #[test]

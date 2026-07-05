@@ -82,19 +82,23 @@ const INDEX_HTML: &str = r##"<!doctype html>
 <script>
 const $ = s => document.querySelector(s);
 function fmtSize(n){ const u=["B","KB","MB","GB","TB"]; let i=0,x=n; while(x>=1024&&i<u.length-1){x/=1024;i++;} return (i?x.toFixed(1):x)+" "+u[i]; }
-function esc(s){ const d=document.createElement("div"); d.textContent=s==null?"":s; return d.innerHTML; }
+function esc(s){ return (s==null?"":String(s)).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 let timer=null;
 async function run(){
-  const params=new URLSearchParams();
-  const q=$("#q").value.trim(); if(q) params.set("q",q);
-  for(const k of ["volume","category","status"]){ const v=$("#"+k).value; if(v) params.set(k,v); }
-  const res=await fetch("/api/search?"+params.toString());
-  const hits=await res.json();
-  $("#count").textContent = hits.length+" result"+(hits.length===1?"":"s")+(hits.length>=500?" (showing first 500)":"");
-  $("#results").innerHTML = hits.map(h=>{
-    const flag = h.status==="active" ? "" : `<span class="flag ${esc(h.status)}">${esc(h.status)}</span>`;
-    return `<tr><td class="loc">${esc(h.location)}</td><td>${esc(h.volume_id)}</td><td>${esc(h.category)}</td><td class="size">${fmtSize(h.size_bytes)}</td><td>${flag}</td></tr>`;
-  }).join("");
+  try {
+    const params=new URLSearchParams();
+    const q=$("#q").value.trim(); if(q) params.set("q",q);
+    for(const k of ["volume","category","status"]){ const v=$("#"+k).value; if(v) params.set(k,v); }
+    const res=await fetch("/api/search?"+params.toString());
+    const hits=await res.json();
+    $("#count").textContent = hits.length+" result"+(hits.length===1?"":"s")+(hits.length>=500?" (showing first 500)":"");
+    $("#results").innerHTML = hits.map(h=>{
+      const flag = h.status==="active" ? "" : `<span class="flag ${esc(h.status)}">${esc(h.status)}</span>`;
+      return `<tr><td class="loc">${esc(h.location)}</td><td>${esc(h.volume_id)}</td><td>${esc(h.category)}</td><td class="size">${fmtSize(h.size_bytes)}</td><td>${flag}</td></tr>`;
+    }).join("");
+  } catch(e) {
+    $("#count").textContent = "Search error: "+e;
+  }
 }
 function debounced(){ clearTimeout(timer); timer=setTimeout(run,180); }
 async function init(){
@@ -172,7 +176,7 @@ fn err500<E: std::fmt::Display>(e: E) -> (axum::http::StatusCode, String) {
 async fn api_search(State(state): State<AppState>, Query(p): Query<SearchParams>)
     -> Result<Json<Vec<HitDto>>, (axum::http::StatusCode, String)>
 {
-    let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
+    let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
     let filters = SearchFilters {
         query: p.q.unwrap_or_default(),
         category: p.category, volume: p.volume, status: p.status,
@@ -195,14 +199,14 @@ fn volume_dtos(cat: &Catalog) -> anyhow::Result<Vec<VolumeDto>> {
 async fn api_volumes(State(state): State<AppState>)
     -> Result<Json<Vec<VolumeDto>>, (axum::http::StatusCode, String)>
 {
-    let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
+    let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
     Ok(Json(volume_dtos(&cat).map_err(err500)?))
 }
 
 async fn api_stats(State(state): State<AppState>)
     -> Result<Json<StatsDto>, (axum::http::StatusCode, String)>
 {
-    let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
+    let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
     let duplicate_groups = cat.duplicate_group_count().map_err(err500)?;
     let volumes = volume_dtos(&cat).map_err(err500)?;
     Ok(Json(StatsDto { duplicate_groups, volumes }))
