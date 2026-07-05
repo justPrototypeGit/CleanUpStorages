@@ -56,6 +56,13 @@ enum Command {
         /// Current mount path of the drive to purge.
         mount: std::path::PathBuf,
     },
+    /// Remove one entry from a top-level zip by rebuilding it (Case 4; needs a surviving copy).
+    Repack {
+        /// Current mount path of the drive holding the archive.
+        mount: std::path::PathBuf,
+        /// Catalog id of the archived entry to remove (from `duplicates`).
+        entry_id: i64,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -72,5 +79,6 @@ fn main() -> anyhow::Result<()> {
         Command::Duplicates => commands::cmd_duplicates(),
         Command::Quarantine { mount, ids } => commands::cmd_quarantine(&mount, &ids),
         Command::Purge { mount } => commands::cmd_purge(&mount),
+        Command::Repack { mount, entry_id } => commands::cmd_repack(&mount, entry_id),
     }
 }
