@@ -70,6 +70,18 @@ pub struct FileRecord {
     pub original_path: Option<String>,
 }
 
+impl FileRecord {
+    /// Human location: origin path if quarantined (original_path), else current relative_path,
+    /// with the archive container chain appended for archived entries.
+    pub fn display_location(&self) -> String {
+        let base = self.original_path.as_deref().unwrap_or(&self.relative_path);
+        match &self.container_chain {
+            Some(chain) => format!("{base} › {chain}"),
+            None => base.to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
