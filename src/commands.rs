@@ -108,21 +108,12 @@ pub fn cmd_duplicates() -> anyhow::Result<()> {
     for group in &groups {
         println!("hash {} — {} copies:", &group[0].content_hash[..16.min(group[0].content_hash.len())], group.len());
         for f in group {
-            let loc = display_location(f);
+            let loc = f.display_location();
             println!("  #{}  {}  [{}]  {} bytes  {}",
                 f.id, loc, f.volume_id, f.size_bytes, f.status.as_str());
         }
     }
     Ok(())
-}
-
-/// Where a file is / came from, for display.
-fn display_location(f: &crate::catalog::models::FileRecord) -> String {
-    let base = f.original_path.as_deref().unwrap_or(&f.relative_path);
-    match &f.container_chain {
-        Some(chain) => format!("{base} › {chain}"),
-        None => base.to_string(),
-    }
 }
 
 pub fn cmd_quarantine(mount: &Path, ids: &[i64]) -> anyhow::Result<()> {

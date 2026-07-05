@@ -36,7 +36,16 @@ Not blockers — 1b shipped with the two catalog/zip-bomb correctness fixes appl
 Shipped clean (all four review findings fixed: read-only per-request catalog open, FTS-token quoting, page error handling, quote-safe escaping). Remaining enhancements:
 
 - **Surface size/date filters in the browse UI.** `SearchFilters` and `/api/search` already accept `min_size`/`max_size`/`modified_after`/`modified_before`, but the page only exposes query + volume + category + status controls. Add size and date-range inputs to the header when wanted. (Date filtering uses `modified_time`, which is NULL for archive entries, so a date filter currently excludes archived content — decide whether that's desired or whether archive entries should inherit the containing archive's mtime.)
-- **When the review GUI arrives (Phase 2)**, it will add action endpoints (confirm-duplicate, quarantine) to this same server; those are the first *write* endpoints and will need care (CSRF is minimal on localhost, but the read-only-open split means write handlers must use the read-write `Catalog::open` deliberately).
+- **When the review GUI arrives (Phase 2)**, it will add action endpoints (confirm-duplicate, quarantine) to this same server; those are the first *write* endpoints and will need care (CSRF is minimal on localhost, but the read-only-open split means write handlers must use the read-write `Catalog::open` deliberately). **[Done in 2b: CSRF token guard + read-write open + reversible-only quarantine.]**
+
+## Follow-ups logged from the Phase 2b (review GUI) code review (2026-07-05)
+
+Shipped clean — no Critical issues; the two Important items (partial-failure hiding committed moves; per-member disk enumeration) and the location-formatter divergence were fixed before merge. Remaining minors:
+
+- **Bound the thumbnail decoder.** `thumbnail_jpeg` decodes at full resolution before downscaling with no `image::Limits`. A pathological on-disk image (decompression bomb / huge dimensions) could spike memory during preview. Malformed input already returns `Err`→404 (no panic), and the threat model is the user's own files on localhost, but decoding via `image::ImageReader::…limits(…)` would make "bounded" true end-to-end.
+- **Preview doesn't filter `status='active'`.** A quarantined/purged record can still be previewed if its bytes are still readable at `relative_path` (returns 404 once moved). Harmless and arguably useful (preview before confirming removal); add an `active` gate only if strict consistency is wanted.
+- **`esc()` and `fmtSize()` are duplicated** across the two inline `<script>` blocks (`INDEX_HTML`/`REVIEW_HTML`). Inherent to two self-contained pages; a shared inlined snippet would stop them drifting.
+- **Carried (unchanged by 2b):** extract `const FILE_COLUMNS` for the 16-column file SELECTs; `active_file_id` status filter/rename; purge bookkeeping transaction; rescan-before-quarantine survivor UX; surface "the safe-to-remove copy lives on an unconnected drive"; size/date UI filters on browse; `container_chain` in FTS.
 
 ## Follow-ups logged from the Phase 2a (quarantine/purge) code review (2026-07-04)
 
