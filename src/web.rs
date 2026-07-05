@@ -576,6 +576,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preview_returns_404_for_undecodable_bytes() {
+        use axum::body::Body; use axum::http::Request; use tower::ServiceExt;
+        let (_t, db, state) = seed_dupes();
+        // write garbage bytes (not an image) at the loose path on the fake drive
+        let drive = match &state.mounts { crate::mounts::MountResolver::Fixed(m) => m["vol-1"].clone(), _ => unreachable!() };
+        std::fs::write(drive.join("a.jpg"), b"this is not an image").unwrap();
+        // find a.jpg's id
+        let cat = crate::catalog::Catalog::open_readonly(&db).unwrap();
+        let id = cat.active_file_id("vol-1", "a.jpg").unwrap().unwrap();
+
+        let app = build_router_with(state);
+        let res = app.oneshot(Request::builder().uri(format!("/api/preview/{id}"))
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn preview_returns_404_for_non_photo() {
+        use axum::body::Body; use axum::http::Request; use tower::ServiceExt;
+        let (_t, db, state) = seed_dupes();
+        // insert a DOCUMENT-category loose file into the catalog
+        {
+            let cat = crate::catalog::Catalog::open(&db).unwrap();
+            let doc = crate::catalog::models::NewFile {
+                volume_id: "vol-1".into(), relative_path: "notes.txt".into(),
+                filename: "notes.txt".into(), extension: "txt".into(), size_bytes: 100,
+                content_hash: "doc_hash".into(), created_time: Some(3000),
+                modified_time: Some(3000), accessed_time: None,
+                category: crate::category::Category::Document, container_chain: None };
+            cat.upsert_file(&doc, 100).unwrap();
+        }
+        // find notes.txt's id
+        let cat = crate::catalog::Catalog::open_readonly(&db).unwrap();
+        let id = cat.active_file_id("vol-1", "notes.txt").unwrap().unwrap();
+
+        let app = build_router_with(state);
+        let res = app.oneshot(Request::builder().uri(format!("/api/preview/{id}"))
+            .body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn index_page_has_search_ui_and_calls_api() {
         use axum::body::Body;
         use axum::http::Request;
