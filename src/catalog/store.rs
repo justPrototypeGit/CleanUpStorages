@@ -194,6 +194,123 @@ impl Catalog {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Id of the loose file at this path, if catalogued, regardless of status.
+    ///
+    /// Not part of this task's brief, but required by its own tests (and every
+    /// downstream quarantine/purge task): it was specified in the Phase 1a plan
+    /// but never actually implemented. Added here as a small, fully-specified
+    /// helper rather than blocking on it.
+    pub fn active_file_id(&self, volume_id: &str, relative_path: &str) -> anyhow::Result<Option<i64>> {
+        let row = self.conn.query_row(
+            "SELECT id FROM files WHERE volume_id=?1 AND relative_path=?2 AND container_chain IS NULL",
+            params![volume_id, relative_path],
+            |r| r.get::<_, i64>(0),
+        );
+        match row {
+            Ok(id) => Ok(Some(id)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Fetch a single file record by id.
+    pub fn get_file(&self, id: i64) -> anyhow::Result<Option<FileRecord>> {
+        let row = self.conn.query_row(
+            "SELECT id, volume_id, relative_path, filename, extension, size_bytes, content_hash,
+                    created_time, modified_time, accessed_time, category, container_chain,
+                    status, first_seen_at, last_seen_at, original_path FROM files WHERE id=?1",
+            params![id], Self::map_file_record,
+        );
+        match row {
+            Ok(r) => Ok(Some(r)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Groups of ≥2 active files (loose or archived) sharing a content_hash,
+    /// ordered by hash then id. Consecutive rows with the same hash form a group.
+    pub fn duplicate_groups(&self) -> anyhow::Result<Vec<Vec<FileRecord>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, volume_id, relative_path, filename, extension, size_bytes, content_hash,
+                    created_time, modified_time, accessed_time, category, container_chain,
+                    status, first_seen_at, last_seen_at, original_path FROM files
+             WHERE status='active' AND content_hash IN (
+                 SELECT content_hash FROM files WHERE status='active'
+                 GROUP BY content_hash HAVING count(*) > 1)
+             ORDER BY content_hash, id",
+        )?;
+        let rows = stmt.query_map([], Self::map_file_record)?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut groups: Vec<Vec<FileRecord>> = Vec::new();
+        for r in rows {
+            match groups.last_mut() {
+                Some(g) if g[0].content_hash == r.content_hash => g.push(r),
+                _ => groups.push(vec![r]),
+            }
+        }
+        Ok(groups)
+    }
+
+    /// True iff some `status='active'` row with this hash has an id not in `excluding`.
+    /// This is the "never remove the last copy" guard used before quarantining a duplicate.
+    pub fn active_survivor_exists(&self, hash: &str, excluding: &[i64]) -> anyhow::Result<bool> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM files WHERE content_hash=?1 AND status='active'")?;
+        let ids = stmt.query_map(params![hash], |r| r.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ids.iter().any(|id| !excluding.contains(id)))
+    }
+
+    /// Move a file into quarantine: records where it moved to and where it came from.
+    pub fn mark_quarantined(&self, id: i64, new_relative_path: &str, original_path: &str, now: i64)
+        -> anyhow::Result<()>
+    {
+        self.conn.execute(
+            "UPDATE files SET status='quarantined', relative_path=?2, original_path=?3, last_seen_at=?4
+             WHERE id=?1",
+            params![id, new_relative_path, original_path, now],
+        )?;
+        Ok(())
+    }
+
+    /// All quarantined rows for a volume, ordered by id.
+    pub fn quarantined_rows(&self, volume_id: &str) -> anyhow::Result<Vec<FileRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, volume_id, relative_path, filename, extension, size_bytes, content_hash,
+                    created_time, modified_time, accessed_time, category, container_chain,
+                    status, first_seen_at, last_seen_at, original_path FROM files
+             WHERE volume_id=?1 AND status='quarantined' ORDER BY id",
+        )?;
+        let rows = stmt.query_map(params![volume_id], Self::map_file_record)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Mark a quarantined file as permanently purged.
+    pub fn mark_purged(&self, id: i64, now: i64) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE files SET status='purged', last_seen_at=?2 WHERE id=?1",
+            params![id, now])?;
+        Ok(())
+    }
+
+    /// Total bytes that would be reclaimed by purging this volume's quarantined files.
+    pub fn recoverable_bytes(&self, volume_id: &str) -> anyhow::Result<i64> {
+        let n = self.conn.query_row(
+            "SELECT IFNULL(sum(size_bytes),0) FROM files WHERE volume_id=?1 AND status='quarantined'",
+            params![volume_id], |r| r.get(0))?;
+        Ok(n)
+    }
+
+    /// Append an audit entry to actions_log.
+    pub fn log_action(&self, action: &str, details_json: &str, now: i64) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT INTO actions_log(action, details, occurred_at) VALUES (?1,?2,?3)",
+            params![action, details_json, now])?;
+        Ok(())
+    }
+
     fn map_file_record(r: &rusqlite::Row) -> rusqlite::Result<FileRecord> {
         Ok(FileRecord {
             id: r.get(0)?,
@@ -384,6 +501,61 @@ mod tests {
 
         let lone_quote = cat.search("\"", None, None, None);
         assert!(lone_quote.is_ok(), "lone quote query must not error: {lone_quote:?}");
+    }
+
+    #[test]
+    fn duplicate_groups_lists_members() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_file(&mk_file("vol-1", "a.txt", "same"), 200).unwrap();
+        cat.upsert_file(&mk_file("vol-1", "b.txt", "same"), 200).unwrap();
+        cat.upsert_file(&mk_file("vol-1", "c.txt", "unique"), 200).unwrap();
+        let groups = cat.duplicate_groups().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn survivor_check_respects_exclusions() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_file(&mk_file("vol-1", "a.txt", "same"), 200).unwrap();
+        cat.upsert_file(&mk_file("vol-1", "b.txt", "same"), 200).unwrap();
+        let a = cat.active_file_id("vol-1", "a.txt").unwrap().unwrap();
+        let b = cat.active_file_id("vol-1", "b.txt").unwrap().unwrap();
+        // excluding one of two leaves a survivor
+        assert!(cat.active_survivor_exists("same", &[a]).unwrap());
+        // excluding both leaves none
+        assert!(!cat.active_survivor_exists("same", &[a, b]).unwrap());
+        // a unique hash has no survivor once excluded
+        assert!(!cat.active_survivor_exists("nope", &[]).unwrap());
+    }
+
+    #[test]
+    fn quarantine_then_purge_transitions_and_recoverable() {
+        let (_t, cat) = open_tmp();
+        let mut f = mk_file("vol-1", "Photos/a.jpg", "h"); f.size_bytes = 2048;
+        cat.upsert_file(&f, 200).unwrap();
+        let id = cat.active_file_id("vol-1", "Photos/a.jpg").unwrap().unwrap();
+
+        cat.mark_quarantined(id, "_ToDelete/Photos/a.jpg", "Photos/a.jpg", 300).unwrap();
+        let rec = cat.get_file(id).unwrap().unwrap();
+        assert_eq!(rec.status, FileStatus::Quarantined);
+        assert_eq!(rec.relative_path, "_ToDelete/Photos/a.jpg");
+        assert_eq!(rec.original_path.as_deref(), Some("Photos/a.jpg"));
+        assert_eq!(cat.recoverable_bytes("vol-1").unwrap(), 2048);
+        assert_eq!(cat.quarantined_rows("vol-1").unwrap().len(), 1);
+
+        cat.mark_purged(id, 400).unwrap();
+        assert_eq!(cat.get_file(id).unwrap().unwrap().status, FileStatus::Purged);
+        assert_eq!(cat.recoverable_bytes("vol-1").unwrap(), 0);
+    }
+
+    #[test]
+    fn log_action_appends() {
+        let (_t, cat) = open_tmp();
+        cat.log_action("quarantine", "{\"file_id\":1}", 100).unwrap();
+        cat.log_action("purge", "{\"volume_id\":\"v\"}", 200).unwrap();
+        let n: i64 = cat.conn.query_row("SELECT count(*) FROM actions_log", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 2);
     }
 
     #[test]
