@@ -9,4 +9,5 @@ pub mod quarantine;
 pub mod purge;
 pub mod commands;
 pub mod archive;
+pub mod repack;
 pub mod web;

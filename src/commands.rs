@@ -8,7 +8,7 @@ use crate::volume::{self, ReadonlyMode};
 use crate::scanner;
 use crate::catalog::backup;
 use crate::web;
-use crate::{quarantine, purge};
+use crate::{quarantine, purge, repack};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum ReadonlyFallback { Ask, Fingerprint, Skip }
@@ -140,6 +140,21 @@ pub fn cmd_purge(mount: &Path) -> anyhow::Result<()> {
     println!("Catalog snapshot (pre-purge): {}", snap.display());
     let out = purge::purge_volume(&cat, mount, &vid, now)?;
     println!("Purged {} file(s), reclaimed {} MiB.", out.files_purged, out.bytes_reclaimed / (1024*1024));
+    Ok(())
+}
+
+pub fn cmd_repack(mount: &Path, entry_id: i64) -> anyhow::Result<()> {
+    let cfg = Config::default_paths()?;
+    let cat = Catalog::open(&cfg.catalog_path)?;
+    let vid = crate::volume::read_volume_id(mount)
+        .ok_or_else(|| anyhow::anyhow!("no identity marker at {}; scan the drive first", mount.display()))?;
+    let now = now_secs();
+    // snapshot BEFORE modifying an archive
+    let snap = backup::snapshot(&cfg.catalog_path, &cfg.backups_dir(), cfg.snapshot_retention, now)?;
+    println!("Catalog snapshot (pre-repack): {}", snap.display());
+    let out = repack::repack_entry(&cat, mount, &vid, entry_id, now)?;
+    println!("Repacked: removed '{}', {} entries retained. Original archive and removed item saved in _ToDelete (recoverable until purge).",
+        out.removed_entry, out.retained_entries);
     Ok(())
 }
 

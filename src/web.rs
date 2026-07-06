@@ -44,6 +44,7 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/duplicates", get(api_duplicates))
         .route("/api/preview/:id", get(api_preview))
         .route("/api/quarantine", post(api_quarantine))
+        .route("/api/repack", post(api_repack))
         .route("/review", get(review))
         .with_state(state)
 }
@@ -205,10 +206,23 @@ function render(){
   $("#group").innerHTML=`<div class="cards">${g.members.map(m=>card(m)).join("")}</div>`;
   for(const el of document.querySelectorAll(".card")) el.addEventListener("click",()=>{ keepId=Number(el.dataset.id); paint(); });
   paint();
+  for(const b of document.querySelectorAll(".repack")) b.addEventListener("click", async (ev)=>{
+    ev.stopPropagation();
+    const id=Number(b.dataset.id);
+    b.disabled=true; $("#msg").textContent="Repacking archive…";
+    try{
+      const res=await fetch("/api/repack",{method:"POST",headers:{"content-type":"application/json","x-cleanup-token":CSRF},body:JSON.stringify({entry_id:id})});
+      if(!res.ok){ $("#msg").textContent="Repack error: "+(await res.text()); b.disabled=false; }
+      else{ const j=await res.json(); $("#msg").textContent=`Removed '${j.removed_entry}' from its archive (${j.retained_entries} kept). Original saved in _ToDelete.`; idx++; render(); }
+    }catch(e){ $("#msg").textContent="Repack error: "+e; b.disabled=false; }
+  });
 }
 function card(m){
   const img=(m.category==="photo"&&m.mounted)?`<img class="thumb" loading="lazy" src="/api/preview/${m.id}" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'noimg',textContent:'no preview'}))">`:`<div class="noimg">${m.mounted?"no preview":"drive not connected"}</div>`;
-  const arch=m.is_loose?"":`<div class="arch">inside archive — can't quarantine individually yet</div>`;
+  const arch = m.is_loose ? "" :
+    (m.id===keepId ? `<div class="arch">inside archive</div>`
+     : m.mounted ? `<button class="danger repack" data-id="${m.id}">Remove from archive</button>`
+                 : `<div class="arch">drive not connected</div>`);
   return `<div class="card" data-id="${m.id}">${img}
     <div class="loc">${esc(m.location)}</div>
     <div class="kv"><b>${esc(m.volume_label||m.volume_id)}</b></div>
@@ -500,6 +514,41 @@ async fn api_quarantine(State(state): State<AppState>, headers: HeaderMap, body:
             cfg.snapshot_retention, now);
     }
     Ok(Json(result))
+}
+
+#[derive(Deserialize)]
+struct RepackReq { entry_id: i64 }
+
+#[derive(Serialize)]
+struct RepackResultDto { removed_entry: String, retained_entries: usize }
+
+/// Remove one entry from its containing archive (Case 4). All destructive safety (marker gate,
+/// disk-aware survivor guard, verify-before-swap, two recovery nets) lives in `repack::repack_entry`;
+/// this handler is just the CSRF gate plus resolving the entry's volume to a mounted drive.
+async fn api_repack(State(state): State<AppState>, headers: HeaderMap, body: Json<RepackReq>)
+    -> Result<Json<RepackResultDto>, (StatusCode, String)>
+{
+    // CSRF: checked first, before any catalog access, so a bad/missing token does nothing.
+    let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
+    if !ok { return Err((StatusCode::FORBIDDEN, "missing or bad token".into())); }
+
+    let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
+    let rec = cat.get_file(body.entry_id).map_err(err500)?
+        .ok_or((StatusCode::NOT_FOUND, "no such entry".to_string()))?;
+    let mount = state.mounts.resolve(&rec.volume_id)
+        .ok_or((StatusCode::CONFLICT, "drive not connected".to_string()))?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map_err(err500)?.as_secs() as i64;
+    let out = crate::repack::repack_entry(&cat, &mount, &rec.volume_id, body.entry_id, now)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    // Snapshot the catalog this request actually mutated (best-effort; a snapshot failure
+    // shouldn't fail the request).
+    if let Ok(cfg) = crate::config::Config::default_paths() {
+        let _ = crate::catalog::backup::snapshot(&state.catalog_path, &cfg.backups_dir(),
+            cfg.snapshot_retention, now);
+    }
+    Ok(Json(RepackResultDto { removed_entry: out.removed_entry, retained_entries: out.retained_entries }))
 }
 
 /// Serve the browse UI on 127.0.0.1 with an OS-assigned free port until the process is stopped.
@@ -838,6 +887,135 @@ mod tests {
         assert_eq!(status, axum::http::StatusCode::OK);
         assert_eq!(json["skipped"], 1);
         assert!(json["unmounted_volumes"].as_array().unwrap().iter().any(|v| v=="vol-2"));
+    }
+
+    #[tokio::test]
+    async fn repack_requires_csrf_token() {
+        let (_t, _db, state) = seed_dupes();
+        let (status, _) = post_json(state, "/api/repack", None,
+            serde_json::json!({"entry_id": 1})).await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn repack_removes_entry_over_http() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("c.db");
+        let drive = tmp.path().join("driveA");
+        std::fs::create_dir_all(&drive).unwrap();
+        std::fs::write(drive.join(".cleanupstorages_id"), "vol-1").unwrap();
+        {
+            use std::io::Write;
+            let f = std::fs::File::create(drive.join("bundle.zip")).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (n, b) in [("keep.txt", &b"KEEP"[..]), ("dup.txt", &b"SHARED"[..])] {
+                zw.start_file(n, opts).unwrap(); zw.write_all(b).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        std::fs::write(drive.join("loose_dup.txt"), b"SHARED").unwrap();
+        {
+            let cat = crate::catalog::Catalog::open(&db).unwrap();
+            cat.upsert_volume(&crate::catalog::models::Volume { volume_id: "vol-1".into(),
+                label: "D".into(), identified_by: "marker".into(), first_seen_at: 1, last_seen_at: 1 }).unwrap();
+            let ident = crate::volume::VolumeIdentity { volume_id: "vol-1".into(), label: "D".into(),
+                identified_by: "marker".into() };
+            crate::scanner::scan_volume(&cat, &drive, &ident, false, 100).unwrap();
+        }
+        let mut mounts = std::collections::HashMap::new();
+        mounts.insert("vol-1".to_string(), drive.clone());
+        let state = AppState { catalog_path: db.clone(),
+            mounts: crate::mounts::MountResolver::Fixed(mounts), csrf_token: "T".into() };
+
+        let cat = crate::catalog::Catalog::open_readonly(&db).unwrap();
+        let entry_id = cat.archive_entries("vol-1", "bundle.zip").unwrap()
+            .into_iter().find(|e| e.container_chain.as_deref() == Some("dup.txt")).unwrap().id;
+        drop(cat);
+
+        let (status, json) = post_json(state, "/api/repack", Some("T"),
+            serde_json::json!({"entry_id": entry_id})).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "body {json}");
+        assert_eq!(json["removed_entry"], "dup.txt");
+
+        let f = std::fs::File::open(drive.join("bundle.zip")).unwrap();
+        let mut z = zip::ZipArchive::new(f).unwrap();
+        assert!(z.by_name("keep.txt").is_ok());
+        assert!(z.by_name("dup.txt").is_err());
+    }
+
+    #[tokio::test]
+    async fn repack_returns_409_when_drive_not_connected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("c.db");
+        let entry_id;
+        {
+            let cat = crate::catalog::Catalog::open(&db).unwrap();
+            cat.upsert_volume(&crate::catalog::models::Volume { volume_id: "vol-1".into(),
+                label: "D".into(), identified_by: "marker".into(), first_seen_at: 1, last_seen_at: 1 }).unwrap();
+            cat.upsert_archive_entry("vol-1", "bundle.zip",
+                &crate::archive::ArchiveEntry { container_chain: "inner.txt".into(),
+                    filename: "inner.txt".into(), extension: "txt".into(), size_bytes: 6,
+                    content_hash: "H".into() }, 100).unwrap();
+            entry_id = cat.archive_entries("vol-1", "bundle.zip").unwrap()
+                .into_iter().find(|e| e.container_chain.as_deref() == Some("inner.txt")).unwrap().id;
+        }
+        // No volumes mounted at all.
+        let state = AppState { catalog_path: db.clone(),
+            mounts: crate::mounts::MountResolver::Fixed(std::collections::HashMap::new()),
+            csrf_token: "T".into() };
+
+        let (status, _) = post_json(state, "/api/repack", Some("T"),
+            serde_json::json!({"entry_id": entry_id})).await;
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn repack_returns_400_when_no_survivor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("c.db");
+        let drive = tmp.path().join("driveA");
+        std::fs::create_dir_all(&drive).unwrap();
+        std::fs::write(drive.join(".cleanupstorages_id"), "vol-1").unwrap();
+        {
+            use std::io::Write;
+            let f = std::fs::File::create(drive.join("bundle.zip")).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (n, b) in [("keep.txt", &b"KEEP"[..]), ("dup.txt", &b"SHARED"[..])] {
+                zw.start_file(n, opts).unwrap(); zw.write_all(b).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        // NOTE: no loose survivor copy written this time — dup.txt inside the zip is the only copy.
+        {
+            let cat = crate::catalog::Catalog::open(&db).unwrap();
+            cat.upsert_volume(&crate::catalog::models::Volume { volume_id: "vol-1".into(),
+                label: "D".into(), identified_by: "marker".into(), first_seen_at: 1, last_seen_at: 1 }).unwrap();
+            let ident = crate::volume::VolumeIdentity { volume_id: "vol-1".into(), label: "D".into(),
+                identified_by: "marker".into() };
+            crate::scanner::scan_volume(&cat, &drive, &ident, false, 100).unwrap();
+        }
+        let mut mounts = std::collections::HashMap::new();
+        mounts.insert("vol-1".to_string(), drive.clone());
+        let state = AppState { catalog_path: db.clone(),
+            mounts: crate::mounts::MountResolver::Fixed(mounts), csrf_token: "T".into() };
+
+        let cat = crate::catalog::Catalog::open_readonly(&db).unwrap();
+        let entry_id = cat.archive_entries("vol-1", "bundle.zip").unwrap()
+            .into_iter().find(|e| e.container_chain.as_deref() == Some("dup.txt")).unwrap().id;
+        drop(cat);
+
+        let (status, _json) = post_json(state, "/api/repack", Some("T"),
+            serde_json::json!({"entry_id": entry_id})).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+
+        // Archive untouched: dup.txt is still inside.
+        let f = std::fs::File::open(drive.join("bundle.zip")).unwrap();
+        let mut z = zip::ZipArchive::new(f).unwrap();
+        assert!(z.by_name("dup.txt").is_ok());
     }
 
     #[tokio::test]
