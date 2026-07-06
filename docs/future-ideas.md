@@ -47,6 +47,17 @@ Shipped clean — no Critical issues; the two Important items (partial-failure h
 - **`esc()` and `fmtSize()` are duplicated** across the two inline `<script>` blocks (`INDEX_HTML`/`REVIEW_HTML`). Inherent to two self-contained pages; a shared inlined snippet would stop them drifting.
 - **Carried (unchanged by 2b):** extract `const FILE_COLUMNS` for the 16-column file SELECTs; `active_file_id` status filter/rename; purge bookkeeping transaction; rescan-before-quarantine survivor UX; surface "the safe-to-remove copy lives on an unconnected drive"; size/date UI filters on browse; `container_chain` in FTS.
 
+## Follow-ups logged from the Phase 2c (archive repack, Case 4) code review (2026-07-06)
+
+Shipped clean — the final review found **no Critical issues** (no data-loss/corruption/last-copy/token-less path); the Important button-gate bug and the diverged `quarantine_dest` were fixed before merge. Remaining minors:
+
+- **Post-swap catalog writes aren't transactional** (`repack_entry` step 10: `mark_quarantined` + `update_archive_hash` + `log_action`). A failure after the on-disk swap leaves the catalog partially updated; it self-heals on the next scan (documented in a code comment now). Wrapping the three in one transaction would make the bookkeeping atomic.
+- **`update_archive_hash` doesn't update `modified_time`** — harmless (guarantees the archive re-hashes next scan) but leaves the row's mtime momentarily inconsistent with disk.
+- **`available_space` returning `None` skips the pre-flight space check** (now warns). On a near-full drive the failure would then surface at the swap's rename (which rolls back safely) rather than at the guard.
+- **`verify_rebuilt` only hash-checks catalogued entries** — un-catalogued entries are preserved byte-for-byte by `raw_copy_file` but not re-hashed (documented in a comment now).
+- **Cross-drive scratch location for near-full drives (spec §11)** — 2c builds the temp on the same drive with a pre-flight check; a configurable scratch dir on another disk (with a cross-device build+verify+swap) is deferred.
+- **`available_space`/`total_capacity` (sysinfo) duplicated** between `repack.rs` and `volume.rs`; the 16-column file SELECT is now in ~7 methods — fold into shared helpers with the carried `FILE_COLUMNS` item.
+
 ## Follow-ups logged from the Phase 2a (quarantine/purge) code review (2026-07-04)
 
 Shipped clean — the final review's two data-safety findings were fixed before merge (disk-aware survivor check so a stale catalog can't cause last-copy loss; catalog-aware `quarantine_dest` so a purged row's path can't orphan a re-quarantined file). Remaining cleanups:
