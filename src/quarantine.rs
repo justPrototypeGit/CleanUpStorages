@@ -93,7 +93,7 @@ pub fn quarantine_files(
 /// extension of the LAST path segment only, preserving the directory). A candidate is only
 /// acceptable when NEITHER the file exists on disk NOR a loose catalog row already claims it
 /// (e.g. a purged row still occupying the loose unique index) — avoiding a post-rename orphan.
-fn quarantine_dest(cat: &Catalog, mount_root: &Path, volume_id: &str, origin_rel: &str)
+pub(crate) fn quarantine_dest(cat: &Catalog, mount_root: &Path, volume_id: &str, origin_rel: &str)
     -> anyhow::Result<String>
 {
     let base = format!("{}/{origin_rel}", crate::volume::QUARANTINE_DIR);
