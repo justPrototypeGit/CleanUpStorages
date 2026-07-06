@@ -220,8 +220,9 @@ function render(){
 function card(m){
   const img=(m.category==="photo"&&m.mounted)?`<img class="thumb" loading="lazy" src="/api/preview/${m.id}" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'noimg',textContent:'no preview'}))">`:`<div class="noimg">${m.mounted?"no preview":"drive not connected"}</div>`;
   const arch = m.is_loose ? "" :
-    (m.mounted ? `<button class="danger repack" data-id="${m.id}">Remove from archive</button>`
-               : `<div class="arch">inside archive — drive not connected</div>`);
+    (m.id===keepId ? `<div class="arch">inside archive</div>`
+     : m.mounted ? `<button class="danger repack" data-id="${m.id}">Remove from archive</button>`
+                 : `<div class="arch">drive not connected</div>`);
   return `<div class="card" data-id="${m.id}">${img}
     <div class="loc">${esc(m.location)}</div>
     <div class="kv"><b>${esc(m.volume_label||m.volume_id)}</b></div>
@@ -942,6 +943,79 @@ mod tests {
         let mut z = zip::ZipArchive::new(f).unwrap();
         assert!(z.by_name("keep.txt").is_ok());
         assert!(z.by_name("dup.txt").is_err());
+    }
+
+    #[tokio::test]
+    async fn repack_returns_409_when_drive_not_connected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("c.db");
+        let entry_id;
+        {
+            let cat = crate::catalog::Catalog::open(&db).unwrap();
+            cat.upsert_volume(&crate::catalog::models::Volume { volume_id: "vol-1".into(),
+                label: "D".into(), identified_by: "marker".into(), first_seen_at: 1, last_seen_at: 1 }).unwrap();
+            cat.upsert_archive_entry("vol-1", "bundle.zip",
+                &crate::archive::ArchiveEntry { container_chain: "inner.txt".into(),
+                    filename: "inner.txt".into(), extension: "txt".into(), size_bytes: 6,
+                    content_hash: "H".into() }, 100).unwrap();
+            entry_id = cat.archive_entries("vol-1", "bundle.zip").unwrap()
+                .into_iter().find(|e| e.container_chain.as_deref() == Some("inner.txt")).unwrap().id;
+        }
+        // No volumes mounted at all.
+        let state = AppState { catalog_path: db.clone(),
+            mounts: crate::mounts::MountResolver::Fixed(std::collections::HashMap::new()),
+            csrf_token: "T".into() };
+
+        let (status, _) = post_json(state, "/api/repack", Some("T"),
+            serde_json::json!({"entry_id": entry_id})).await;
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn repack_returns_400_when_no_survivor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("c.db");
+        let drive = tmp.path().join("driveA");
+        std::fs::create_dir_all(&drive).unwrap();
+        std::fs::write(drive.join(".cleanupstorages_id"), "vol-1").unwrap();
+        {
+            use std::io::Write;
+            let f = std::fs::File::create(drive.join("bundle.zip")).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (n, b) in [("keep.txt", &b"KEEP"[..]), ("dup.txt", &b"SHARED"[..])] {
+                zw.start_file(n, opts).unwrap(); zw.write_all(b).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        // NOTE: no loose survivor copy written this time — dup.txt inside the zip is the only copy.
+        {
+            let cat = crate::catalog::Catalog::open(&db).unwrap();
+            cat.upsert_volume(&crate::catalog::models::Volume { volume_id: "vol-1".into(),
+                label: "D".into(), identified_by: "marker".into(), first_seen_at: 1, last_seen_at: 1 }).unwrap();
+            let ident = crate::volume::VolumeIdentity { volume_id: "vol-1".into(), label: "D".into(),
+                identified_by: "marker".into() };
+            crate::scanner::scan_volume(&cat, &drive, &ident, false, 100).unwrap();
+        }
+        let mut mounts = std::collections::HashMap::new();
+        mounts.insert("vol-1".to_string(), drive.clone());
+        let state = AppState { catalog_path: db.clone(),
+            mounts: crate::mounts::MountResolver::Fixed(mounts), csrf_token: "T".into() };
+
+        let cat = crate::catalog::Catalog::open_readonly(&db).unwrap();
+        let entry_id = cat.archive_entries("vol-1", "bundle.zip").unwrap()
+            .into_iter().find(|e| e.container_chain.as_deref() == Some("dup.txt")).unwrap().id;
+        drop(cat);
+
+        let (status, _json) = post_json(state, "/api/repack", Some("T"),
+            serde_json::json!({"entry_id": entry_id})).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+
+        // Archive untouched: dup.txt is still inside.
+        let f = std::fs::File::open(drive.join("bundle.zip")).unwrap();
+        let mut z = zip::ZipArchive::new(f).unwrap();
+        assert!(z.by_name("dup.txt").is_ok());
     }
 
     #[tokio::test]
