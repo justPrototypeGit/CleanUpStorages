@@ -69,6 +69,8 @@ pub fn repack_entry(
                  run `purge` to reclaim space first"
             );
         }
+    } else {
+        eprintln!("warning: could not determine free space on the drive; skipping the pre-repack space check");
     }
 
     // 6+7. Build the rebuilt archive in a temp file and verify it before anything else happens.
@@ -85,7 +87,7 @@ pub fn repack_entry(
         .count();
 
     // 8. Extract the removed entry into _ToDelete (safety net 1) before the swap.
-    let extract_rel = quarantine_dest(cat, mount_root, expected_volume_id, &format!("{archive_rel}/{chain}"));
+    let extract_rel = crate::quarantine::quarantine_dest(cat, mount_root, expected_volume_id, &format!("{archive_rel}/{chain}"))?;
     let extract_path = mount_root.join(&extract_rel);
     if let Some(p) = extract_path.parent() {
         std::fs::create_dir_all(p)?;
@@ -93,7 +95,7 @@ pub fn repack_entry(
     std::fs::write(&extract_path, extract_entry(&archive_path, &chain)?)?;
 
     // 9. Swap: original -> _ToDelete/<name>.original.zip (safety net 2); temp -> archive path.
-    let original_rel = quarantine_dest(cat, mount_root, expected_volume_id, &format!("{archive_rel}.original.zip"));
+    let original_rel = crate::quarantine::quarantine_dest(cat, mount_root, expected_volume_id, &format!("{archive_rel}.original.zip"))?;
     let original_dest = mount_root.join(&original_rel);
     if let Some(p) = original_dest.parent() {
         std::fs::create_dir_all(p)?;
@@ -114,6 +116,9 @@ pub fn repack_entry(
     }
 
     // 10. Catalog + audit.
+    // Disk is now the source of truth. If any of these catalog writes fails after the swap, the
+    // next scan reconciles (the rebuilt archive re-hashes; the removed entry is swept to missing).
+    // No data is lost.
     cat.mark_quarantined(
         entry_id,
         &extract_rel.replace('\\', "/"),
@@ -199,33 +204,6 @@ fn archive_filename(archive_rel: &str) -> String {
         .unwrap_or_else(|| "archive.zip".into())
 }
 
-/// Collision-free `_ToDelete/<rel>` path avoiding both disk AND catalog collisions (mirrors the
-/// quarantine collision-avoidance helper from Phase 2a).
-fn quarantine_dest(cat: &Catalog, mount_root: &Path, volume_id: &str, origin_rel: &str) -> String {
-    let base = format!("{}/{origin_rel}", crate::volume::QUARANTINE_DIR);
-    let taken = |cand: &str| {
-        mount_root.join(cand).exists() || cat.loose_path_taken(volume_id, cand).unwrap_or(false)
-    };
-    if !taken(&base) {
-        return base;
-    }
-    let (dir, seg) = match base.rsplit_once('/') {
-        Some((d, s)) => (format!("{d}/"), s.to_string()),
-        None => (String::new(), base.clone()),
-    };
-    let (stem, ext) = match seg.rsplit_once('.') {
-        Some((s, e)) if !s.is_empty() => (s.to_string(), format!(".{e}")),
-        _ => (seg.clone(), String::new()),
-    };
-    for n in 1.. {
-        let cand = format!("{dir}{stem} ({n}){ext}");
-        if !taken(&cand) {
-            return cand;
-        }
-    }
-    unreachable!()
-}
-
 /// Bytes of one top-level entry.
 pub fn extract_entry(archive_path: &Path, entry_name: &str) -> anyhow::Result<Vec<u8>> {
     let file = std::fs::File::open(archive_path)?;
@@ -264,6 +242,8 @@ pub fn rebuild_without(src_archive: &Path, dest_tmp: &Path, exclude_entry: &str)
 }
 
 /// Re-hash every expected retained entry and confirm the removed one is absent.
+/// Only catalogued entries are re-hashed here; entries the scanner never catalogued are
+/// preserved byte-for-byte by raw_copy_file but not hash-checked.
 pub fn verify_rebuilt(
     tmp: &Path,
     expected: &HashMap<String, String>,
