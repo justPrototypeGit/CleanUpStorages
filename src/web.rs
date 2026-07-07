@@ -52,6 +52,7 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/scan/status", get(api_scan_status))
         .route("/api/pick-folder", post(api_pick_folder))
         .route("/review", get(review))
+        .route("/scan", get(scan_page))
         .with_state(state)
 }
 
@@ -61,6 +62,10 @@ async fn index(State(_state): State<AppState>) -> Html<&'static str> {
 
 async fn review(State(state): State<AppState>) -> Html<String> {
     Html(REVIEW_HTML.replace("{{CSRF}}", &state.csrf_token))
+}
+
+async fn scan_page(State(state): State<AppState>) -> Html<String> {
+    Html(SCAN_HTML.replace("{{CSRF}}", &state.csrf_token))
 }
 
 const INDEX_HTML: &str = r##"<!doctype html>
@@ -93,7 +98,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
 </head>
 <body>
 <header>
-  <h1>CleanUpStorages — Browse <span class="meta" id="stats"></span> <a href="/review" style="font-size:12px">Review duplicates →</a></h1>
+  <h1>CleanUpStorages — Browse <span class="meta" id="stats"></span> <a href="/review" style="font-size:12px">Review duplicates →</a> <a href="/scan" style="font-size:12px">Scan a drive →</a></h1>
   <div class="controls">
     <input id="q" type="search" placeholder="Search filename or path…" autofocus>
     <select id="volume"><option value="">All drives</option></select>
@@ -184,7 +189,7 @@ const REVIEW_HTML: &str = r##"<!doctype html>
   .msg{color:var(--mut);margin-top:10px;min-height:1.4em;}
 </style></head>
 <body>
-<header><strong>Review duplicates</strong><a href="/">← Back to browse</a></header>
+<header><strong>Review duplicates</strong><a href="/">← Back to browse</a><a href="/scan">Scan a drive</a></header>
 <main>
   <div class="progress" id="progress"></div>
   <div id="group"></div>
@@ -257,6 +262,95 @@ $("#confirm").addEventListener("click",async()=>{
 });
 $("#skip").addEventListener("click",()=>{ idx++; $("#msg").textContent=""; render(); });
 load();
+</script>
+</body></html>
+"##;
+
+const SCAN_HTML: &str = r##"<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="csrf" content="{{CSRF}}">
+<title>CleanUpStorages — Scan a drive</title>
+<style>
+  :root{color-scheme:light dark;--bg:#111;--fg:#eee;--mut:#999;--line:#333;--accent:#5aa0ff;}
+  @media (prefers-color-scheme:light){:root{--bg:#fff;--fg:#111;--mut:#666;--line:#ddd;}}
+  *{box-sizing:border-box;} body{margin:0;font:14px/1.4 system-ui,sans-serif;background:var(--bg);color:var(--fg);}
+  header{padding:12px 16px;border-bottom:1px solid var(--line);display:flex;gap:12px;align-items:center;}
+  header a{color:var(--accent);text-decoration:none;font-size:12px;}
+  main{padding:16px;max-width:820px;margin:0 auto;}
+  h2{font-size:14px;color:var(--mut);margin:18px 0 6px;}
+  input,button{font:inherit;color:var(--fg);background:transparent;border:1px solid var(--line);border-radius:6px;padding:8px 10px;}
+  input#path{width:100%;} .row{display:flex;gap:8px;margin:6px 0;}
+  button.primary{border-color:var(--accent);color:var(--accent);cursor:pointer;}
+  button{cursor:pointer;}
+  .drive{border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin:6px 0;cursor:pointer;}
+  .drive:hover{border-color:var(--accent);}
+  .drive .tag{font-size:11px;color:var(--mut);}
+  label.chk{font-size:13px;color:var(--mut);display:flex;gap:6px;align-items:center;margin:6px 0;}
+  .status{margin-top:14px;border-top:1px solid var(--line);padding-top:12px;}
+  .bar{color:var(--mut);} .err{color:#e06c6c;}
+  .recent div{padding:2px 0;border-bottom:1px solid var(--line);font-size:13px;}
+</style></head>
+<body>
+<header><strong>Scan a drive</strong><a href="/">Browse</a><a href="/review">Review</a></header>
+<main>
+  <h2>Detected drives</h2>
+  <div id="drives" class="bar">Looking for connected drives…</div>
+
+  <h2>Or enter a path</h2>
+  <div class="row"><input id="path" type="text" placeholder="e.g. D:\ or /Volumes/MyDrive"><button id="browse">Browse…</button></div>
+  <label class="chk"><input id="force" type="checkbox"> Force full rescan (re-hash every file, slower)</label>
+  <div class="row"><button class="primary" id="scan">Scan</button></div>
+
+  <div class="status">
+    <div id="running" class="bar"></div>
+    <div id="queued" class="bar"></div>
+    <h2>Recent scans</h2>
+    <div id="recent" class="recent bar">None yet.</div>
+  </div>
+</main>
+<script>
+const $=s=>document.querySelector(s);
+const CSRF=document.querySelector('meta[name="csrf"]').content;
+function esc(s){return (s==null?"":String(s)).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
+async function loadDrives(){
+  try{
+    const ds=await (await fetch("/api/detected-drives")).json();
+    if(!ds.length){ $("#drives").textContent="No drives detected. Type a path below."; return; }
+    $("#drives").innerHTML=ds.map(d=>`<div class="drive" data-path="${esc(d.mount_path)}">${esc(d.mount_path)} <span class="tag">${d.catalogued?("· "+esc(d.volume_label||"catalogued")+" (rescan)"):"· new"}</span></div>`).join("");
+    for(const el of document.querySelectorAll(".drive")) el.addEventListener("click",()=>{ $("#path").value=el.dataset.path; });
+  }catch(e){ $("#drives").textContent="Could not list drives: "+e; }
+}
+$("#browse").addEventListener("click",async()=>{
+  try{
+    const r=await fetch("/api/pick-folder",{method:"POST",headers:{"x-cleanup-token":CSRF}});
+    const j=await r.json(); if(j.path) $("#path").value=j.path;
+  }catch(e){ $("#running").textContent="Folder picker error: "+e; }
+});
+$("#scan").addEventListener("click",async()=>{
+  const path=$("#path").value.trim(); if(!path){ $("#running").textContent="Enter a path first."; return; }
+  const force=$("#force").checked;
+  try{
+    const r=await fetch("/api/scan",{method:"POST",headers:{"content-type":"application/json","x-cleanup-token":CSRF},body:JSON.stringify({path,force})});
+    if(!r.ok){ $("#running").innerHTML=`<span class="err">Scan error: ${esc(await r.text())}</span>`; return; }
+    poll();
+  }catch(e){ $("#running").textContent="Scan error: "+e; }
+});
+async function poll(){
+  try{
+    const s=await (await fetch("/api/scan/status")).json();
+    if(s.running){ const r=s.running; $("#running").textContent=`Scanning ${r.path} — ${r.hashed} hashed · ${r.skipped} unchanged · ${r.errors} errors · ${r.archive_entries} archive entries`; }
+    else $("#running").textContent="";
+    $("#queued").textContent = s.queued.length ? ("Queued: "+s.queued.join(", ")) : "";
+    $("#recent").innerHTML = s.recent.length ? s.recent.map(r=>{
+      const msg = r.error_message ? `<span class="err">${esc(r.error_message)}</span>` : `${r.hashed} hashed · ${r.skipped} unchanged · ${r.errors} errors · ${r.archive_entries} archive entries · ${r.marked_missing} newly missing`;
+      return `<div>${esc(r.path)} — ${msg}</div>`;
+    }).join("") : "None yet.";
+    if(s.running || s.queued.length) setTimeout(poll, 1500);
+  }catch(e){ /* stop polling on error */ }
+}
+loadDrives(); poll();
 </script>
 </body></html>
 "##;
@@ -1196,5 +1290,22 @@ mod tests {
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["catalogued"], true);
         assert_eq!(arr[0]["volume_label"], "Photos HDD");
+    }
+
+    #[tokio::test]
+    async fn scan_page_is_self_contained_and_wired() {
+        use axum::body::Body; use axum::http::Request; use tower::ServiceExt;
+        let (_t, _db, state) = seed_dupes();
+        let app = build_router_with(state);
+        let res = app.oneshot(Request::builder().uri("/scan").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), 2_000_000).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("name=\"csrf\""));
+        assert!(body.contains("/api/scan"));
+        assert!(body.contains("/api/detected-drives"));
+        assert!(body.contains("/api/pick-folder"));
+        assert!(!body.contains("http://") && !body.contains("https://"));
     }
 }
