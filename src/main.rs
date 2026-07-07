@@ -5,6 +5,9 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "cleanupstorages", version, about)]
 struct Cli {
+    /// Verbose logging (debug level). RUST_LOG, if set, overrides this.
+    #[arg(short, long, global = true)]
+    verbose: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -67,6 +70,7 @@ enum Command {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    cleanupstorages::observability::init(cli.verbose);
     match cli.command {
         Command::Scan { path, force, readonly_fallback } => {
             commands::cmd_scan(&path, force, readonly_fallback)
