@@ -20,6 +20,7 @@ impl Catalog {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         schema::apply(&conn)?;
         Ok(Catalog { conn })
     }

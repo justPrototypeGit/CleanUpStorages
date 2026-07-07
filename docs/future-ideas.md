@@ -58,6 +58,14 @@ Shipped clean — the final review found **no Critical issues** (no data-loss/co
 - **Cross-drive scratch location for near-full drives (spec §11)** — 2c builds the temp on the same drive with a pre-flight check; a configurable scratch dir on another disk (with a cross-device build+verify+swap) is deferred.
 - **`available_space`/`total_capacity` (sysinfo) duplicated** between `repack.rs` and `volume.rs`; the 16-column file SELECT is now in ~7 methods — fold into shared helpers with the carried `FILE_COLUMNS` item.
 
+## Follow-ups logged from the web-scanning code review (2026-07-07)
+
+Shipped clean — the final review found **no Critical issues** and confirmed a web scan running alongside a quarantine/repack **cannot corrupt or lose data** (WAL + the scanner's 200-file batched commits + the 5s busy-timeout → the worst case is a failed, retryable action). The two cheap improvements (worker integrity-check parity; a page note about the marker file) landed before merge. Remaining fast-follows:
+
+- **Friendlier "scan in progress" error (Important, fast-follow).** While a scan holds the write lock (hashing a big file mid-batch), a concurrent review-page quarantine/repack can surface a raw "database is locked" 500. Either (a) at the top of `api_quarantine`/`api_repack`, if `state.scan_queue.status().running.is_some()`, return `409` with "a scan is in progress — try again when it finishes"; or (b) map `SQLITE_BUSY` to that friendly message; or (c) disable the review-page action buttons while a scan runs (also the deferred "disable actions during scan" item). A deterministic test needs a controllable running state (small test-only seam on `ScanQueue`).
+- **Bound / de-duplicate the pending scan queue.** `enqueue` has no cap and no dedup, so a token-holding local script could enqueue unbounded jobs, or the same drive twice (a harmless redundant incremental pass). Low severity (local single-user) — add a small cap and skip enqueuing a path already running/pending.
+- **Carried, still open:** concurrent scans; cancel a running/queued scan; per-file live path + ETA; the `esc()`/`$` JS helpers are duplicated across the three self-contained pages (accepted — no frontend build system).
+
 ## Follow-ups logged from the Phase 2a (quarantine/purge) code review (2026-07-04)
 
 Shipped clean — the final review's two data-safety findings were fixed before merge (disk-aware survivor check so a stale catalog can't cause last-copy loss; catalog-aware `quarantine_dest` so a purged row's path can't orphan a re-quarantined file). Remaining cleanups:

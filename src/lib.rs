@@ -11,3 +11,4 @@ pub mod commands;
 pub mod archive;
 pub mod repack;
 pub mod web;
+pub mod scan_queue;
