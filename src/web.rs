@@ -16,15 +16,17 @@ pub struct AppState {
     pub catalog_path: PathBuf,
     pub mounts: crate::mounts::MountResolver,
     pub csrf_token: String,
+    pub scan_queue: std::sync::Arc<crate::scan_queue::ScanQueue>,
 }
 
 impl AppState {
     /// Production state: live mount detection and a fresh random CSRF token.
     pub fn new_live(catalog_path: PathBuf) -> AppState {
         AppState {
-            catalog_path,
             mounts: crate::mounts::MountResolver::Live,
             csrf_token: uuid::Uuid::new_v4().to_string(),
+            scan_queue: crate::scan_queue::ScanQueue::new(catalog_path.clone()),
+            catalog_path,
         }
     }
 }
@@ -45,6 +47,8 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/preview/:id", get(api_preview))
         .route("/api/quarantine", post(api_quarantine))
         .route("/api/repack", post(api_repack))
+        .route("/api/scan", post(api_scan))
+        .route("/api/scan/status", get(api_scan_status))
         .route("/review", get(review))
         .with_state(state)
 }
@@ -551,9 +555,39 @@ async fn api_repack(State(state): State<AppState>, headers: HeaderMap, body: Jso
     Ok(Json(RepackResultDto { removed_entry: out.removed_entry, retained_entries: out.retained_entries }))
 }
 
+#[derive(Deserialize)]
+struct ScanReq { path: String, force: bool }
+
+#[derive(Serialize)]
+struct ScanEnqueuedDto { queued_position: usize }
+
+/// Enqueue a background scan of `path`. This handler is just the CSRF gate plus input
+/// validation; the actual scan runs one-at-a-time in `ScanQueue`'s worker task so the request
+/// returns immediately instead of blocking on a potentially slow drive walk.
+async fn api_scan(State(state): State<AppState>, headers: HeaderMap, body: Json<ScanReq>)
+    -> Result<Json<ScanEnqueuedDto>, (StatusCode, String)>
+{
+    // CSRF: checked first, before any queue access, so a bad/missing token does nothing.
+    let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
+    if !ok { return Err((StatusCode::FORBIDDEN, "missing or bad token".into())); }
+
+    if body.path.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "path is required".into()));
+    }
+    let path = std::path::PathBuf::from(body.path.trim());
+    let pos = state.scan_queue.enqueue(path, body.force);
+    Ok(Json(ScanEnqueuedDto { queued_position: pos }))
+}
+
+async fn api_scan_status(State(state): State<AppState>) -> Json<crate::scan_queue::StatusSnapshot> {
+    Json(state.scan_queue.status())
+}
+
 /// Serve the browse UI on 127.0.0.1 with an OS-assigned free port until the process is stopped.
 pub async fn serve(catalog_path: PathBuf, open: bool) -> anyhow::Result<()> {
-    let app = build_router_with(AppState::new_live(catalog_path));
+    let state = AppState::new_live(catalog_path);
+    tokio::spawn(state.scan_queue.clone().run_worker());
+    let app = build_router_with(state);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
     let url = format!("http://{}", listener.local_addr()?);
     println!("CleanUpStorages browse UI at {url}");
@@ -707,7 +741,8 @@ mod tests {
         let mut mounts = HashMap::new();
         mounts.insert("vol-1".to_string(), drive);
         let state = AppState { catalog_path: db.clone(),
-            mounts: crate::mounts::MountResolver::Fixed(mounts), csrf_token: "T".into() };
+            mounts: crate::mounts::MountResolver::Fixed(mounts), csrf_token: "T".into(),
+            scan_queue: crate::scan_queue::ScanQueue::new(db.clone()) };
         (tmp, db, state)
     }
 
@@ -927,7 +962,8 @@ mod tests {
         let mut mounts = std::collections::HashMap::new();
         mounts.insert("vol-1".to_string(), drive.clone());
         let state = AppState { catalog_path: db.clone(),
-            mounts: crate::mounts::MountResolver::Fixed(mounts), csrf_token: "T".into() };
+            mounts: crate::mounts::MountResolver::Fixed(mounts), csrf_token: "T".into(),
+            scan_queue: crate::scan_queue::ScanQueue::new(db.clone()) };
 
         let cat = crate::catalog::Catalog::open_readonly(&db).unwrap();
         let entry_id = cat.archive_entries("vol-1", "bundle.zip").unwrap()
@@ -964,7 +1000,7 @@ mod tests {
         // No volumes mounted at all.
         let state = AppState { catalog_path: db.clone(),
             mounts: crate::mounts::MountResolver::Fixed(std::collections::HashMap::new()),
-            csrf_token: "T".into() };
+            csrf_token: "T".into(), scan_queue: crate::scan_queue::ScanQueue::new(db.clone()) };
 
         let (status, _) = post_json(state, "/api/repack", Some("T"),
             serde_json::json!({"entry_id": entry_id})).await;
@@ -1001,7 +1037,8 @@ mod tests {
         let mut mounts = std::collections::HashMap::new();
         mounts.insert("vol-1".to_string(), drive.clone());
         let state = AppState { catalog_path: db.clone(),
-            mounts: crate::mounts::MountResolver::Fixed(mounts), csrf_token: "T".into() };
+            mounts: crate::mounts::MountResolver::Fixed(mounts), csrf_token: "T".into(),
+            scan_queue: crate::scan_queue::ScanQueue::new(db.clone()) };
 
         let cat = crate::catalog::Catalog::open_readonly(&db).unwrap();
         let entry_id = cat.archive_entries("vol-1", "bundle.zip").unwrap()
@@ -1016,6 +1053,48 @@ mod tests {
         let f = std::fs::File::open(drive.join("bundle.zip")).unwrap();
         let mut z = zip::ZipArchive::new(f).unwrap();
         assert!(z.by_name("dup.txt").is_ok());
+    }
+
+    #[tokio::test]
+    async fn scan_requires_csrf_token() {
+        let (_t, _db, state) = seed_dupes();
+        let (status, _) = post_json(state, "/api/scan", None,
+            serde_json::json!({"path":"whatever","force":false})).await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn scan_enqueues_and_status_reports_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("c.db");
+        let drive = tmp.path().join("drive");
+        std::fs::create_dir_all(&drive).unwrap();
+        std::fs::write(drive.join("a.txt"), b"hi").unwrap();
+        { crate::catalog::Catalog::open(&db).unwrap(); }
+        let state = AppState {
+            catalog_path: db.clone(),
+            mounts: crate::mounts::MountResolver::Fixed(std::collections::HashMap::new()),
+            csrf_token: "T".into(),
+            scan_queue: crate::scan_queue::ScanQueue::new(db.clone()),
+        };
+        // must run the worker for the enqueued job to progress
+        tokio::spawn(state.scan_queue.clone().run_worker());
+
+        let (status, json) = post_json(state.clone(), "/api/scan", Some("T"),
+            serde_json::json!({"path": drive.to_string_lossy(), "force": false})).await;
+        assert_eq!(status, axum::http::StatusCode::OK, "body {json}");
+
+        // poll status until the scan finishes
+        let done = {
+            let mut found = false;
+            for _ in 0..200 {
+                let v = get_json_state(state.clone(), "/api/scan/status").await;
+                if v["recent"].as_array().map(|a| !a.is_empty()).unwrap_or(false) { found = true; break; }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            found
+        };
+        assert!(done, "scan should have completed and appeared in recent");
     }
 
     #[tokio::test]
