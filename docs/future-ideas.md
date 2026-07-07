@@ -77,3 +77,10 @@ Shipped clean — the final review's two data-safety findings were fixed before 
 - **UX:** `cmd_purge`'s missing-marker error lacks the "scan the drive first" hint that `cmd_quarantine` gives; `cmd_duplicates` prints a status column that is always "active".
 - **Rescan-before-quarantine guidance.** The disk-aware survivor check protects same-drive copies, but a cross-drive survivor on an *unmounted* drive is trusted without verification (it's a genuinely separate physical copy). The review GUI (2b) should surface "the copy that makes this safe to remove lives on «Other Drive» (not currently connected)" so the user decides with full information.
 
+
+## Follow-ups logged from the observability code review (2026-07-07)
+
+Shipped clean — the final review found no Critical/Important issues (verified additive: no behavior/test change, no sensitive data off-machine, exhaustive command match, no hot-loop logging). Applied before merge: plain logs when stderr is redirected; a comment on the command-span nesting caveat. Remaining minor:
+
+- **CSRF-reject helper.** The `if !ok { tracing::warn!(...); return Err((FORBIDDEN, "missing or bad token")) }` block is now duplicated across four handlers (`api_quarantine`/`api_repack`/`api_scan`/`api_pick_folder`). If a 5th protected route is added, extract a small `reject_missing_csrf()` helper. Also the `CaptureWriter`/`CaptureW` test `MakeWriter` is duplicated between the web and scanner test modules (accepted — no shared test-support module yet).
+- **Deferred (from the spec, unchanged):** log files / rotation / retention; a log-viewer panel in the web UI; metrics/telemetry export (Prometheus/OpenTelemetry); redaction modes.

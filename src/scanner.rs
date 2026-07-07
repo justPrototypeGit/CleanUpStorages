@@ -189,6 +189,8 @@ pub fn run_scan(
         Some(id) => id,
         None => return Ok(None),
     };
+    tracing::info!(volume = %identity.volume_id, label = %identity.label,
+        identified_by = %identity.identified_by, "scanning volume");
     cat.upsert_volume(&Volume {
         volume_id: identity.volume_id.clone(),
         label: identity.label.clone(),
@@ -367,6 +369,36 @@ mod tests {
         // the volume row exists after run_scan upserted it
         let stats = cat.volume_stats().unwrap();
         assert!(stats.iter().any(|(id, _, _, _)| id == &identity.volume_id));
+    }
+
+    #[derive(Clone)]
+    struct CaptureW(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for CaptureW {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().extend_from_slice(b); Ok(b.len()) }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureW {
+        type Writer = CaptureW;
+        fn make_writer(&'a self) -> Self::Writer { self.clone() }
+    }
+
+    #[test]
+    fn run_scan_logs_volume_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("drive");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("x.txt"), b"hi").unwrap();
+        let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
+
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sub = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
+            .with_writer(CaptureW(buf.clone())).with_ansi(false).finish();
+        let _guard = tracing::subscriber::set_default(sub);
+
+        run_scan(&cat, &root, false, crate::volume::ReadonlyMode::Fingerprint, 100, None).unwrap();
+        let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(logged.to_lowercase().contains("volume"), "expected a volume info line: {logged}");
     }
 
     #[test]

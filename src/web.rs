@@ -10,6 +10,8 @@ use serde::{Serialize, Deserialize};
 use crate::catalog::Catalog;
 use crate::catalog::store::SearchFilters;
 use crate::catalog::models::FileRecord;
+use tower_http::trace::{TraceLayer, DefaultOnRequest, DefaultOnResponse};
+use tower_http::LatencyUnit;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -53,6 +55,18 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/pick-folder", post(api_pick_folder))
         .route("/review", get(review))
         .route("/scan", get(scan_page))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|req: &axum::http::Request<axum::body::Body>| {
+                    crate::observability::make_request_span(req)
+                })
+                .on_request(DefaultOnRequest::new().level(tracing::Level::DEBUG))
+                .on_response(
+                    DefaultOnResponse::new()
+                        .level(tracing::Level::INFO)
+                        .latency_unit(LatencyUnit::Millis),
+                ),
+        )
         .with_state(state)
 }
 
@@ -414,6 +428,7 @@ struct SearchParams {
 
 /// Map any error to a 500 with a short text body (localhost dev tool — plain messages are fine).
 fn err500<E: std::fmt::Display>(e: E) -> (axum::http::StatusCode, String) {
+    tracing::error!(error = %e, "request failed");
     (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 
@@ -600,7 +615,10 @@ async fn api_quarantine(State(state): State<AppState>, headers: HeaderMap, body:
     // CSRF: require the per-run token (a cross-site page can't read it). Checked first, before
     // any catalog access, so a bad/missing token does nothing.
     let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
-    if !ok { return Err((StatusCode::FORBIDDEN, "missing or bad token".into())); }
+    if !ok {
+        tracing::warn!("rejected request: missing or bad CSRF token");
+        return Err((StatusCode::FORBIDDEN, "missing or bad token".into()));
+    }
 
     let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
@@ -660,7 +678,10 @@ async fn api_repack(State(state): State<AppState>, headers: HeaderMap, body: Jso
 {
     // CSRF: checked first, before any catalog access, so a bad/missing token does nothing.
     let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
-    if !ok { return Err((StatusCode::FORBIDDEN, "missing or bad token".into())); }
+    if !ok {
+        tracing::warn!("rejected request: missing or bad CSRF token");
+        return Err((StatusCode::FORBIDDEN, "missing or bad token".into()));
+    }
 
     let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
     let rec = cat.get_file(body.entry_id).map_err(err500)?
@@ -695,7 +716,10 @@ async fn api_scan(State(state): State<AppState>, headers: HeaderMap, body: Json<
 {
     // CSRF: checked first, before any queue access, so a bad/missing token does nothing.
     let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
-    if !ok { return Err((StatusCode::FORBIDDEN, "missing or bad token".into())); }
+    if !ok {
+        tracing::warn!("rejected request: missing or bad CSRF token");
+        return Err((StatusCode::FORBIDDEN, "missing or bad token".into()));
+    }
 
     if body.path.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "path is required".into()));
@@ -720,7 +744,10 @@ async fn api_pick_folder(State(state): State<AppState>, headers: HeaderMap)
 {
     // CSRF: checked first, before touching the OS dialog, so a bad/missing token does nothing.
     let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
-    if !ok { return Err((StatusCode::FORBIDDEN, "missing or bad token".into())); }
+    if !ok {
+        tracing::warn!("rejected request: missing or bad CSRF token");
+        return Err((StatusCode::FORBIDDEN, "missing or bad token".into()));
+    }
 
     let picked = tokio::task::spawn_blocking(|| {
         rfd::FileDialog::new().set_title("Choose a drive or folder to scan").pick_folder()
@@ -1308,5 +1335,65 @@ mod tests {
         assert!(body.contains("/api/detected-drives"));
         assert!(body.contains("/api/pick-folder"));
         assert!(!body.contains("http://") && !body.contains("https://"));
+    }
+
+    #[derive(Clone)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf); Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer { self.clone() }
+    }
+
+    #[tokio::test]
+    async fn request_is_traced_with_method_status_and_id() {
+        use axum::body::Body; use axum::http::Request; use tower::ServiceExt;
+        let (_t, db) = seed_catalog();
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sub = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
+            .with_writer(CaptureWriter(buf.clone()))
+            .with_ansi(false) // the custom writer isn't a terminal; disable ANSI so "id=" etc. are contiguous
+            .finish();
+        let _guard = tracing::subscriber::set_default(sub); // held across the await (current-thread test)
+
+        let app = build_router(db.clone());
+        let res = app.oneshot(Request::builder().uri("/api/search?q=thesis").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+
+        let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("GET"), "log: {logged}");
+        assert!(logged.contains("200"), "log: {logged}");
+        assert!(logged.contains("id="), "request-id field present: {logged}");
+    }
+
+    #[tokio::test]
+    async fn csrf_rejection_is_logged() {
+        use axum::body::Body; use axum::http::Request; use tower::ServiceExt;
+        let (_t, _db, state) = seed_dupes();
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sub = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
+            .with_writer(CaptureWriter(buf.clone()))
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(sub);
+
+        let app = build_router_with(state);
+        // POST /api/quarantine with NO token -> 403 and a warn line
+        let res = app.oneshot(Request::builder().method("POST").uri("/api/quarantine")
+            .header("content-type", "application/json")
+            .body(Body::from("{\"quarantine_ids\":[1]}")).unwrap()).await.unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::FORBIDDEN);
+
+        let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("WARN"), "expected a warn line: {logged}");
+        assert!(logged.to_lowercase().contains("token"), "reason mentions token: {logged}");
     }
 }
