@@ -428,6 +428,7 @@ struct SearchParams {
 
 /// Map any error to a 500 with a short text body (localhost dev tool — plain messages are fine).
 fn err500<E: std::fmt::Display>(e: E) -> (axum::http::StatusCode, String) {
+    tracing::error!(error = %e, "request failed");
     (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 
@@ -614,7 +615,10 @@ async fn api_quarantine(State(state): State<AppState>, headers: HeaderMap, body:
     // CSRF: require the per-run token (a cross-site page can't read it). Checked first, before
     // any catalog access, so a bad/missing token does nothing.
     let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
-    if !ok { return Err((StatusCode::FORBIDDEN, "missing or bad token".into())); }
+    if !ok {
+        tracing::warn!("rejected request: missing or bad CSRF token");
+        return Err((StatusCode::FORBIDDEN, "missing or bad token".into()));
+    }
 
     let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
@@ -674,7 +678,10 @@ async fn api_repack(State(state): State<AppState>, headers: HeaderMap, body: Jso
 {
     // CSRF: checked first, before any catalog access, so a bad/missing token does nothing.
     let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
-    if !ok { return Err((StatusCode::FORBIDDEN, "missing or bad token".into())); }
+    if !ok {
+        tracing::warn!("rejected request: missing or bad CSRF token");
+        return Err((StatusCode::FORBIDDEN, "missing or bad token".into()));
+    }
 
     let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
     let rec = cat.get_file(body.entry_id).map_err(err500)?
@@ -709,7 +716,10 @@ async fn api_scan(State(state): State<AppState>, headers: HeaderMap, body: Json<
 {
     // CSRF: checked first, before any queue access, so a bad/missing token does nothing.
     let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
-    if !ok { return Err((StatusCode::FORBIDDEN, "missing or bad token".into())); }
+    if !ok {
+        tracing::warn!("rejected request: missing or bad CSRF token");
+        return Err((StatusCode::FORBIDDEN, "missing or bad token".into()));
+    }
 
     if body.path.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "path is required".into()));
@@ -734,7 +744,10 @@ async fn api_pick_folder(State(state): State<AppState>, headers: HeaderMap)
 {
     // CSRF: checked first, before touching the OS dialog, so a bad/missing token does nothing.
     let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
-    if !ok { return Err((StatusCode::FORBIDDEN, "missing or bad token".into())); }
+    if !ok {
+        tracing::warn!("rejected request: missing or bad CSRF token");
+        return Err((StatusCode::FORBIDDEN, "missing or bad token".into()));
+    }
 
     let picked = tokio::task::spawn_blocking(|| {
         rfd::FileDialog::new().set_title("Choose a drive or folder to scan").pick_folder()
@@ -1358,5 +1371,29 @@ mod tests {
         assert!(logged.contains("GET"), "log: {logged}");
         assert!(logged.contains("200"), "log: {logged}");
         assert!(logged.contains("id="), "request-id field present: {logged}");
+    }
+
+    #[tokio::test]
+    async fn csrf_rejection_is_logged() {
+        use axum::body::Body; use axum::http::Request; use tower::ServiceExt;
+        let (_t, _db, state) = seed_dupes();
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sub = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
+            .with_writer(CaptureWriter(buf.clone()))
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(sub);
+
+        let app = build_router_with(state);
+        // POST /api/quarantine with NO token -> 403 and a warn line
+        let res = app.oneshot(Request::builder().method("POST").uri("/api/quarantine")
+            .header("content-type", "application/json")
+            .body(Body::from("{\"quarantine_ids\":[1]}")).unwrap()).await.unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::FORBIDDEN);
+
+        let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("WARN"), "expected a warn line: {logged}");
+        assert!(logged.to_lowercase().contains("token"), "reason mentions token: {logged}");
     }
 }
