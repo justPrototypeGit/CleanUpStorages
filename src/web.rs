@@ -43,6 +43,7 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/search", get(api_search))
         .route("/api/volumes", get(api_volumes))
         .route("/api/stats", get(api_stats))
+        .route("/api/detected-drives", get(api_detected_drives))
         .route("/api/duplicates", get(api_duplicates))
         .route("/api/preview/:id", get(api_preview))
         .route("/api/quarantine", post(api_quarantine))
@@ -289,6 +290,14 @@ impl From<FileRecord> for HitDto {
 }
 
 #[derive(Serialize)]
+struct DetectedDriveDto {
+    mount_path: String,
+    volume_id: Option<String>,
+    catalogued: bool,
+    volume_label: Option<String>,
+}
+
+#[derive(Serialize)]
 struct VolumeDto { volume_id: String, label: String, active_files: i64, active_bytes: i64 }
 
 #[derive(Serialize)]
@@ -349,6 +358,27 @@ async fn api_stats(State(state): State<AppState>)
     let duplicate_groups = cat.duplicate_group_count().map_err(err500)?;
     let volumes = volume_dtos(&cat).map_err(err500)?;
     Ok(Json(StatsDto { duplicate_groups, volumes }))
+}
+
+async fn api_detected_drives(State(state): State<AppState>)
+    -> Result<Json<Vec<DetectedDriveDto>>, (StatusCode, String)>
+{
+    let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
+    let labels: std::collections::HashMap<String, String> = cat.volume_stats().map_err(err500)?
+        .into_iter().map(|(id, label, _, _)| (id, label)).collect();
+    let mut out = Vec::new();
+    for (_vid_key, root) in state.mounts.snapshot() {
+        let volume_id = crate::volume::read_volume_id(&root);
+        let (catalogued, volume_label) = match &volume_id {
+            Some(vid) => (labels.contains_key(vid), labels.get(vid).cloned()),
+            None => (false, None),
+        };
+        out.push(DetectedDriveDto {
+            mount_path: root.display().to_string(), volume_id, catalogued, volume_label,
+        });
+    }
+    out.sort_by(|a, b| a.mount_path.cmp(&b.mount_path));
+    Ok(Json(out))
 }
 
 #[derive(Serialize)]
@@ -1129,5 +1159,15 @@ mod tests {
         // self-contained: no external resource references
         assert!(!body.contains("http://"), "no external http resources");
         assert!(!body.contains("https://"), "no external https resources");
+    }
+
+    #[tokio::test]
+    async fn detected_drives_flags_catalogued() {
+        let (_t, _db, state) = seed_dupes(); // Fixed mount vol-1 -> driveA (marker vol-1), catalogued
+        let v = get_json_state(state, "/api/detected-drives").await;
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["catalogued"], true);
+        assert_eq!(arr[0]["volume_label"], "Photos HDD");
     }
 }
