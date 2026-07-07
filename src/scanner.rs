@@ -11,6 +11,14 @@ use crate::volume::VolumeIdentity;
 
 const BATCH_SIZE: usize = 200;
 
+/// Optional live-progress sink for a scan. Each method fires once per counted event.
+pub trait Progress: Send + Sync {
+    fn on_hashed(&self);
+    fn on_skipped(&self);
+    fn on_error(&self);
+    fn on_archive_entry(&self);
+}
+
 /// Outcome of one `scan_volume` pass.
 #[derive(Debug, Default)]
 pub struct ScanSummary {
@@ -57,8 +65,9 @@ fn rotate_batch(cat: &Catalog, in_batch: &mut usize) -> anyhow::Result<()> {
 /// scan's `last_seen_at` stamp and as `scan_started_at` for the missing-file sweep: because every
 /// file touched this scan gets `last_seen_at == now`, `mark_missing_scanned` (which flags rows
 /// with `last_seen_at < scan_started_at`) only ever catches files genuinely absent this pass.
-pub fn scan_volume(
+pub fn scan_volume_with_progress(
     cat: &Catalog, root: &Path, identity: &VolumeIdentity, force: bool, now: i64,
+    progress: Option<&dyn Progress>,
 ) -> anyhow::Result<ScanSummary> {
     let scan_started_at = now;
     let limits = ArchiveLimits::from_config(&Config::default_paths()?);
@@ -76,6 +85,7 @@ pub fn scan_volume(
                     .unwrap_or_else(|| "<unknown>".to_string());
                 cat.log_scan_error(Some(&identity.volume_id), &p, &format!("walk: {err}"), now)?;
                 summary.errors += 1;
+                if let Some(p) = progress { p.on_error(); }
                 continue;
             }
         };
@@ -94,6 +104,7 @@ pub fn scan_volume(
             Err(e) => {
                 cat.log_scan_error(Some(&identity.volume_id), &rel, &format!("metadata: {e}"), now)?;
                 summary.errors += 1;
+                if let Some(p) = progress { p.on_error(); }
                 let _ = cat.touch_seen(&identity.volume_id, &rel, now);
                 continue;
             }
@@ -110,6 +121,7 @@ pub fn scan_volume(
                         cat.touch_archive_entries(&identity.volume_id, &rel, now)?;
                     }
                     summary.skipped += 1;
+                    if let Some(p) = progress { p.on_skipped(); }
                     in_batch += 1;
                     rotate_batch(cat, &mut in_batch)?;
                     continue;
@@ -122,6 +134,7 @@ pub fn scan_volume(
             Err(e) => {
                 cat.log_scan_error(Some(&identity.volume_id), &rel, &format!("read: {e}"), now)?;
                 summary.errors += 1;
+                if let Some(p) = progress { p.on_error(); }
                 let _ = cat.touch_seen(&identity.volume_id, &rel, now);
                 continue;
             }
@@ -143,11 +156,12 @@ pub fn scan_volume(
         };
         cat.upsert_file(&nf, now)?;
         summary.hashed += 1;
+        if let Some(p) = progress { p.on_hashed(); }
         in_batch += 1;
         rotate_batch(cat, &mut in_batch)?;
 
         if archive::is_archive_name(&rel) {
-            descend_archive(cat, path, &rel, identity, &limits, now, &mut summary, &mut in_batch)?;
+            descend_archive(cat, path, &rel, identity, &limits, now, &mut summary, &mut in_batch, progress)?;
         }
     }
 
@@ -156,16 +170,25 @@ pub fn scan_volume(
     Ok(summary)
 }
 
+/// Scan without progress reporting (CLI and tests). Delegates with `None`.
+pub fn scan_volume(cat: &Catalog, root: &Path, identity: &VolumeIdentity, force: bool, now: i64)
+    -> anyhow::Result<ScanSummary>
+{
+    scan_volume_with_progress(cat, root, identity, force, now, None)
+}
+
 /// Open an on-disk archive file, catalog each entry, and log each non-fatal error.
 fn descend_archive(
     cat: &Catalog, path: &Path, rel: &str, identity: &VolumeIdentity,
     limits: &ArchiveLimits, now: i64, summary: &mut ScanSummary, in_batch: &mut usize,
+    progress: Option<&dyn Progress>,
 ) -> anyhow::Result<()> {
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(e) => {
             cat.log_scan_error(Some(&identity.volume_id), rel, &format!("archive open: {e}"), now)?;
             summary.errors += 1;
+            if let Some(p) = progress { p.on_error(); }
             return Ok(());
         }
     };
@@ -173,6 +196,7 @@ fn descend_archive(
     for entry in &res.entries {
         cat.upsert_archive_entry(&identity.volume_id, rel, entry, now)?;
         summary.archive_entries += 1;
+        if let Some(p) = progress { p.on_archive_entry(); }
         *in_batch += 1;
         rotate_batch(cat, in_batch)?;
     }
@@ -180,6 +204,7 @@ fn descend_archive(
         let where_ = if ctx.is_empty() { rel.to_string() } else { format!("{rel} › {ctx}") };
         cat.log_scan_error(Some(&identity.volume_id), &where_, reason, now)?;
         summary.errors += 1;
+        if let Some(p) = progress { p.on_error(); }
     }
     Ok(())
 }
@@ -288,5 +313,38 @@ mod tests {
         let s = scan_volume(&cat, &root, &ident(), false, 200).unwrap();
         assert_eq!(s.marked_missing, 0);
         assert_eq!(cat.search("x", None, None, Some("active")).unwrap().len(), 1);
+    }
+
+    struct CountingProgress {
+        hashed: std::sync::atomic::AtomicUsize,
+        skipped: std::sync::atomic::AtomicUsize,
+        errors: std::sync::atomic::AtomicUsize,
+        arch: std::sync::atomic::AtomicUsize,
+    }
+    impl CountingProgress { fn new() -> Self { Self {
+        hashed: 0.into(), skipped: 0.into(), errors: 0.into(), arch: 0.into() } } }
+    impl Progress for CountingProgress {
+        fn on_hashed(&self) { self.hashed.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        fn on_skipped(&self) { self.skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        fn on_error(&self) { self.errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        fn on_archive_entry(&self) { self.arch.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+    }
+
+    #[test]
+    fn progress_callbacks_match_summary() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("a.txt"), b"alpha").unwrap();
+        fs::write(root.join("sub/b.txt"), b"beta").unwrap();
+
+        let p = CountingProgress::new();
+        let s = scan_volume_with_progress(&cat, &root, &ident(), false, 100, Some(&p)).unwrap();
+        assert_eq!(p.hashed.load(Relaxed), s.hashed);
+        assert_eq!(p.skipped.load(Relaxed), s.skipped);
+        assert_eq!(p.errors.load(Relaxed), s.errors);
+        assert_eq!(p.arch.load(Relaxed), s.archive_entries);
+        assert_eq!(s.hashed, 2);
     }
 }
