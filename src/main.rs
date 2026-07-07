@@ -5,6 +5,9 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "cleanupstorages", version, about)]
 struct Cli {
+    /// Verbose logging (debug level). RUST_LOG, if set, overrides this.
+    #[arg(short, long, global = true)]
+    verbose: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -67,6 +70,21 @@ enum Command {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    cleanupstorages::observability::init(cli.verbose);
+    let name = match &cli.command {
+        Command::Scan { .. } => "scan",
+        Command::Search { .. } => "search",
+        Command::Status => "status",
+        Command::Browse { .. } => "browse",
+        Command::Duplicates => "duplicates",
+        Command::Quarantine { .. } => "quarantine",
+        Command::Purge { .. } => "purge",
+        Command::Repack { .. } => "repack",
+    };
+    // Groups a command's log events under `command{name=...}`. Note: this uses a thread-local
+    // context, so it reliably nests only synchronous commands; `browse`'s per-connection request
+    // spans run on separate tokio worker tasks and appear as their own top-level spans.
+    let _span = tracing::info_span!("command", name).entered();
     match cli.command {
         Command::Scan { path, force, readonly_fallback } => {
             commands::cmd_scan(&path, force, readonly_fallback)
