@@ -50,6 +50,7 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/repack", post(api_repack))
         .route("/api/scan", post(api_scan))
         .route("/api/scan/status", get(api_scan_status))
+        .route("/api/pick-folder", post(api_pick_folder))
         .route("/review", get(review))
         .with_state(state)
 }
@@ -613,6 +614,25 @@ async fn api_scan_status(State(state): State<AppState>) -> Json<crate::scan_queu
     Json(state.scan_queue.status())
 }
 
+#[derive(Serialize)]
+struct PickFolderDto { path: Option<String> }
+
+/// Open the native OS folder-picker dialog and return the chosen path (or `null` on cancel).
+/// The dialog call is blocking, so it runs on a `spawn_blocking` thread rather than the async
+/// runtime. This handler is just the CSRF gate plus that thread hop.
+async fn api_pick_folder(State(state): State<AppState>, headers: HeaderMap)
+    -> Result<Json<PickFolderDto>, (StatusCode, String)>
+{
+    // CSRF: checked first, before touching the OS dialog, so a bad/missing token does nothing.
+    let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
+    if !ok { return Err((StatusCode::FORBIDDEN, "missing or bad token".into())); }
+
+    let picked = tokio::task::spawn_blocking(|| {
+        rfd::FileDialog::new().set_title("Choose a drive or folder to scan").pick_folder()
+    }).await.map_err(err500)?;
+    Ok(Json(PickFolderDto { path: picked.map(|p| p.display().to_string()) }))
+}
+
 /// Serve the browse UI on 127.0.0.1 with an OS-assigned free port until the process is stopped.
 pub async fn serve(catalog_path: PathBuf, open: bool) -> anyhow::Result<()> {
     let state = AppState::new_live(catalog_path);
@@ -1083,6 +1103,13 @@ mod tests {
         let f = std::fs::File::open(drive.join("bundle.zip")).unwrap();
         let mut z = zip::ZipArchive::new(f).unwrap();
         assert!(z.by_name("dup.txt").is_ok());
+    }
+
+    #[tokio::test]
+    async fn pick_folder_requires_csrf_token() {
+        let (_t, _db, state) = seed_dupes();
+        let (status, _) = post_json(state, "/api/pick-folder", None, serde_json::json!({})).await;
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
