@@ -131,6 +131,9 @@ impl ScanQueue {
                 anyhow::bail!("path does not exist or is not a directory: {}", path.display());
             }
             let cat = crate::catalog::Catalog::open(&catalog_path)?;
+            if !cat.integrity_ok()? {
+                anyhow::bail!("catalog failed integrity check; restore the latest snapshot before scanning");
+            }
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64;
             let progress: &dyn crate::scanner::Progress = counters_for_job.as_ref();
             let scanned = crate::scanner::run_scan(&cat, &path, force,
