@@ -3,7 +3,7 @@ use walkdir::WalkDir;
 
 use crate::archive::{self, ArchiveLimits};
 use crate::catalog::Catalog;
-use crate::catalog::models::NewFile;
+use crate::catalog::models::{NewFile, Volume};
 use crate::category::Category;
 use crate::config::Config;
 use crate::hashing;
@@ -177,6 +177,28 @@ pub fn scan_volume(cat: &Catalog, root: &Path, identity: &VolumeIdentity, force:
     scan_volume_with_progress(cat, root, identity, force, now, None)
 }
 
+/// Resolve identity, upsert the volume, and scan. `Ok(None)` iff a read-only drive was skipped.
+///
+/// The single shared definition of "how a scan works" — used by both the CLI's `cmd_scan` and
+/// the web worker, so the two callers can never drift apart on volume-identity/upsert semantics.
+pub fn run_scan(
+    cat: &Catalog, mount_root: &Path, force: bool, fallback: crate::volume::ReadonlyMode,
+    now: i64, progress: Option<&dyn Progress>,
+) -> anyhow::Result<Option<(VolumeIdentity, ScanSummary)>> {
+    let identity = match crate::volume::resolve(mount_root, fallback)? {
+        Some(id) => id,
+        None => return Ok(None),
+    };
+    cat.upsert_volume(&Volume {
+        volume_id: identity.volume_id.clone(),
+        label: identity.label.clone(),
+        identified_by: identity.identified_by.clone(),
+        first_seen_at: now, last_seen_at: now,
+    })?;
+    let summary = scan_volume_with_progress(cat, mount_root, &identity, force, now, progress)?;
+    Ok(Some((identity, summary)))
+}
+
 /// Open an on-disk archive file, catalog each entry, and log each non-fatal error.
 fn descend_archive(
     cat: &Catalog, path: &Path, rel: &str, identity: &VolumeIdentity,
@@ -328,6 +350,23 @@ mod tests {
         fn on_skipped(&self) { self.skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
         fn on_error(&self) { self.errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
         fn on_archive_entry(&self) { self.arch.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+    }
+
+    #[test]
+    fn run_scan_resolves_upserts_and_scans() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("drive");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("x.txt"), b"hello").unwrap();
+        let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
+
+        let out = run_scan(&cat, &root, false, crate::volume::ReadonlyMode::Fingerprint, 100, None)
+            .unwrap();
+        let (identity, summary) = out.expect("not skipped");
+        assert_eq!(summary.hashed, 1);
+        // the volume row exists after run_scan upserted it
+        let stats = cat.volume_stats().unwrap();
+        assert!(stats.iter().any(|(id, _, _, _)| id == &identity.volume_id));
     }
 
     #[test]

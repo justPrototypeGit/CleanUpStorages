@@ -3,8 +3,8 @@ use clap::ValueEnum;
 
 use crate::config::Config;
 use crate::catalog::Catalog;
-use crate::catalog::models::{Volume, FileStatus};
-use crate::volume::{self, ReadonlyMode};
+use crate::catalog::models::FileStatus;
+use crate::volume::ReadonlyMode;
 use crate::scanner;
 use crate::catalog::backup;
 use crate::web;
@@ -34,25 +34,15 @@ pub fn cmd_scan(path: &Path, force: bool, fallback: ReadonlyFallback) -> anyhow:
         anyhow::bail!("catalog failed integrity check; restore the latest snapshot from {}",
             cfg.backups_dir().display());
     }
-
-    let identity = match volume::resolve(path, fallback.into())? {
-        Some(id) => id,
-        None => { println!("Skipped read-only drive at {}", path.display()); return Ok(()); }
-    };
     let now = now_secs();
-    cat.upsert_volume(&Volume {
-        volume_id: identity.volume_id.clone(),
-        label: identity.label.clone(),
-        identified_by: identity.identified_by.clone(),
-        first_seen_at: now, last_seen_at: now,
-    })?;
-
-    println!("Scanning {} (volume {}, id by {})...",
-        path.display(), identity.label, identity.identified_by);
-    let s = scanner::scan_volume(&cat, path, &identity, force, now)?;
-    println!("Done: {} hashed, {} unchanged, {} errors, {} newly missing, {} archive entries.",
-        s.hashed, s.skipped, s.errors, s.marked_missing, s.archive_entries);
-
+    match scanner::run_scan(&cat, path, force, fallback.into(), now, None)? {
+        None => { println!("Skipped read-only drive at {}", path.display()); return Ok(()); }
+        Some((identity, s)) => {
+            println!("Scanned {} (volume {}, id by {})", path.display(), identity.label, identity.identified_by);
+            println!("Done: {} hashed, {} unchanged, {} errors, {} newly missing, {} archive entries.",
+                s.hashed, s.skipped, s.errors, s.marked_missing, s.archive_entries);
+        }
+    }
     let snap = backup::snapshot(&cfg.catalog_path, &cfg.backups_dir(), cfg.snapshot_retention, now)?;
     println!("Catalog snapshot: {}", snap.display());
     Ok(())
