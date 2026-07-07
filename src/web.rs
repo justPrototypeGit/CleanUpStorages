@@ -10,6 +10,8 @@ use serde::{Serialize, Deserialize};
 use crate::catalog::Catalog;
 use crate::catalog::store::SearchFilters;
 use crate::catalog::models::FileRecord;
+use tower_http::trace::{TraceLayer, DefaultOnRequest, DefaultOnResponse};
+use tower_http::LatencyUnit;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -53,6 +55,18 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/pick-folder", post(api_pick_folder))
         .route("/review", get(review))
         .route("/scan", get(scan_page))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|req: &axum::http::Request<axum::body::Body>| {
+                    crate::observability::make_request_span(req)
+                })
+                .on_request(DefaultOnRequest::new().level(tracing::Level::DEBUG))
+                .on_response(
+                    DefaultOnResponse::new()
+                        .level(tracing::Level::INFO)
+                        .latency_unit(LatencyUnit::Millis),
+                ),
+        )
         .with_state(state)
 }
 
@@ -1308,5 +1322,41 @@ mod tests {
         assert!(body.contains("/api/detected-drives"));
         assert!(body.contains("/api/pick-folder"));
         assert!(!body.contains("http://") && !body.contains("https://"));
+    }
+
+    #[derive(Clone)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf); Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer { self.clone() }
+    }
+
+    #[tokio::test]
+    async fn request_is_traced_with_method_status_and_id() {
+        use axum::body::Body; use axum::http::Request; use tower::ServiceExt;
+        let (_t, db) = seed_catalog();
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sub = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
+            .with_writer(CaptureWriter(buf.clone()))
+            .with_ansi(false) // the custom writer isn't a terminal; disable ANSI so "id=" etc. are contiguous
+            .finish();
+        let _guard = tracing::subscriber::set_default(sub); // held across the await (current-thread test)
+
+        let app = build_router(db.clone());
+        let res = app.oneshot(Request::builder().uri("/api/search?q=thesis").body(Body::empty()).unwrap())
+            .await.unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+
+        let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("GET"), "log: {logged}");
+        assert!(logged.contains("200"), "log: {logged}");
+        assert!(logged.contains("id="), "request-id field present: {logged}");
     }
 }
