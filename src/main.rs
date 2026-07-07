@@ -81,6 +81,9 @@ fn main() -> anyhow::Result<()> {
         Command::Purge { .. } => "purge",
         Command::Repack { .. } => "repack",
     };
+    // Groups a command's log events under `command{name=...}`. Note: this uses a thread-local
+    // context, so it reliably nests only synchronous commands; `browse`'s per-connection request
+    // spans run on separate tokio worker tasks and appear as their own top-level spans.
     let _span = tracing::info_span!("command", name).entered();
     match cli.command {
         Command::Scan { path, force, readonly_fallback } => {
