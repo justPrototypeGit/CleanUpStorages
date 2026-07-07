@@ -71,6 +71,17 @@ enum Command {
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     cleanupstorages::observability::init(cli.verbose);
+    let name = match &cli.command {
+        Command::Scan { .. } => "scan",
+        Command::Search { .. } => "search",
+        Command::Status => "status",
+        Command::Browse { .. } => "browse",
+        Command::Duplicates => "duplicates",
+        Command::Quarantine { .. } => "quarantine",
+        Command::Purge { .. } => "purge",
+        Command::Repack { .. } => "repack",
+    };
+    let _span = tracing::info_span!("command", name).entered();
     match cli.command {
         Command::Scan { path, force, readonly_fallback } => {
             commands::cmd_scan(&path, force, readonly_fallback)
