@@ -301,6 +301,7 @@ const SCAN_HTML: &str = r##"<!doctype html>
   <h2>Or enter a path</h2>
   <div class="row"><input id="path" type="text" placeholder="e.g. D:\ or /Volumes/MyDrive"><button id="browse">Browse…</button></div>
   <label class="chk"><input id="force" type="checkbox"> Force full rescan (re-hash every file, slower)</label>
+  <div class="bar" style="font-size:12px;margin:4px 0;">Scanning writes a tiny hidden marker file (.cleanupstorages_id) to the drive root so it's recognised on future scans.</div>
   <div class="row"><button class="primary" id="scan">Scan</button></div>
 
   <div class="status">
