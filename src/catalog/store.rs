@@ -345,6 +345,17 @@ impl Catalog {
         Ok(())
     }
 
+    /// The most recent `limit` audit entries, newest first: (action, details_json, occurred_at).
+    pub fn recent_actions(&self, limit: usize) -> anyhow::Result<Vec<(String, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT action, IFNULL(details,''), occurred_at FROM actions_log
+             ORDER BY occurred_at DESC, id DESC LIMIT ?1")?;
+        let rows = stmt.query_map(params![limit as i64], |r| Ok((
+            r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?,
+        )))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     fn map_file_record(r: &rusqlite::Row) -> rusqlite::Result<FileRecord> {
         Ok(FileRecord {
             id: r.get(0)?,
@@ -586,6 +597,20 @@ mod tests {
         cat.log_action("purge", "{\"volume_id\":\"v\"}", 200).unwrap();
         let n: i64 = cat.conn.query_row("SELECT count(*) FROM actions_log", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn recent_actions_returns_newest_first() {
+        let (_t, cat) = open_tmp();
+        cat.log_action("quarantine", "{\"file_id\":1}", 100).unwrap();
+        cat.log_action("purge", "{\"volume_id\":\"v\"}", 200).unwrap();
+        let rows = cat.recent_actions(10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "purge");      // newest first
+        assert_eq!(rows[0].2, 200);
+        assert_eq!(rows[1].0, "quarantine");
+        // limit is respected
+        assert_eq!(cat.recent_actions(1).unwrap().len(), 1);
     }
 
     #[test]
