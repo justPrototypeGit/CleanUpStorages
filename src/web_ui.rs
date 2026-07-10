@@ -50,6 +50,14 @@ th{color:var(--mut);font-weight:600;font-size:12px;text-transform:uppercase;lett
  border:1px solid var(--line);border-radius:10px;padding:12px;min-height:300px;max-height:60vh;overflow:auto;}
 .console-in{width:100%;font-family:ui-monospace,Consolas,monospace;padding:10px;border-radius:8px;
  border:1px solid var(--line);background:var(--content);color:var(--fg);}
+.cards{display:flex;flex-wrap:wrap;gap:16px;}
+.cards .card{width:250px;margin:0;cursor:pointer;transition:box-shadow .15s,border-color .15s;}
+.cards .card.keep{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent) inset;}
+.thumb{width:100%;height:150px;object-fit:contain;border-radius:8px;background:#0003;display:block;}
+.noimg{width:100%;height:150px;display:flex;align-items:center;justify-content:center;color:var(--mut);
+ background:#0002;border-radius:8px;font-size:12px;text-align:center;padding:8px;}
+.badge{font-size:11px;color:var(--accent);font-weight:600;margin-top:8px;display:block;}
+.arch{color:var(--mut);font-size:11px;margin-top:8px;}
 "##;
 
 pub const SHARED_JS: &str = r##"
@@ -180,6 +188,75 @@ async function init(){
 }
 init();"##;
     shell("browse", csrf, "Browse", main, script)
+}
+
+pub fn review_page(csrf: &str) -> String {
+    let main = r##"
+<div class="mut" id="progress" style="margin-bottom:12px"></div>
+<div id="group"></div>
+<div style="display:flex;gap:8px;margin-top:16px;align-items:center;justify-content:space-between">
+  <button class="btn" id="skip">Skip this group</button>
+  <button class="btn btn-primary" id="confirm">Keep selected, quarantine the rest</button>
+</div>
+<p class="mut" style="font-size:11px;text-align:center;margin-top:12px">Nothing is deleted — copies move to a recoverable <span class="mono">_ToDelete</span> folder until you purge.</p>
+<div class="mut" id="msg" style="margin-top:10px;min-height:1.4em"></div>"##;
+    let script = r##"
+let groups=[],idx=0,keepId=null;
+async function load(){
+  try{ groups=await apiGet("/api/duplicates"); }catch(e){ $("#msg").textContent="Load error: "+e; return; }
+  idx=0; render();
+}
+function render(){
+  if(idx>=groups.length){ $("#progress").textContent=""; $("#group").innerHTML="<p>All duplicate groups reviewed. 🎉</p>"; $("#confirm").style.display="none"; $("#skip").style.display="none"; return; }
+  const g=groups[idx]; keepId=g.suggested_keep_id;
+  $("#progress").textContent=`Group ${idx+1} of ${groups.length} · ${g.members.length} copies`;
+  $("#group").innerHTML=`<div class="cards">${g.members.map(m=>card(m)).join("")}</div>`;
+  for(const el of document.querySelectorAll(".cards .card")) el.addEventListener("click",()=>{ keepId=Number(el.dataset.id); paint(); });
+  paint();
+  for(const b of document.querySelectorAll(".repack")) b.addEventListener("click", async (ev)=>{
+    ev.stopPropagation();
+    const id=Number(b.dataset.id);
+    b.disabled=true; $("#msg").textContent="Repacking archive…";
+    try{
+      const j=await apiPost("/api/repack",{entry_id:id});
+      $("#msg").textContent=`Removed '${j.removed_entry}' from its archive (${j.retained_entries} kept). Original saved in _ToDelete.`; idx++; render();
+    }catch(e){ $("#msg").textContent="Repack error: "+e; b.disabled=false; }
+  });
+}
+function card(m){
+  const img=(m.category==="photo"&&m.mounted)?`<img class="thumb" loading="lazy" src="/api/preview/${m.id}" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'noimg',textContent:'no preview'}))">`:`<div class="noimg">${m.mounted?"no preview":"drive not connected"}</div>`;
+  const arch = m.is_loose ? "" :
+    (m.id===keepId ? `<div class="arch">inside archive</div>`
+     : m.mounted ? `<button class="btn btn-danger repack" data-id="${m.id}">Remove from archive</button>`
+                 : `<div class="arch">drive not connected</div>`);
+  return `<div class="card" data-id="${m.id}">${img}
+    <div class="mono" style="word-break:break-all;font-size:12px;margin:10px 0 6px">${esc(m.location)}</div>
+    <div class="mut" style="font-size:12px"><b style="color:var(--fg)">${esc(m.volume_label||m.volume_id)}</b></div>
+    <div class="mut" style="font-size:12px">${fmtSize(m.size_bytes)} · created ${fmtDate(m.created_time)}</div>
+    <div class="mut" style="font-size:12px">status: ${esc(m.status)}</div>${arch}
+    <div class="badge kept-badge" style="visibility:hidden">✓ keep this</div></div>`;
+}
+function paint(){
+  for(const el of document.querySelectorAll(".cards .card")){
+    const on=Number(el.dataset.id)===keepId;
+    el.classList.toggle("keep",on);
+    el.querySelector(".kept-badge").style.visibility=on?"visible":"hidden";
+  }
+}
+$("#confirm").addEventListener("click",async()=>{
+  const g=groups[idx]; if(!g)return;
+  const victims=g.members.filter(m=>m.id!==keepId&&m.is_loose).map(m=>m.id);
+  if(victims.length===0){ $("#msg").textContent="Nothing to quarantine (the other copies are inside archives)."; return; }
+  $("#confirm").disabled=true; $("#msg").textContent="Quarantining…";
+  try{
+    const j=await apiPost("/api/quarantine",{quarantine_ids:victims});
+    let m=`Quarantined ${j.quarantined}, skipped ${j.skipped}.`; if(j.unmounted_volumes&&j.unmounted_volumes.length) m+=" Some drives not connected."; if(j.errors&&j.errors.length) m+=" Errors: "+j.errors.join("; "); $("#msg").textContent=m; idx++; render();
+  }catch(e){ $("#msg").textContent="Error: "+e; }
+  $("#confirm").disabled=false;
+});
+$("#skip").addEventListener("click",()=>{ idx++; $("#msg").textContent=""; render(); });
+load();"##;
+    shell("duplicates", csrf, "Review duplicates", main, script)
 }
 
 pub fn drives_page(csrf: &str) -> String {
