@@ -203,6 +203,18 @@ fn err500<E: std::fmt::Display>(e: E) -> (axum::http::StatusCode, String) {
     (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 
+/// CSRF gate for mutating endpoints: require the per-run token (a cross-site page can't read it).
+/// Call this FIRST in every mutating handler, before any catalog/filesystem/dialog access.
+fn check_csrf(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, String)> {
+    let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok())
+        == Some(state.csrf_token.as_str());
+    if !ok {
+        tracing::warn!("rejected request: missing or bad CSRF token");
+        return Err((StatusCode::FORBIDDEN, "missing or bad token".into()));
+    }
+    Ok(())
+}
+
 async fn api_search(State(state): State<AppState>, Query(p): Query<SearchParams>)
     -> Result<Json<Vec<HitDto>>, (axum::http::StatusCode, String)>
 {
@@ -418,13 +430,7 @@ struct QuarantineResultDto {
 async fn api_quarantine(State(state): State<AppState>, headers: HeaderMap, body: Json<QuarantineReq>)
     -> Result<Json<QuarantineResultDto>, (StatusCode, String)>
 {
-    // CSRF: require the per-run token (a cross-site page can't read it). Checked first, before
-    // any catalog access, so a bad/missing token does nothing.
-    let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
-    if !ok {
-        tracing::warn!("rejected request: missing or bad CSRF token");
-        return Err((StatusCode::FORBIDDEN, "missing or bad token".into()));
-    }
+    check_csrf(&headers, &state)?;
 
     let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
@@ -482,12 +488,7 @@ struct RepackResultDto { removed_entry: String, retained_entries: usize }
 async fn api_repack(State(state): State<AppState>, headers: HeaderMap, body: Json<RepackReq>)
     -> Result<Json<RepackResultDto>, (StatusCode, String)>
 {
-    // CSRF: checked first, before any catalog access, so a bad/missing token does nothing.
-    let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
-    if !ok {
-        tracing::warn!("rejected request: missing or bad CSRF token");
-        return Err((StatusCode::FORBIDDEN, "missing or bad token".into()));
-    }
+    check_csrf(&headers, &state)?;
 
     let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
     let rec = cat.get_file(body.entry_id).map_err(err500)?
@@ -520,12 +521,7 @@ struct ForgetResultDto { removed_files: usize }
 async fn api_forget_drive(State(state): State<AppState>, headers: HeaderMap, body: Json<ForgetReq>)
     -> Result<Json<ForgetResultDto>, (StatusCode, String)>
 {
-    // CSRF: checked first, before any catalog access, so a bad/missing token does nothing.
-    let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
-    if !ok {
-        tracing::warn!("rejected request: missing or bad CSRF token");
-        return Err((StatusCode::FORBIDDEN, "missing or bad token".into()));
-    }
+    check_csrf(&headers, &state)?;
     let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .map_err(err500)?.as_secs() as i64;
@@ -552,12 +548,7 @@ struct PurgeAllResultDto {
 async fn api_purge_all(State(state): State<AppState>, headers: HeaderMap)
     -> Result<Json<PurgeAllResultDto>, (StatusCode, String)>
 {
-    // CSRF: checked first, before any catalog access, so a bad/missing token does nothing.
-    let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
-    if !ok {
-        tracing::warn!("rejected request: missing or bad CSRF token");
-        return Err((StatusCode::FORBIDDEN, "missing or bad token".into()));
-    }
+    check_csrf(&headers, &state)?;
     let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
         .map_err(err500)?.as_secs() as i64;
@@ -587,12 +578,7 @@ struct ScanEnqueuedDto { queued_position: usize }
 async fn api_scan(State(state): State<AppState>, headers: HeaderMap, body: Json<ScanReq>)
     -> Result<Json<ScanEnqueuedDto>, (StatusCode, String)>
 {
-    // CSRF: checked first, before any queue access, so a bad/missing token does nothing.
-    let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
-    if !ok {
-        tracing::warn!("rejected request: missing or bad CSRF token");
-        return Err((StatusCode::FORBIDDEN, "missing or bad token".into()));
-    }
+    check_csrf(&headers, &state)?;
 
     if body.path.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "path is required".into()));
@@ -615,12 +601,7 @@ struct PickFolderDto { path: Option<String> }
 async fn api_pick_folder(State(state): State<AppState>, headers: HeaderMap)
     -> Result<Json<PickFolderDto>, (StatusCode, String)>
 {
-    // CSRF: checked first, before touching the OS dialog, so a bad/missing token does nothing.
-    let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
-    if !ok {
-        tracing::warn!("rejected request: missing or bad CSRF token");
-        return Err((StatusCode::FORBIDDEN, "missing or bad token".into()));
-    }
+    check_csrf(&headers, &state)?;
 
     let picked = tokio::task::spawn_blocking(|| {
         rfd::FileDialog::new().set_title("Choose a drive or folder to scan").pick_folder()
