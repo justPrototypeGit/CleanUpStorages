@@ -52,6 +52,7 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/preview/:id", get(api_preview))
         .route("/api/quarantine", post(api_quarantine))
         .route("/api/repack", post(api_repack))
+        .route("/api/forget-drive", post(api_forget_drive))
         .route("/api/scan", post(api_scan))
         .route("/api/scan/status", get(api_scan_status))
         .route("/api/pick-folder", post(api_pick_folder))
@@ -780,6 +781,35 @@ async fn api_repack(State(state): State<AppState>, headers: HeaderMap, body: Jso
 }
 
 #[derive(Deserialize)]
+struct ForgetReq { volume_id: String }
+
+#[derive(Serialize)]
+struct ForgetResultDto { removed_files: usize }
+
+/// Remove a volume's catalog rows entirely (files on disk untouched; a rescan re-adds them).
+/// All destructive safety lives in `Catalog::forget_volume` (a same-transaction delete); this
+/// handler is just the CSRF gate plus a best-effort pre-mutation snapshot.
+async fn api_forget_drive(State(state): State<AppState>, headers: HeaderMap, body: Json<ForgetReq>)
+    -> Result<Json<ForgetResultDto>, (StatusCode, String)>
+{
+    // CSRF: checked first, before any catalog access, so a bad/missing token does nothing.
+    let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
+    if !ok {
+        tracing::warn!("rejected request: missing or bad CSRF token");
+        return Err((StatusCode::FORBIDDEN, "missing or bad token".into()));
+    }
+    let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map_err(err500)?.as_secs() as i64;
+    if let Ok(cfg) = crate::config::Config::default_paths() {
+        let _ = crate::catalog::backup::snapshot(&state.catalog_path, &cfg.backups_dir(),
+            cfg.snapshot_retention, now);
+    }
+    let removed = cat.forget_volume(&body.volume_id, now).map_err(err500)?;
+    Ok(Json(ForgetResultDto { removed_files: removed }))
+}
+
+#[derive(Deserialize)]
 struct ScanReq { path: String, force: bool }
 
 #[derive(Serialize)]
@@ -1130,6 +1160,18 @@ mod tests {
         let bytes = axum::body::to_bytes(res.into_body(), 5_000_000).await.unwrap();
         let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         (status, json)
+    }
+
+    #[tokio::test]
+    async fn forget_drive_requires_token_then_removes() {
+        let (_t, _db, state) = seed_dupes();
+        let (status, _) = post_json(state.clone(), "/api/forget-drive", None,
+            serde_json::json!({"volume_id":"vol-1"})).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, json) = post_json(state, "/api/forget-drive", Some("T"),
+            serde_json::json!({"volume_id":"vol-1"})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["removed_files"].as_i64().unwrap() >= 1);
     }
 
     #[tokio::test]

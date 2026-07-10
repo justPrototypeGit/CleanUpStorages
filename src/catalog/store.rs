@@ -374,6 +374,23 @@ impl Catalog {
         Ok(n)
     }
 
+    /// Remove ALL catalog knowledge of a volume: its file rows (FTS cleaned up by triggers) and
+    /// its `volumes` row. Never touches files on disk — a later rescan fully rebuilds the volume.
+    /// Returns the number of file rows removed, and logs a `forget` audit action.
+    pub fn forget_volume(&self, volume_id: &str, now: i64) -> anyhow::Result<usize> {
+        let label: String = self.conn.query_row(
+            "SELECT label FROM volumes WHERE volume_id=?1", params![volume_id],
+            |r| r.get(0)).unwrap_or_else(|_| volume_id.to_string());
+        self.conn.execute_batch("BEGIN")?;
+        let removed = self.conn.execute("DELETE FROM files WHERE volume_id=?1", params![volume_id])?;
+        self.conn.execute("DELETE FROM scan_errors WHERE volume_id=?1", params![volume_id])?;
+        self.conn.execute("DELETE FROM volumes WHERE volume_id=?1", params![volume_id])?;
+        self.conn.execute_batch("COMMIT")?;
+        self.log_action("forget", &serde_json::json!({
+            "volume_id": volume_id, "label": label, "removed_files": removed }).to_string(), now)?;
+        Ok(removed)
+    }
+
     /// Append an audit entry to actions_log.
     pub fn log_action(&self, action: &str, details_json: &str, now: i64) -> anyhow::Result<()> {
         self.conn.execute(
@@ -728,6 +745,25 @@ mod tests {
         assert_eq!(rec.container_chain, None); // now a loose quarantined row
         assert_eq!(rec.relative_path, "_ToDelete/a.zip/x.jpg");
         assert_eq!(rec.original_path.as_deref(), Some("a.zip › x.jpg"));
+    }
+
+    #[test]
+    fn forget_volume_deletes_rows_and_fts_but_returns_count() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_volume(&crate::catalog::models::Volume {
+            volume_id: "v".into(), label: "Gone".into(), identified_by: "marker".into(),
+            first_seen_at: 1, last_seen_at: 1 }).unwrap();
+        let f = crate::catalog::models::NewFile {
+            volume_id: "v".into(), relative_path: "a.txt".into(), filename: "a.txt".into(),
+            extension: "txt".into(), size_bytes: 1, content_hash: "h".into(),
+            created_time: None, modified_time: None, accessed_time: None,
+            category: crate::category::Category::Other, container_chain: None };
+        cat.upsert_file(&f, 1).unwrap();
+        let removed = cat.forget_volume("v", 500).unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(cat.volume_last_seen("v").unwrap(), None);          // volume row gone
+        assert!(cat.search("a", None, None, None).unwrap().is_empty()); // FTS row gone
+        assert!(cat.recent_actions(5).unwrap().iter().any(|(a, _, _)| a == "forget"));
     }
 
     #[test]
