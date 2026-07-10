@@ -142,6 +142,46 @@ init().catch(e=>{$("#activity").textContent="Error: "+e;});"##;
     shell("overview", csrf, "Overview", main, script)
 }
 
+pub fn browse_page(csrf: &str) -> String {
+    let main = r##"
+<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:12px">
+  <input id="q" type="search" placeholder="Search filename or path…" style="flex:1;min-width:220px;padding:8px 12px;border-radius:999px;border:1px solid var(--line);background:var(--content);color:var(--fg)" autofocus>
+  <select id="volume" class="btn"><option value="">All drives</option></select>
+  <select id="category" class="btn"><option value="">All types</option>
+    <option value="photo">Photo</option><option value="video">Video</option>
+    <option value="document">Document</option><option value="academic">Academic</option><option value="other">Other</option></select>
+  <select id="status" class="btn"><option value="">Any status</option>
+    <option value="active">Active</option><option value="missing">Missing</option>
+    <option value="quarantined">Quarantined</option><option value="purged">Purged</option></select>
+</div>
+<div class="mut" id="count" style="margin-bottom:8px"></div>
+<div class="card" style="padding:0"><table><thead><tr>
+  <th>Location</th><th>Drive</th><th>Type</th><th style="text-align:right">Size</th><th>Status</th>
+</tr></thead><tbody id="results"></tbody></table></div>"##;
+    let script = r##"
+let timer=null;
+async function run(){ try{
+  const p=new URLSearchParams(); const q=$("#q").value.trim(); if(q)p.set("q",q);
+  for(const k of ["volume","category","status"]){ const v=$("#"+k).value; if(v)p.set(k,v); }
+  const hits=await apiGet("/api/search?"+p.toString());
+  $("#count").textContent=hits.length+" result"+(hits.length===1?"":"s")+(hits.length>=500?" (showing first 500)":"");
+  $("#results").innerHTML=hits.map(h=>{
+    const pill=h.status==="active"?"":`<span class="pill ${esc(h.status)}">${esc(h.status)}</span>`;
+    return `<tr><td class="mono">${esc(h.location)}</td><td>${esc(h.volume_id)}</td><td>${esc(h.category)}</td>
+      <td class="mono" style="text-align:right">${fmtSize(h.size_bytes)}</td><td>${pill}</td></tr>`; }).join("");
+}catch(e){ $("#count").textContent="Search error: "+e; } }
+function debounced(){ clearTimeout(timer); timer=setTimeout(run,180); }
+async function init(){
+  const vs=await apiGet("/api/volumes"); const sel=$("#volume");
+  for(const v of vs){ const o=document.createElement("option"); o.value=v.volume_id; o.textContent=v.label; sel.appendChild(o); }
+  $("#q").addEventListener("input",debounced);
+  for(const k of ["volume","category","status"]) $("#"+k).addEventListener("change",run);
+  run();
+}
+init();"##;
+    shell("browse", csrf, "Browse", main, script)
+}
+
 pub fn drives_page(csrf: &str) -> String {
     let main = r##"
 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
