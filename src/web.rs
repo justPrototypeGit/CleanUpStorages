@@ -45,6 +45,7 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/search", get(api_search))
         .route("/api/volumes", get(api_volumes))
         .route("/api/stats", get(api_stats))
+        .route("/api/activity", get(api_activity))
         .route("/api/detected-drives", get(api_detected_drives))
         .route("/api/duplicates", get(api_duplicates))
         .route("/api/preview/:id", get(api_preview))
@@ -413,6 +414,27 @@ struct VolumeDto { volume_id: String, label: String, active_files: i64, active_b
 #[derive(Serialize)]
 struct StatsDto { duplicate_groups: i64, volumes: Vec<VolumeDto> }
 
+#[derive(Serialize)]
+struct ActivityDto { kind: String, summary: String, occurred_at: i64 }
+
+/// Human summary for one audit row. `details` is the JSON stored by the engine; parse best-effort
+/// and fall back to the raw action name so a schema change can never break the feed.
+fn activity_summary(action: &str, details: &str) -> String {
+    let d: serde_json::Value = serde_json::from_str(details).unwrap_or(serde_json::Value::Null);
+    let s = |k: &str| d.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let n = |k: &str| d.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+    match action {
+        "scan" => format!("Scanned {} — {} hashed, {} unchanged", s("label"), n("hashed"), n("skipped")),
+        "quarantine" => format!("Quarantined {}", if s("filename").is_empty() { s("relative_path") } else { s("filename") }),
+        "quarantine_skip" => "Skipped a file to protect the last copy".to_string(),
+        "quarantine_error" => "A file could not be quarantined".to_string(),
+        "repack" => format!("Repacked an archive (removed {})", s("removed_entry")),
+        "purge" => format!("Purged {} file(s), reclaimed {} MiB", n("files_purged"), n("bytes_reclaimed") / (1024 * 1024)),
+        "forget" => format!("Removed drive '{}' from the catalog", s("label")),
+        other => other.to_string(),
+    }
+}
+
 #[derive(Deserialize, Default)]
 struct SearchParams {
     q: Option<String>,
@@ -469,6 +491,16 @@ async fn api_stats(State(state): State<AppState>)
     let duplicate_groups = cat.duplicate_group_count().map_err(err500)?;
     let volumes = volume_dtos(&cat).map_err(err500)?;
     Ok(Json(StatsDto { duplicate_groups, volumes }))
+}
+
+async fn api_activity(State(state): State<AppState>)
+    -> Result<Json<Vec<ActivityDto>>, (StatusCode, String)>
+{
+    let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
+    let rows = cat.recent_actions(30).map_err(err500)?;
+    Ok(Json(rows.into_iter().map(|(action, details, occurred_at)| ActivityDto {
+        summary: activity_summary(&action, &details), kind: action, occurred_at,
+    }).collect()))
 }
 
 async fn api_detected_drives(State(state): State<AppState>)
@@ -1395,5 +1427,21 @@ mod tests {
         let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(logged.contains("WARN"), "expected a warn line: {logged}");
         assert!(logged.to_lowercase().contains("token"), "reason mentions token: {logged}");
+    }
+
+    #[tokio::test]
+    async fn api_activity_returns_formatted_rows() {
+        let (_t, db, state) = seed_dupes();
+        { // write an action to read back
+            let cat = crate::catalog::Catalog::open(&db).unwrap();
+            cat.log_action("purge",
+                "{\"volume_id\":\"vol-1\",\"files_purged\":3,\"bytes_reclaimed\":2048}", 500).unwrap();
+        }
+        let v = get_json_state(state, "/api/activity").await;
+        let arr = v.as_array().unwrap();
+        assert!(!arr.is_empty());
+        assert_eq!(arr[0]["kind"], "purge");
+        assert!(arr[0]["summary"].as_str().unwrap().contains("Purged"));
+        assert_eq!(arr[0]["occurred_at"], 500);
     }
 }
