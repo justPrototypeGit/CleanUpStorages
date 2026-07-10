@@ -859,7 +859,7 @@ mod tests {
         std::fs::write(drive.join("a.jpg"), tiny_png()).unwrap();
         // find a.jpg's id
         let cat = crate::catalog::Catalog::open_readonly(&db).unwrap();
-        let id = cat.active_file_id("vol-1", "a.jpg").unwrap().unwrap();
+        let id = cat.loose_file_id("vol-1", "a.jpg").unwrap().unwrap();
 
         let app = build_router_with(state);
         let res = app.oneshot(Request::builder().uri(format!("/api/preview/{id}"))
@@ -880,7 +880,7 @@ mod tests {
         std::fs::write(drive.join("a.jpg"), b"this is not an image").unwrap();
         // find a.jpg's id
         let cat = crate::catalog::Catalog::open_readonly(&db).unwrap();
-        let id = cat.active_file_id("vol-1", "a.jpg").unwrap().unwrap();
+        let id = cat.loose_file_id("vol-1", "a.jpg").unwrap().unwrap();
 
         let app = build_router_with(state);
         let res = app.oneshot(Request::builder().uri(format!("/api/preview/{id}"))
@@ -905,7 +905,7 @@ mod tests {
         }
         // find notes.txt's id
         let cat = crate::catalog::Catalog::open_readonly(&db).unwrap();
-        let id = cat.active_file_id("vol-1", "notes.txt").unwrap().unwrap();
+        let id = cat.loose_file_id("vol-1", "notes.txt").unwrap().unwrap();
 
         let app = build_router_with(state);
         let res = app.oneshot(Request::builder().uri(format!("/api/preview/{id}"))
@@ -964,7 +964,7 @@ mod tests {
         std::fs::write(drive.join("a.jpg"), b"DUP").unwrap();
         std::fs::write(drive.join("copy/a.jpg"), b"DUP").unwrap();
         let cat = crate::catalog::Catalog::open_readonly(&db).unwrap();
-        let victim = cat.active_file_id("vol-1", "copy/a.jpg").unwrap().unwrap();
+        let victim = cat.loose_file_id("vol-1", "copy/a.jpg").unwrap().unwrap();
         drop(cat);
 
         let (status, json) = post_json(state, "/api/quarantine", Some("T"),
@@ -990,7 +990,7 @@ mod tests {
                 container_chain: None }, 100).unwrap();
         }
         let cat = crate::catalog::Catalog::open_readonly(&db).unwrap();
-        let id = cat.active_file_id("vol-2", "x.jpg").unwrap().unwrap();
+        let id = cat.loose_file_id("vol-2", "x.jpg").unwrap().unwrap();
         drop(cat);
         let (status, json) = post_json(state, "/api/quarantine", Some("T"),
             serde_json::json!({"quarantine_ids":[id]})).await;

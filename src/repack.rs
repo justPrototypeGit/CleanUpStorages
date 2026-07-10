@@ -127,7 +127,7 @@ pub fn repack_entry(
     )?;
     let new_hash = crate::hashing::hash_file(&archive_path)?;
     let new_size = std::fs::metadata(&archive_path)?.len() as i64;
-    if let Some(arch_id) = cat.active_file_id(expected_volume_id, &archive_rel)? {
+    if let Some(arch_id) = cat.loose_file_id(expected_volume_id, &archive_rel)? {
         cat.update_archive_hash(arch_id, &new_hash, new_size, now)?;
     }
     cat.log_action(

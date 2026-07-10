@@ -217,13 +217,10 @@ impl Catalog {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Id of the loose file at this path, if catalogued, regardless of status.
-    ///
-    /// Not part of this task's brief, but required by its own tests (and every
-    /// downstream quarantine/purge task): it was specified in the Phase 1a plan
-    /// but never actually implemented. Added here as a small, fully-specified
-    /// helper rather than blocking on it.
-    pub fn active_file_id(&self, volume_id: &str, relative_path: &str) -> anyhow::Result<Option<i64>> {
+    /// Id of the loose file (container_chain IS NULL) at this path, if catalogued, regardless of
+    /// status. Exactly one such row can exist per (volume, path) — the loose-identity partial
+    /// unique index guarantees it.
+    pub fn loose_file_id(&self, volume_id: &str, relative_path: &str) -> anyhow::Result<Option<i64>> {
         let row = self.conn.query_row(
             "SELECT id FROM files WHERE volume_id=?1 AND relative_path=?2 AND container_chain IS NULL",
             params![volume_id, relative_path],
@@ -665,7 +662,7 @@ mod tests {
         let (_t, cat) = open_tmp();
         let mut f = mk_file("vol-1", "Photos/a.jpg", "h"); f.size_bytes = 2048;
         cat.upsert_file(&f, 200).unwrap();
-        let id = cat.active_file_id("vol-1", "Photos/a.jpg").unwrap().unwrap();
+        let id = cat.loose_file_id("vol-1", "Photos/a.jpg").unwrap().unwrap();
 
         cat.mark_quarantined(id, "_ToDelete/Photos/a.jpg", "Photos/a.jpg", 300).unwrap();
         let rec = cat.get_file(id).unwrap().unwrap();
@@ -771,7 +768,7 @@ mod tests {
     fn update_archive_hash_changes_hash_and_size() {
         let (_t, cat) = open_tmp();
         cat.upsert_file(&mk_file("vol-1", "a.zip", "OLD"), 100).unwrap();
-        let id = cat.active_file_id("vol-1", "a.zip").unwrap().unwrap();
+        let id = cat.loose_file_id("vol-1", "a.zip").unwrap().unwrap();
         cat.update_archive_hash(id, "NEW", 999, 200).unwrap();
         let rec = cat.get_file(id).unwrap().unwrap();
         assert_eq!(rec.content_hash, "NEW");
