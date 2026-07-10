@@ -86,7 +86,7 @@ async fn browse(State(state): State<AppState>) -> Html<String> {
 }
 
 async fn review(State(state): State<AppState>) -> Html<String> {
-    Html(REVIEW_HTML.replace("{{CSRF}}", &state.csrf_token))
+    Html(crate::web_ui::review_page(&state.csrf_token))
 }
 
 async fn scan_page(State(state): State<AppState>) -> Html<String> {
@@ -100,112 +100,6 @@ async fn drives_page_h(State(state): State<AppState>) -> Html<String> {
 async fn console_page_h(State(state): State<AppState>) -> Html<String> {
     Html(crate::web_ui::console_page(&state.csrf_token))
 }
-
-const REVIEW_HTML: &str = r##"<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="csrf" content="{{CSRF}}">
-<title>CleanUpStorages — Review duplicates</title>
-<style>
-  :root { color-scheme: light dark; --bg:#111; --fg:#eee; --mut:#999; --line:#333; --accent:#5aa0ff; --danger:#e0705a; }
-  @media (prefers-color-scheme: light){ :root{ --bg:#fff; --fg:#111; --mut:#666; --line:#ddd; } }
-  *{box-sizing:border-box;} body{margin:0;font:14px/1.4 system-ui,sans-serif;background:var(--bg);color:var(--fg);}
-  header{padding:12px 16px;border-bottom:1px solid var(--line);display:flex;gap:12px;align-items:center;}
-  header a{color:var(--accent);text-decoration:none;font-size:12px;}
-  main{padding:16px;max-width:1000px;margin:0 auto;}
-  .progress{color:var(--mut);margin-bottom:12px;}
-  .cards{display:flex;flex-wrap:wrap;gap:12px;}
-  .card{border:1px solid var(--line);border-radius:10px;padding:10px;width:230px;}
-  .card.keep{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset;}
-  .thumb{width:100%;height:150px;object-fit:contain;background:#0004;border-radius:6px;}
-  .noimg{width:100%;height:150px;display:flex;align-items:center;justify-content:center;color:var(--mut);background:#0002;border-radius:6px;font-size:12px;text-align:center;}
-  .loc{word-break:break-all;font-size:12px;margin:6px 0 2px;}
-  .kv{color:var(--mut);font-size:12px;} .kv b{color:var(--fg);font-weight:600;}
-  .badge{font-size:11px;color:var(--accent);} .arch{color:var(--mut);font-size:11px;}
-  .actions{display:flex;gap:8px;margin-top:8px;}
-  button{font:inherit;padding:8px 12px;border-radius:8px;border:1px solid var(--line);background:transparent;color:var(--fg);cursor:pointer;}
-  button.primary{border-color:var(--accent);color:var(--accent);}
-  button.danger{border-color:var(--danger);color:var(--danger);}
-  .msg{color:var(--mut);margin-top:10px;min-height:1.4em;}
-</style></head>
-<body>
-<header><strong>Review duplicates</strong><a href="/browse">← Back to browse</a><a href="/scan">Scan a drive</a></header>
-<main>
-  <div class="progress" id="progress"></div>
-  <div id="group"></div>
-  <div class="actions">
-    <button class="primary" id="confirm">Keep selected, quarantine the rest</button>
-    <button id="skip">Skip</button>
-  </div>
-  <div class="msg" id="msg"></div>
-</main>
-<script>
-const $=s=>document.querySelector(s);
-const CSRF=document.querySelector('meta[name="csrf"]').content;
-function esc(s){return (s==null?"":String(s)).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
-function fmtSize(n){const u=["B","KB","MB","GB","TB"];let i=0,x=n;while(x>=1024&&i<u.length-1){x/=1024;i++;}return (i?x.toFixed(1):x)+" "+u[i];}
-function fmtDate(t){return t?new Date(t*1000).toISOString().slice(0,10):"—";}
-let groups=[],idx=0,keepId=null;
-async function load(){
-  try{ groups=await (await fetch("/api/duplicates")).json(); }catch(e){ $("#msg").textContent="Load error: "+e; return; }
-  idx=0; render();
-}
-function render(){
-  if(idx>=groups.length){ $("#progress").textContent=""; $("#group").innerHTML="<p>All duplicate groups reviewed. 🎉</p>"; $("#confirm").style.display="none"; $("#skip").style.display="none"; return; }
-  const g=groups[idx]; keepId=g.suggested_keep_id;
-  $("#progress").textContent=`Group ${idx+1} of ${groups.length} · ${g.members.length} copies`;
-  $("#group").innerHTML=`<div class="cards">${g.members.map(m=>card(m)).join("")}</div>`;
-  for(const el of document.querySelectorAll(".card")) el.addEventListener("click",()=>{ keepId=Number(el.dataset.id); paint(); });
-  paint();
-  for(const b of document.querySelectorAll(".repack")) b.addEventListener("click", async (ev)=>{
-    ev.stopPropagation();
-    const id=Number(b.dataset.id);
-    b.disabled=true; $("#msg").textContent="Repacking archive…";
-    try{
-      const res=await fetch("/api/repack",{method:"POST",headers:{"content-type":"application/json","x-cleanup-token":CSRF},body:JSON.stringify({entry_id:id})});
-      if(!res.ok){ $("#msg").textContent="Repack error: "+(await res.text()); b.disabled=false; }
-      else{ const j=await res.json(); $("#msg").textContent=`Removed '${j.removed_entry}' from its archive (${j.retained_entries} kept). Original saved in _ToDelete.`; idx++; render(); }
-    }catch(e){ $("#msg").textContent="Repack error: "+e; b.disabled=false; }
-  });
-}
-function card(m){
-  const img=(m.category==="photo"&&m.mounted)?`<img class="thumb" loading="lazy" src="/api/preview/${m.id}" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'noimg',textContent:'no preview'}))">`:`<div class="noimg">${m.mounted?"no preview":"drive not connected"}</div>`;
-  const arch = m.is_loose ? "" :
-    (m.id===keepId ? `<div class="arch">inside archive</div>`
-     : m.mounted ? `<button class="danger repack" data-id="${m.id}">Remove from archive</button>`
-                 : `<div class="arch">drive not connected</div>`);
-  return `<div class="card" data-id="${m.id}">${img}
-    <div class="loc">${esc(m.location)}</div>
-    <div class="kv"><b>${esc(m.volume_label||m.volume_id)}</b></div>
-    <div class="kv">${fmtSize(m.size_bytes)} · created ${fmtDate(m.created_time)}</div>
-    <div class="kv">status: ${esc(m.status)}</div>${arch}
-    <div class="badge kept-badge" style="visibility:hidden">✓ keep this</div></div>`;
-}
-function paint(){
-  for(const el of document.querySelectorAll(".card")){
-    const on=Number(el.dataset.id)===keepId;
-    el.classList.toggle("keep",on);
-    el.querySelector(".kept-badge").style.visibility=on?"visible":"hidden";
-  }
-}
-$("#confirm").addEventListener("click",async()=>{
-  const g=groups[idx]; if(!g)return;
-  const victims=g.members.filter(m=>m.id!==keepId&&m.is_loose).map(m=>m.id);
-  if(victims.length===0){ $("#msg").textContent="Nothing to quarantine (the other copies are inside archives)."; return; }
-  $("#confirm").disabled=true; $("#msg").textContent="Quarantining…";
-  try{
-    const res=await fetch("/api/quarantine",{method:"POST",headers:{"content-type":"application/json","x-cleanup-token":CSRF},body:JSON.stringify({quarantine_ids:victims})});
-    if(!res.ok){ $("#msg").textContent="Error: "+(await res.text()); }
-    else{ const j=await res.json(); let m=`Quarantined ${j.quarantined}, skipped ${j.skipped}.`; if(j.unmounted_volumes&&j.unmounted_volumes.length) m+=" Some drives not connected."; if(j.errors&&j.errors.length) m+=" Errors: "+j.errors.join("; "); $("#msg").textContent=m; idx++; render(); }
-  }catch(e){ $("#msg").textContent="Error: "+e; }
-  $("#confirm").disabled=false;
-});
-$("#skip").addEventListener("click",()=>{ idx++; $("#msg").textContent=""; render(); });
-load();
-</script>
-</body></html>
-"##;
 
 const SCAN_HTML: &str = r##"<!doctype html>
 <html lang="en"><head>
