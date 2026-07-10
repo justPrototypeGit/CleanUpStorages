@@ -425,7 +425,11 @@ fn activity_summary(action: &str, details: &str) -> String {
     let n = |k: &str| d.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
     match action {
         "scan" => format!("Scanned {} — {} hashed, {} unchanged", s("label"), n("hashed"), n("skipped")),
-        "quarantine" => format!("Quarantined {}", if s("filename").is_empty() { s("relative_path") } else { s("filename") }),
+        "quarantine" => {
+            let from = s("from");
+            let name = from.rsplit('/').next().unwrap_or(&from);
+            format!("Quarantined {}", name)
+        }
         "quarantine_skip" => "Skipped a file to protect the last copy".to_string(),
         "quarantine_error" => "A file could not be quarantined".to_string(),
         "repack" => format!("Repacked an archive (removed {})", s("removed_entry")),
@@ -1432,10 +1436,13 @@ mod tests {
     #[tokio::test]
     async fn api_activity_returns_formatted_rows() {
         let (_t, db, state) = seed_dupes();
-        { // write an action to read back
+        { // write actions to read back (newest-first: purge@500, then quarantine@400)
             let cat = crate::catalog::Catalog::open(&db).unwrap();
             cat.log_action("purge",
                 "{\"volume_id\":\"vol-1\",\"files_purged\":3,\"bytes_reclaimed\":2048}", 500).unwrap();
+            // Real quarantine payload shape from src/quarantine.rs: `from` is the relative path.
+            cat.log_action("quarantine",
+                "{\"file_id\":1,\"volume_id\":\"vol-1\",\"from\":\"docs/report.txt\",\"to\":\"_ToDelete/report.txt\",\"hash\":\"h\"}", 400).unwrap();
         }
         let v = get_json_state(state, "/api/activity").await;
         let arr = v.as_array().unwrap();
@@ -1443,5 +1450,9 @@ mod tests {
         assert_eq!(arr[0]["kind"], "purge");
         assert!(arr[0]["summary"].as_str().unwrap().contains("Purged"));
         assert_eq!(arr[0]["occurred_at"], 500);
+        // The quarantine feed entry must name the file (basename of `from`), not render blank.
+        let q = arr.iter().find(|e| e["kind"] == "quarantine").expect("quarantine entry present");
+        assert!(q["summary"].as_str().unwrap().contains("report.txt"),
+            "quarantine summary should name the file: {}", q["summary"]);
     }
 }
