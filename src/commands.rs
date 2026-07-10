@@ -119,17 +119,40 @@ pub fn cmd_quarantine(mount: &Path, ids: &[i64]) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn cmd_purge(mount: &Path) -> anyhow::Result<()> {
+pub fn cmd_purge(mount: Option<&Path>, all: bool) -> anyhow::Result<()> {
     let cfg = Config::default_paths()?;
     let cat = Catalog::open(&cfg.catalog_path)?;
-    let vid = crate::volume::read_volume_id(mount)
-        .ok_or_else(|| anyhow::anyhow!("no identity marker at {}", mount.display()))?;
     let now = now_secs();
     // snapshot BEFORE the irreversible delete
     let snap = backup::snapshot(&cfg.catalog_path, &cfg.backups_dir(), cfg.snapshot_retention, now)?;
     println!("Catalog snapshot (pre-purge): {}", snap.display());
+    if all {
+        let mounts = crate::mounts::live_mounts();
+        let out = purge::purge_all(&cat, &mounts, now)?;
+        let total: i64 = out.purged.iter().map(|(_, _, b)| *b).sum();
+        println!("Purged {} volume(s), reclaimed {} MiB total.", out.purged.len(), total / (1024*1024));
+        for v in &out.skipped_unmounted { println!("  skipped (not connected): {v}"); }
+        for e in &out.errors { println!("  error: {e}"); }
+        return Ok(());
+    }
+    let mount = mount.ok_or_else(|| anyhow::anyhow!("a mount path is required unless --all is given"))?;
+    let vid = crate::volume::read_volume_id(mount)
+        .ok_or_else(|| anyhow::anyhow!("no identity marker at {}", mount.display()))?;
     let out = purge::purge_volume(&cat, mount, &vid, now)?;
     println!("Purged {} file(s), reclaimed {} MiB.", out.files_purged, out.bytes_reclaimed / (1024*1024));
+    Ok(())
+}
+
+pub fn cmd_forget(mount: &Path) -> anyhow::Result<()> {
+    let cfg = Config::default_paths()?;
+    let cat = Catalog::open(&cfg.catalog_path)?;
+    let vid = crate::volume::read_volume_id(mount)
+        .ok_or_else(|| anyhow::anyhow!("no identity marker at {}; nothing to forget", mount.display()))?;
+    let now = now_secs();
+    let snap = backup::snapshot(&cfg.catalog_path, &cfg.backups_dir(), cfg.snapshot_retention, now)?;
+    println!("Catalog snapshot (pre-forget): {}", snap.display());
+    let removed = cat.forget_volume(&vid, now)?;
+    println!("Forgot volume {vid}: removed {removed} catalog entries. Files on disk are untouched; rescan to re-add.");
     Ok(())
 }
 
