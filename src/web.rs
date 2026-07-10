@@ -60,6 +60,7 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/pick-folder", post(api_pick_folder))
         .route("/review", get(review))
         .route("/scan", get(scan_page))
+        .route("/drives", get(drives_page_h))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|req: &axum::http::Request<axum::body::Body>| {
@@ -89,6 +90,10 @@ async fn review(State(state): State<AppState>) -> Html<String> {
 
 async fn scan_page(State(state): State<AppState>) -> Html<String> {
     Html(SCAN_HTML.replace("{{CSRF}}", &state.csrf_token))
+}
+
+async fn drives_page_h(State(state): State<AppState>) -> Html<String> {
+    Html(crate::web_ui::drives_page(&state.csrf_token))
 }
 
 const INDEX_HTML: &str = r##"<!doctype html>
@@ -1530,6 +1535,22 @@ mod tests {
         assert!(body.contains("/api/scan"));
         assert!(body.contains("/api/detected-drives"));
         assert!(body.contains("/api/pick-folder"));
+        assert!(!body.contains("http://") && !body.contains("https://"));
+    }
+
+    #[tokio::test]
+    async fn drives_page_is_wired_and_self_contained() {
+        use axum::body::Body; use axum::http::Request; use tower::ServiceExt;
+        let (_t, _db, state) = seed_dupes();
+        let app = build_router_with(state);
+        let res = app.oneshot(Request::builder().uri("/drives").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), 2_000_000).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("name=\"csrf\""));
+        assert!(body.contains("/api/drives"));
+        assert!(body.contains("/api/forget-drive"));
+        assert!(body.contains("/api/purge-all"));
         assert!(!body.contains("http://") && !body.contains("https://"));
     }
 

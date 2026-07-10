@@ -141,3 +141,57 @@ async function init(){
 init().catch(e=>{$("#activity").textContent="Error: "+e;});"##;
     shell("overview", csrf, "Overview", main, script)
 }
+
+pub fn drives_page(csrf: &str) -> String {
+    let main = r##"
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+  <div class="mut">Manage catalogued drives. Nothing here deletes files on your drives.</div>
+  <button class="btn btn-danger" id="purge-all">Purge all quarantines</button></div>
+<div id="drives" class="mut">Loading drives…</div>
+<div class="mut" id="msg" style="margin-top:12px;min-height:1.4em"></div>"##;
+    let script = r##"
+function bar(d){ if(d.total_bytes==null) return "";
+  const used=d.total_bytes-d.free_bytes, pct=Math.round(100*used/d.total_bytes);
+  return `<div style="margin:10px 0"><div style="display:flex;justify-content:space-between">
+    <span class="mono">${fmtSize(used)} of ${fmtSize(d.total_bytes)} used</span><span class="mut">${pct}% full</span></div>
+    <div class="progressbar"><span style="width:${pct}%"></span></div></div>`; }
+async function load(){
+  const drives=await apiGet("/api/drives");
+  $("#drives").innerHTML = drives.length? drives.map(d=>`<div class="card" data-vid="${esc(d.volume_id)}" data-path="${esc(d.mount_path||'')}">
+    <div style="display:flex;justify-content:space-between;align-items:start">
+      <div><h3 style="margin:0">${esc(d.label)}</h3>
+        <div class="mut" style="font-size:12px">${d.connected?'<span class="pill active">connected</span>':'<span class="pill purged">offline</span>'}
+          · ${d.active_files.toLocaleString()} files · last scan ${fmtDate(d.last_seen_at)}
+          ${d.has_errors?' · <span class="pill missing">had scan errors</span>':''}</div></div>
+      <div class="mut mono">${fmtSize(d.reclaimable_bytes)} reclaimable</div></div>
+    ${bar(d)}
+    <div style="display:flex;gap:8px;margin-top:12px">
+      <button class="btn rescan" ${d.connected?'':'disabled'}>${d.has_errors?'Repair (rescan)':'Rescan'}</button>
+      <button class="btn btn-danger forget">Forget…</button></div></div>`).join("")
+    : '<div class="mut">No drives catalogued yet. Scan one from the Scan page.</div>';
+  for(const c of document.querySelectorAll("[data-vid]")){
+    c.querySelector(".forget").onclick=async()=>{
+      const vid=c.dataset.vid, label=c.querySelector("h3").textContent;
+      if(!window.confirm(`Forget "${label}"? This removes it from the catalog only — files on the drive are NOT deleted. You can rescan to re-add it.`))return;
+      try{ const r=await apiPost("/api/forget-drive",{volume_id:vid}); $("#msg").textContent=`Forgot ${label} (${r.removed_files} entries removed).`; load(); }
+      catch(e){ $("#msg").textContent="Error: "+e; }
+    };
+    c.querySelector(".rescan").onclick=async()=>{
+      const path=c.dataset.path; if(!path){ $("#msg").textContent="Drive not connected."; return; }
+      try{ await apiPost("/api/scan",{path,force:false}); $("#msg").textContent="Rescan queued for "+path+". Watch progress on the Scan page."; }
+      catch(e){ $("#msg").textContent="Error: "+e; }
+    };
+  }
+}
+$("#purge-all").onclick=async()=>{
+  if(!window.confirm("Permanently delete every drive's _ToDelete quarantine? This is the only real delete and cannot be undone."))return;
+  try{ const r=await apiPost("/api/purge-all",{});
+    let m=`Purged ${r.purged_volumes} volume(s), reclaimed ${fmtSize(r.bytes_reclaimed)}.`;
+    if(r.skipped_unmounted.length)m+=" Skipped (offline): "+r.skipped_unmounted.join(", ")+".";
+    if(r.errors.length)m+=" Errors: "+r.errors.join("; ");
+    $("#msg").textContent=m; load(); }
+  catch(e){ $("#msg").textContent="Error: "+e; }
+};
+load().catch(e=>{$("#drives").textContent="Error: "+e;});"##;
+    shell("drives", csrf, "Drives", main, script)
+}
