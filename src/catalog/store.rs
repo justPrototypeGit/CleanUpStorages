@@ -153,7 +153,7 @@ impl Catalog {
     pub fn duplicate_group_count(&self) -> anyhow::Result<i64> {
         let n = self.conn.query_row(
             "SELECT count(*) FROM (SELECT content_hash FROM files
-                 WHERE status IN ('active','missing') GROUP BY content_hash HAVING count(*) > 1)",
+                 WHERE status='active' GROUP BY content_hash HAVING count(*) > 1)",
             [], |r| r.get(0),
         )?;
         Ok(n)
@@ -503,6 +503,27 @@ mod tests {
         cat.upsert_file(&mk_file("vol-1", "b.txt", "same"), 200).unwrap();
         cat.upsert_file(&mk_file("vol-1", "c.txt", "unique"), 200).unwrap();
         assert_eq!(cat.duplicate_group_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn duplicate_group_count_ignores_all_missing_groups() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_volume(&crate::catalog::models::Volume {
+            volume_id: "v".into(), label: "V".into(), identified_by: "marker".into(),
+            first_seen_at: 1, last_seen_at: 1 }).unwrap();
+        // Two files sharing a hash, both marked missing -> not a reviewable group.
+        let mut f = crate::catalog::models::NewFile {
+            volume_id: "v".into(), relative_path: "a".into(), filename: "a".into(),
+            extension: "".into(), size_bytes: 1, content_hash: "dup".into(),
+            created_time: None, modified_time: None, accessed_time: None,
+            category: crate::category::Category::Other, container_chain: None };
+        cat.upsert_file(&f, 1).unwrap();
+        f.relative_path = "b".into(); f.filename = "b".into();
+        cat.upsert_file(&f, 1).unwrap();
+        // Both rows have last_seen_at=1; a scan starting at 300 sweeps anything not seen this pass
+        // (last_seen_at < 300) to missing. Signature: mark_missing_scanned(volume_id, scan_started_at, now).
+        cat.mark_missing_scanned("v", 300, 300).unwrap();
+        assert_eq!(cat.duplicate_group_count().unwrap(), 0); // active-only: no reviewable groups
     }
 
     #[test]
