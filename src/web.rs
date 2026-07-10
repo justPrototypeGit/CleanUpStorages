@@ -53,6 +53,7 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/quarantine", post(api_quarantine))
         .route("/api/repack", post(api_repack))
         .route("/api/forget-drive", post(api_forget_drive))
+        .route("/api/purge-all", post(api_purge_all))
         .route("/api/scan", post(api_scan))
         .route("/api/scan/status", get(api_scan_status))
         .route("/api/pick-folder", post(api_pick_folder))
@@ -809,6 +810,44 @@ async fn api_forget_drive(State(state): State<AppState>, headers: HeaderMap, bod
     Ok(Json(ForgetResultDto { removed_files: removed }))
 }
 
+#[derive(Serialize)]
+struct PurgeAllResultDto {
+    purged_volumes: usize,
+    files_purged: usize,
+    bytes_reclaimed: i64,
+    skipped_unmounted: Vec<String>,
+    errors: Vec<String>,
+}
+
+/// Purge every mounted volume that has reclaimable quarantine (Task 6's `purge_all`). All
+/// destructive safety lives in `purge::purge_volume` (called per-volume); this handler is just
+/// the CSRF gate plus a best-effort pre-mutation snapshot.
+async fn api_purge_all(State(state): State<AppState>, headers: HeaderMap)
+    -> Result<Json<PurgeAllResultDto>, (StatusCode, String)>
+{
+    // CSRF: checked first, before any catalog access, so a bad/missing token does nothing.
+    let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
+    if !ok {
+        tracing::warn!("rejected request: missing or bad CSRF token");
+        return Err((StatusCode::FORBIDDEN, "missing or bad token".into()));
+    }
+    let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map_err(err500)?.as_secs() as i64;
+    if let Ok(cfg) = crate::config::Config::default_paths() {
+        let _ = crate::catalog::backup::snapshot(&state.catalog_path, &cfg.backups_dir(),
+            cfg.snapshot_retention, now);
+    }
+    let out = crate::purge::purge_all(&cat, &state.mounts.snapshot(), now).map_err(err500)?;
+    Ok(Json(PurgeAllResultDto {
+        purged_volumes: out.purged.len(),
+        files_purged: out.purged.iter().map(|(_, f, _)| f).sum(),
+        bytes_reclaimed: out.purged.iter().map(|(_, _, b)| b).sum(),
+        skipped_unmounted: out.skipped_unmounted,
+        errors: out.errors,
+    }))
+}
+
 #[derive(Deserialize)]
 struct ScanReq { path: String, force: bool }
 
@@ -1172,6 +1211,13 @@ mod tests {
             serde_json::json!({"volume_id":"vol-1"})).await;
         assert_eq!(status, StatusCode::OK);
         assert!(json["removed_files"].as_i64().unwrap() >= 1);
+    }
+
+    #[tokio::test]
+    async fn purge_all_requires_token() {
+        let (_t, _db, state) = seed_dupes();
+        let (status, _) = post_json(state, "/api/purge-all", None, serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

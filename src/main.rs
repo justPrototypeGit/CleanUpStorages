@@ -56,8 +56,11 @@ enum Command {
     },
     /// Permanently delete a drive's _ToDelete quarantine and reclaim space.
     Purge {
-        /// Current mount path of the drive to purge.
-        mount: std::path::PathBuf,
+        /// Current mount path of the drive to purge (omit when using --all).
+        mount: Option<std::path::PathBuf>,
+        /// Purge every currently-connected drive that has quarantined files.
+        #[arg(long)]
+        all: bool,
     },
     /// Remove one entry from a top-level zip by rebuilding it (Case 4; needs a surviving copy).
     Repack {
@@ -102,7 +105,7 @@ fn main() -> anyhow::Result<()> {
         Command::Browse { no_open } => commands::cmd_browse(!no_open),
         Command::Duplicates => commands::cmd_duplicates(),
         Command::Quarantine { mount, ids } => commands::cmd_quarantine(&mount, &ids),
-        Command::Purge { mount } => commands::cmd_purge(&mount),
+        Command::Purge { mount, all } => commands::cmd_purge(mount.as_deref(), all),
         Command::Repack { mount, entry_id } => commands::cmd_repack(&mount, entry_id),
         Command::Forget { mount } => commands::cmd_forget(&mount),
     }
