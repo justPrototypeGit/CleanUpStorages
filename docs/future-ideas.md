@@ -84,3 +84,14 @@ Shipped clean — the final review found no Critical/Important issues (verified 
 
 - **CSRF-reject helper.** The `if !ok { tracing::warn!(...); return Err((FORBIDDEN, "missing or bad token")) }` block is now duplicated across four handlers (`api_quarantine`/`api_repack`/`api_scan`/`api_pick_folder`). If a 5th protected route is added, extract a small `reject_missing_csrf()` helper. Also the `CaptureWriter`/`CaptureW` test `MakeWriter` is duplicated between the web and scanner test modules (accepted — no shared test-support module yet).
 - **Deferred (from the spec, unchanged):** log files / rotation / retention; a log-viewer panel in the web UI; metrics/telemetry export (Prometheus/OpenTelemetry); redaction modes.
+
+
+## Follow-ups logged from the UI-integration code review (2026-07-10)
+
+Shipped clean — the final whole-branch review found no Critical/Important issues (verified: self-contained across all six pages, CSRF-first on all six mutating handlers, `open_readonly`/`open` split correct, `forget_volume` never touches disk, `purge_all` delegates only to `purge_volume`, XSS-safe via `esc()`/`textContent`, DTO/JS field names all match). One earlier DTO-contract bug (activity feed read wrong field names) was caught and fixed in-branch (`d453511`). Remaining minor / optional:
+
+- **CSRF-reject block is now duplicated across SIX handlers** (the four above plus `api_forget_drive`/`api_purge_all`). The `reject_missing_csrf()` extraction noted above is now clearly worth doing.
+- **`api_drives` re-enumerates disks per volume.** It calls `mounts::disk_capacity()` inside the per-volume loop, and each call does `Disks::new_with_refreshed_list()` — O(volumes × all-disks). Harmless for a handful of drives; if drive count grows, add a `disk_capacity` variant taking a pre-refreshed `Disks` list and refresh once per request.
+- **`forget_volume` logs the audit action after `COMMIT`.** An (unlikely) audit-insert failure returns `Err` even though the forget already succeeded — cosmetic, non-destructive. (A `DELETE` error before `COMMIT` self-heals: the open transaction rolls back on connection drop.)
+- **Console flag parser requires flag-after-positional** (`scan D:\ --force` works, `scan --force D:\` doesn't). Fails safe (no request, just a usage hint). Improve the tokenizer if console ergonomics matter.
+- **Pre-existing (not from this branch):** `duplicate_group_count()` counts `status IN ('active','missing')` while `duplicate_groups()` is active-only, so the Overview group count and the review-page count can diverge. Align them if the discrepancy surfaces.
