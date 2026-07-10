@@ -198,6 +198,12 @@ pub fn run_scan(
         first_seen_at: now, last_seen_at: now,
     })?;
     let summary = scan_volume_with_progress(cat, mount_root, &identity, force, now, progress)?;
+    // Audit trail: one row per completed scan so the Overview "recent activity" feed can show it.
+    let _ = cat.log_action("scan", &serde_json::json!({
+        "volume_id": identity.volume_id, "label": identity.label,
+        "hashed": summary.hashed, "skipped": summary.skipped, "errors": summary.errors,
+        "marked_missing": summary.marked_missing, "archive_entries": summary.archive_entries,
+    }).to_string(), now);
     Ok(Some((identity, summary)))
 }
 
@@ -399,6 +405,21 @@ mod tests {
         run_scan(&cat, &root, false, crate::volume::ReadonlyMode::Fingerprint, 100, None).unwrap();
         let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(logged.to_lowercase().contains("volume"), "expected a volume info line: {logged}");
+    }
+
+    #[test]
+    fn run_scan_logs_a_scan_action() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("drive");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("x.txt"), b"hello").unwrap();
+        let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
+
+        let n = run_scan(&cat, &root, false, crate::volume::ReadonlyMode::Fingerprint, 1234, None)
+            .unwrap();
+        assert!(n.is_some());
+        let acts = cat.recent_actions(10).unwrap();
+        assert!(acts.iter().any(|(a, d, t)| a == "scan" && *t == 1234 && d.contains("\"hashed\"")));
     }
 
     #[test]
