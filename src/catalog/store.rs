@@ -252,6 +252,23 @@ impl Catalog {
         Ok(groups)
     }
 
+    /// Bytes-per-volume of active duplicate members that are NOT their group's suggested keep.
+    /// Suggested keep = earliest created_time, then earliest modified_time, then smallest id.
+    pub fn reclaimable_bytes_by_volume(&self) -> anyhow::Result<std::collections::HashMap<String, i64>> {
+        let mut out: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        for group in self.duplicate_groups()? {
+            let keep = group.iter().min_by_key(|f| (
+                f.created_time.unwrap_or(i64::MAX), f.modified_time.unwrap_or(i64::MAX), f.id,
+            )).map(|f| f.id).unwrap_or(0);
+            for f in &group {
+                if f.id != keep {
+                    *out.entry(f.volume_id.clone()).or_default() += f.size_bytes;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// All currently-active rows sharing this content hash (loose or archived).
     pub fn active_copies(&self, hash: &str) -> anyhow::Result<Vec<FileRecord>> {
         let mut stmt = self.conn.prepare(
@@ -557,6 +574,28 @@ mod tests {
         let groups = cat.duplicate_groups().unwrap();
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 2);
+    }
+
+    #[test]
+    fn reclaimable_bytes_by_volume_excludes_the_keep() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_volume(&Volume {
+            volume_id: "v".into(), label: "V".into(), identified_by: "marker".into(),
+            first_seen_at: 1, last_seen_at: 1 }).unwrap();
+        let mut f = NewFile {
+            volume_id: "v".into(), relative_path: "a.bin".into(), filename: "a.bin".into(),
+            extension: "bin".into(), size_bytes: 100, content_hash: "dup".into(),
+            created_time: Some(10), modified_time: Some(10), accessed_time: None,
+            category: Category::Other, container_chain: None };
+        cat.upsert_file(&f, 1).unwrap();                     // keep (created 10)
+        f.relative_path = "b.bin".into(); f.filename = "b.bin".into();
+        f.created_time = Some(20);                            // newer duplicate -> reclaimable
+        cat.upsert_file(&f, 1).unwrap();
+        f.relative_path = "u.bin".into(); f.filename = "u.bin".into();
+        f.content_hash = "uniq".into(); f.size_bytes = 999;   // unique -> not counted
+        cat.upsert_file(&f, 1).unwrap();
+        let map = cat.reclaimable_bytes_by_volume().unwrap();
+        assert_eq!(map.get("v").copied().unwrap_or(0), 100); // only the non-keep duplicate
     }
 
     #[test]
