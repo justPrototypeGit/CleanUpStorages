@@ -133,6 +133,19 @@ pub fn cmd_purge(mount: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn cmd_forget(mount: &Path) -> anyhow::Result<()> {
+    let cfg = Config::default_paths()?;
+    let cat = Catalog::open(&cfg.catalog_path)?;
+    let vid = crate::volume::read_volume_id(mount)
+        .ok_or_else(|| anyhow::anyhow!("no identity marker at {}; nothing to forget", mount.display()))?;
+    let now = now_secs();
+    let snap = backup::snapshot(&cfg.catalog_path, &cfg.backups_dir(), cfg.snapshot_retention, now)?;
+    println!("Catalog snapshot (pre-forget): {}", snap.display());
+    let removed = cat.forget_volume(&vid, now)?;
+    println!("Forgot volume {vid}: removed {removed} catalog entries. Files on disk are untouched; rescan to re-add.");
+    Ok(())
+}
+
 pub fn cmd_repack(mount: &Path, entry_id: i64) -> anyhow::Result<()> {
     let cfg = Config::default_paths()?;
     let cat = Catalog::open(&cfg.catalog_path)?;

@@ -66,6 +66,11 @@ enum Command {
         /// Catalog id of the archived entry to remove (from `duplicates`).
         entry_id: i64,
     },
+    /// Remove a drive's catalog entries (files on disk untouched; rescan to re-add).
+    Forget {
+        /// Current mount path of the drive to forget.
+        mount: std::path::PathBuf,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -80,6 +85,7 @@ fn main() -> anyhow::Result<()> {
         Command::Quarantine { .. } => "quarantine",
         Command::Purge { .. } => "purge",
         Command::Repack { .. } => "repack",
+        Command::Forget { .. } => "forget",
     };
     // Groups a command's log events under `command{name=...}`. Note: this uses a thread-local
     // context, so it reliably nests only synchronous commands; `browse`'s per-connection request
@@ -98,5 +104,6 @@ fn main() -> anyhow::Result<()> {
         Command::Quarantine { mount, ids } => commands::cmd_quarantine(&mount, &ids),
         Command::Purge { mount } => commands::cmd_purge(&mount),
         Command::Repack { mount, entry_id } => commands::cmd_repack(&mount, entry_id),
+        Command::Forget { mount } => commands::cmd_forget(&mount),
     }
 }
