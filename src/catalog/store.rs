@@ -123,6 +123,26 @@ impl Catalog {
         Ok(())
     }
 
+    /// The volume's last_seen_at (updated on every scan), if the volume exists.
+    pub fn volume_last_seen(&self, volume_id: &str) -> anyhow::Result<Option<i64>> {
+        let row = self.conn.query_row(
+            "SELECT last_seen_at FROM volumes WHERE volume_id=?1",
+            params![volume_id], |r| r.get::<_, i64>(0));
+        match row {
+            Ok(t) => Ok(Some(t)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// True if this volume has any recorded scan error.
+    pub fn volume_has_scan_errors(&self, volume_id: &str) -> anyhow::Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT count(*) FROM scan_errors WHERE volume_id=?1",
+            params![volume_id], |r| r.get(0))?;
+        Ok(n > 0)
+    }
+
     pub fn duplicate_group_count(&self) -> anyhow::Result<i64> {
         let n = self.conn.query_row(
             "SELECT count(*) FROM (SELECT content_hash FROM files
@@ -436,6 +456,19 @@ mod tests {
             identified_by: "marker".into(), first_seen_at: 100, last_seen_at: 100,
         }).unwrap();
         (tmp, cat)
+    }
+
+    #[test]
+    fn volume_last_seen_and_scan_errors() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_volume(&crate::catalog::models::Volume {
+            volume_id: "v".into(), label: "V".into(), identified_by: "marker".into(),
+            first_seen_at: 5, last_seen_at: 42 }).unwrap();
+        assert_eq!(cat.volume_last_seen("v").unwrap(), Some(42));
+        assert_eq!(cat.volume_last_seen("nope").unwrap(), None);
+        assert_eq!(cat.volume_has_scan_errors("v").unwrap(), false);
+        cat.log_scan_error(Some("v"), "some/path", "permission denied", 9).unwrap();
+        assert_eq!(cat.volume_has_scan_errors("v").unwrap(), true);
     }
 
     #[test]
