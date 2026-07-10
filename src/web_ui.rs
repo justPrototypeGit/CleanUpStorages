@@ -313,6 +313,79 @@ load().catch(e=>{$("#drives").textContent="Error: "+e;});"##;
     shell("drives", csrf, "Drives", main, script)
 }
 
+pub fn scan_page(csrf: &str) -> String {
+    let main = r##"
+<div class="mut" style="margin-bottom:16px">Scan a drive to catalog its files and find duplicates. Nothing is modified except a tiny hidden marker file used to recognise the drive next time.</div>
+
+<h3 style="margin:0 0 10px">Detected drives</h3>
+<div id="drives" class="cards" style="margin-bottom:20px"><span class="mut">Looking for connected drives…</span></div>
+
+<div class="card">
+  <h3 style="margin-top:0">Or enter a path</h3>
+  <div style="display:flex;gap:8px;margin-bottom:10px">
+    <input id="path" type="text" placeholder="e.g. D:\ or /Volumes/MyDrive" style="flex:1;padding:8px 12px;border-radius:8px;border:1px solid var(--line);background:var(--content);color:var(--fg)">
+    <button class="btn" id="browse">Browse…</button>
+  </div>
+  <label style="display:flex;gap:8px;align-items:center;font-size:13px;color:var(--mut);margin-bottom:6px">
+    <input id="force" type="checkbox"> Force full rescan (re-hash every file, slower)
+  </label>
+  <div class="mut" style="font-size:11px;margin-bottom:14px">Scanning writes a tiny hidden marker file (.cleanupstorages_id) to the drive root so it's recognised on future scans.</div>
+  <button class="btn btn-primary" id="scan">Scan</button>
+</div>
+
+<div class="card">
+  <h3 style="margin-top:0">Live status</h3>
+  <div id="running" class="mut">No scan running.</div>
+  <div id="queued" class="mut" style="margin-top:6px"></div>
+</div>
+
+<div class="card">
+  <h3 style="margin-top:0">Recent scans</h3>
+  <div id="recent" class="mut">None yet.</div>
+</div>"##;
+    let script = r##"
+async function loadDrives(){
+  try{
+    const ds=await apiGet("/api/detected-drives");
+    if(!ds.length){ $("#drives").innerHTML='<span class="mut">No drives detected. Type a path below.</span>'; return; }
+    $("#drives").innerHTML=ds.map(d=>`<div class="card" data-path="${esc(d.mount_path)}" style="cursor:pointer">
+      <div style="font-weight:600">${esc(d.mount_path)}</div>
+      <div class="mut" style="font-size:12px;margin-top:4px">${d.catalogued?("Catalogued as "+esc(d.volume_label||"—")+" · rescan"):"New drive"}</div>
+      </div>`).join("");
+    for(const el of document.querySelectorAll("#drives [data-path]")) el.addEventListener("click",()=>{ $("#path").value=el.dataset.path; });
+  }catch(e){ $("#drives").innerHTML='<span class="mut">Could not list drives: '+esc(String(e))+'</span>'; }
+}
+$("#browse").addEventListener("click",async()=>{
+  try{
+    const j=await apiPost("/api/pick-folder");
+    if(j.path) $("#path").value=j.path;
+  }catch(e){ $("#running").textContent="Folder picker error: "+e; }
+});
+$("#scan").addEventListener("click",async()=>{
+  const path=$("#path").value.trim(); if(!path){ $("#running").textContent="Enter a path first."; return; }
+  const force=$("#force").checked;
+  try{
+    await apiPost("/api/scan",{path,force});
+    poll();
+  }catch(e){ $("#running").innerHTML='<span style="color:var(--red)">Scan error: '+esc(String(e))+'</span>'; }
+});
+async function poll(){
+  try{
+    const s=await apiGet("/api/scan/status");
+    if(s.running){ const r=s.running; $("#running").textContent=`Scanning ${r.path} — ${r.hashed} hashed · ${r.skipped} unchanged · ${r.errors} errors · ${r.archive_entries} archive entries`; }
+    else $("#running").textContent="No scan running.";
+    $("#queued").textContent = s.queued.length ? ("Queued: "+s.queued.join(", ")) : "";
+    $("#recent").innerHTML = s.recent.length ? s.recent.map(r=>{
+      const msg = r.error_message ? `<span style="color:var(--red)">${esc(r.error_message)}</span>` : `${r.hashed} hashed · ${r.skipped} unchanged · ${r.errors} errors · ${r.archive_entries} archive entries · ${r.marked_missing} newly missing`;
+      return `<div style="padding:6px 0;border-bottom:1px solid var(--line)"><span class="mono">${esc(r.path)}</span> — ${msg}</div>`;
+    }).join("") : "None yet.";
+    if(s.running || s.queued.length) setTimeout(poll, 1500);
+  }catch(e){ /* stop polling on error */ }
+}
+loadDrives(); poll();"##;
+    shell("scan", csrf, "Scan a drive", main, script)
+}
+
 /// Client-side-only REPL: parses a typed line into one existing `/api/*` call (the same
 /// endpoints the buttons use, via SHARED_JS `apiGet`/`apiPost`) and prints the JSON response as
 /// scrollback text. No new backend, no subprocess, no shell execution — unrecognized input
