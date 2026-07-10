@@ -121,7 +121,7 @@ const INDEX_HTML: &str = r##"<!doctype html>
 </head>
 <body>
 <header>
-  <h1>CleanUpStorages — Browse <span class="meta" id="stats"></span> <a href="/review" style="font-size:12px">Review duplicates →</a> <a href="/scan" style="font-size:12px">Scan a drive →</a></h1>
+  <h1>CleanUpStorages — Browse <span class="meta" id="stats"></span> <a href="/" style="font-size:12px">Overview</a> <a href="/review" style="font-size:12px">Review duplicates →</a> <a href="/scan" style="font-size:12px">Scan a drive →</a></h1>
   <div class="controls">
     <input id="q" type="search" placeholder="Search filename or path…" autofocus>
     <select id="volume"><option value="">All drives</option></select>
@@ -212,7 +212,7 @@ const REVIEW_HTML: &str = r##"<!doctype html>
   .msg{color:var(--mut);margin-top:10px;min-height:1.4em;}
 </style></head>
 <body>
-<header><strong>Review duplicates</strong><a href="/">← Back to browse</a><a href="/scan">Scan a drive</a></header>
+<header><strong>Review duplicates</strong><a href="/browse">← Back to browse</a><a href="/scan">Scan a drive</a></header>
 <main>
   <div class="progress" id="progress"></div>
   <div id="group"></div>
@@ -316,7 +316,7 @@ const SCAN_HTML: &str = r##"<!doctype html>
   .recent div{padding:2px 0;border-bottom:1px solid var(--line);font-size:13px;}
 </style></head>
 <body>
-<header><strong>Scan a drive</strong><a href="/">Browse</a><a href="/review">Review</a></header>
+<header><strong>Scan a drive</strong><a href="/browse">Browse</a><a href="/review">Review</a></header>
 <main>
   <h2>Detected drives</h2>
   <div id="drives" class="bar">Looking for connected drives…</div>
