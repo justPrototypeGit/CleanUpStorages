@@ -195,3 +195,62 @@ $("#purge-all").onclick=async()=>{
 load().catch(e=>{$("#drives").textContent="Error: "+e;});"##;
     shell("drives", csrf, "Drives", main, script)
 }
+
+/// Client-side-only REPL: parses a typed line into one existing `/api/*` call (the same
+/// endpoints the buttons use, via SHARED_JS `apiGet`/`apiPost`) and prints the JSON response as
+/// scrollback text. No new backend, no subprocess, no shell execution — unrecognized input
+/// prints a usage hint and makes no request.
+pub fn console_page(csrf: &str) -> String {
+    let main = r##"
+<div class="mut" style="margin-bottom:8px">Runs this app's own commands only — the same safe actions as the buttons. Type <span class="mono">help</span>.</div>
+<div id="out" class="console-out" aria-live="polite"></div>
+<input id="cmd" class="console-in" style="margin-top:10px" placeholder="e.g. status  ·  search thesis  ·  scan D:\ --force" autofocus>"##;
+    let script = r##"
+const out=$("#out");
+function print(s,cls){ const d=document.createElement("div"); if(cls)d.className=cls; d.textContent=s; out.appendChild(d); out.scrollTop=out.scrollHeight; }
+function printJSON(o){ print(JSON.stringify(o,null,2)); }
+const HELP=`Commands:
+  status                         catalog summary
+  duplicates                     list duplicate groups
+  search <query> [--category c] [--status s]
+  scan <path> [--force]          queue a scan
+  quarantine <id> [id ...]       quarantine file ids
+  repack <id>                    remove an in-archive duplicate
+  forget <volumeId>              remove a drive from the catalog
+  purge --all                    purge every mounted quarantine
+  drives                         list drives
+  help, clear`;
+// naive shell-ish tokenizer: splits on whitespace, honours "double quotes".
+function tokenize(line){ const m=line.match(/"[^"]*"|\S+/g)||[]; return m.map(t=>t.replace(/^"|"$/g,"")); }
+function flag(toks,name){ const i=toks.indexOf("--"+name); if(i<0)return null; const v=toks[i+1]; toks.splice(i, v&&!v.startsWith("--")?2:1); return v||true; }
+async function exec(line){
+  print("$ "+line);
+  const toks=tokenize(line); const cmd=(toks.shift()||"").toLowerCase();
+  try{
+    if(cmd==="help"||cmd===""){ print(HELP); return; }
+    if(cmd==="clear"){ out.innerHTML=""; return; }
+    if(cmd==="status"){ printJSON(await apiGet("/api/stats")); return; }
+    if(cmd==="drives"){ printJSON(await apiGet("/api/drives")); return; }
+    if(cmd==="duplicates"){ printJSON(await apiGet("/api/duplicates")); return; }
+    if(cmd==="search"){ const cat=flag(toks,"category"), st=flag(toks,"status");
+      const p=new URLSearchParams(); if(toks.length)p.set("q",toks.join(" ")); if(cat)p.set("category",cat); if(st)p.set("status",st);
+      printJSON(await apiGet("/api/search?"+p.toString())); return; }
+    if(cmd==="scan"){ const force=!!flag(toks,"force"); const path=toks.join(" ");
+      if(!path){ print("usage: scan <path> [--force]","mut"); return; }
+      printJSON(await apiPost("/api/scan",{path,force})); return; }
+    if(cmd==="quarantine"){ const ids=toks.map(Number).filter(n=>!isNaN(n));
+      if(!ids.length){ print("usage: quarantine <id> [id ...]","mut"); return; }
+      printJSON(await apiPost("/api/quarantine",{quarantine_ids:ids})); return; }
+    if(cmd==="repack"){ const id=Number(toks[0]); if(isNaN(id)){ print("usage: repack <id>","mut"); return; }
+      printJSON(await apiPost("/api/repack",{entry_id:id})); return; }
+    if(cmd==="forget"){ if(!toks[0]){ print("usage: forget <volumeId>","mut"); return; }
+      printJSON(await apiPost("/api/forget-drive",{volume_id:toks[0]})); return; }
+    if(cmd==="purge"){ if(flag(toks,"all")){ printJSON(await apiPost("/api/purge-all",{})); return; }
+      print("only 'purge --all' is supported from the console; use the Drives page for a single drive.","mut"); return; }
+    print("unknown command: "+cmd+" (try 'help')","mut");
+  }catch(e){ print("error: "+e,"mut"); }
+}
+$("#cmd").addEventListener("keydown",e=>{ if(e.key==="Enter"){ const v=e.target.value; e.target.value=""; if(v.trim())exec(v.trim()); }});
+print(HELP);"##;
+    shell("console", csrf, "Console", main, script)
+}
