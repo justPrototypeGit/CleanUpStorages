@@ -49,6 +49,36 @@ pub fn purge_volume(
     Ok(PurgeOutcome { files_purged, bytes_reclaimed })
 }
 
+#[derive(Debug, Default)]
+pub struct PurgeAllOutcome {
+    pub purged: Vec<(String, usize, i64)>,
+    pub skipped_unmounted: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+/// Purge every volume that has reclaimable quarantine. Mounted volumes are purged via
+/// `purge_volume`; volumes with reclaimable space that aren't currently mounted are reported in
+/// `skipped_unmounted` (you can't delete files on a disk that isn't connected).
+pub fn purge_all(
+    cat: &Catalog,
+    mounts: &std::collections::HashMap<String, std::path::PathBuf>,
+    now: i64,
+) -> anyhow::Result<PurgeAllOutcome> {
+    let mut out = PurgeAllOutcome::default();
+    for (volume_id, _label, _files, _bytes) in cat.volume_stats()? {
+        let reclaimable = cat.recoverable_bytes(&volume_id)?;
+        if reclaimable == 0 { continue; }
+        match mounts.get(&volume_id) {
+            Some(root) => match purge_volume(cat, root, &volume_id, now) {
+                Ok(o) => out.purged.push((volume_id, o.files_purged, o.bytes_reclaimed)),
+                Err(e) => out.errors.push(format!("{volume_id}: {e}")),
+            },
+            None => out.skipped_unmounted.push(volume_id),
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +156,82 @@ mod tests {
         let res = purge_volume(&cat, &root, "vol-1", 200);
         assert!(res.is_err());
         assert!(root.join("_ToDelete/x").exists());
+    }
+
+    /// Build a marked drive with one quarantined loose file, matching the setup style of
+    /// `purge_deletes_quarantine_and_marks_rows` above (marker + a directly-inserted quarantined
+    /// row, rather than going through `quarantine::quarantine_files`, which enforces a
+    /// "not the last copy" guard we don't need here).
+    fn setup_quarantined_drive() -> (tempfile::TempDir, std::path::PathBuf, String, Catalog) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("drive");
+        fs::create_dir_all(root.join("_ToDelete/Photos")).unwrap();
+        fs::write(root.join(".cleanupstorages_id"), "vol-1").unwrap();
+        fs::write(root.join("_ToDelete/Photos/a.jpg"), b"DEADBEEF").unwrap();
+
+        let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
+        cat.upsert_volume(&Volume { volume_id: "vol-1".into(), label: "D".into(),
+            identified_by: "marker".into(), first_seen_at: 1, last_seen_at: 1 }).unwrap();
+        let f = crate::catalog::models::NewFile {
+            volume_id: "vol-1".into(), relative_path: "_ToDelete/Photos/a.jpg".into(),
+            filename: "a.jpg".into(), extension: "jpg".into(), size_bytes: 8,
+            content_hash: "h".into(), created_time: None, modified_time: None, accessed_time: None,
+            category: crate::category::Category::Photo, container_chain: None };
+        cat.upsert_file(&f, 100).unwrap();
+        let id = cat.active_file_id("vol-1", "_ToDelete/Photos/a.jpg").unwrap().unwrap();
+        cat.mark_quarantined(id, "_ToDelete/Photos/a.jpg", "Photos/a.jpg", 150).unwrap();
+
+        let vid = "vol-1".to_string();
+        (tmp, root, vid, cat)
+    }
+
+    #[test]
+    fn purge_all_purges_mounted_and_reports_unmounted() {
+        // Reuse this module's helper that builds a marked drive with one quarantined file.
+        let (_tmp, root, vid, cat) = setup_quarantined_drive(); // existing-style helper
+        let mut mounts = std::collections::HashMap::new();
+        mounts.insert(vid.clone(), root.clone());
+        let out = purge_all(&cat, &mounts, 1000).unwrap();
+        assert_eq!(out.purged.len(), 1);
+        assert_eq!(out.purged[0].0, vid);
+        assert!(out.skipped_unmounted.is_empty());
+        // Second run: nothing left to reclaim.
+        let out2 = purge_all(&cat, &mounts, 1001).unwrap();
+        assert!(out2.purged.is_empty());
+    }
+
+    #[test]
+    fn purge_all_reports_unmounted_volume_without_touching_it() {
+        // A second volume has reclaimable quarantine but is NOT in the mounts map.
+        let (_tmp, root, vid, cat) = setup_quarantined_drive();
+
+        let tmp2 = tempfile::tempdir().unwrap();
+        let root2 = tmp2.path().join("drive2");
+        fs::create_dir_all(root2.join("_ToDelete")).unwrap();
+        fs::write(root2.join(".cleanupstorages_id"), "vol-2").unwrap();
+        fs::write(root2.join("_ToDelete/b.jpg"), b"DATA").unwrap();
+        cat.upsert_volume(&Volume { volume_id: "vol-2".into(), label: "E".into(),
+            identified_by: "marker".into(), first_seen_at: 1, last_seen_at: 1 }).unwrap();
+        let f2 = crate::catalog::models::NewFile {
+            volume_id: "vol-2".into(), relative_path: "_ToDelete/b.jpg".into(),
+            filename: "b.jpg".into(), extension: "jpg".into(), size_bytes: 4,
+            content_hash: "h2".into(), created_time: None, modified_time: None, accessed_time: None,
+            category: crate::category::Category::Photo, container_chain: None };
+        cat.upsert_file(&f2, 100).unwrap();
+        let id2 = cat.active_file_id("vol-2", "_ToDelete/b.jpg").unwrap().unwrap();
+        cat.mark_quarantined(id2, "_ToDelete/b.jpg", "b.jpg", 150).unwrap();
+
+        // Only vol-1 is mounted; vol-2 is not.
+        let mut mounts = std::collections::HashMap::new();
+        mounts.insert(vid.clone(), root.clone());
+
+        let out = purge_all(&cat, &mounts, 1000).unwrap();
+        assert_eq!(out.purged.len(), 1);
+        assert_eq!(out.purged[0].0, vid);
+        assert_eq!(out.skipped_unmounted, vec!["vol-2".to_string()]);
+        assert!(out.errors.is_empty());
+        // vol-2's quarantine directory is untouched.
+        assert!(root2.join("_ToDelete/b.jpg").exists());
     }
 
     #[test]

@@ -123,6 +123,26 @@ impl Catalog {
         Ok(())
     }
 
+    /// The volume's last_seen_at (updated on every scan), if the volume exists.
+    pub fn volume_last_seen(&self, volume_id: &str) -> anyhow::Result<Option<i64>> {
+        let row = self.conn.query_row(
+            "SELECT last_seen_at FROM volumes WHERE volume_id=?1",
+            params![volume_id], |r| r.get::<_, i64>(0));
+        match row {
+            Ok(t) => Ok(Some(t)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// True if this volume has any recorded scan error.
+    pub fn volume_has_scan_errors(&self, volume_id: &str) -> anyhow::Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT count(*) FROM scan_errors WHERE volume_id=?1",
+            params![volume_id], |r| r.get(0))?;
+        Ok(n > 0)
+    }
+
     pub fn duplicate_group_count(&self) -> anyhow::Result<i64> {
         let n = self.conn.query_row(
             "SELECT count(*) FROM (SELECT content_hash FROM files
@@ -252,6 +272,23 @@ impl Catalog {
         Ok(groups)
     }
 
+    /// Bytes-per-volume of active duplicate members that are NOT their group's suggested keep.
+    /// Suggested keep = earliest created_time, then earliest modified_time, then smallest id.
+    pub fn reclaimable_bytes_by_volume(&self) -> anyhow::Result<std::collections::HashMap<String, i64>> {
+        let mut out: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        for group in self.duplicate_groups()? {
+            let keep = group.iter().min_by_key(|f| (
+                f.created_time.unwrap_or(i64::MAX), f.modified_time.unwrap_or(i64::MAX), f.id,
+            )).map(|f| f.id).unwrap_or(0);
+            for f in &group {
+                if f.id != keep {
+                    *out.entry(f.volume_id.clone()).or_default() += f.size_bytes;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// All currently-active rows sharing this content hash (loose or archived).
     pub fn active_copies(&self, hash: &str) -> anyhow::Result<Vec<FileRecord>> {
         let mut stmt = self.conn.prepare(
@@ -337,12 +374,40 @@ impl Catalog {
         Ok(n)
     }
 
+    /// Remove ALL catalog knowledge of a volume: its file rows (FTS cleaned up by triggers) and
+    /// its `volumes` row. Never touches files on disk — a later rescan fully rebuilds the volume.
+    /// Returns the number of file rows removed, and logs a `forget` audit action.
+    pub fn forget_volume(&self, volume_id: &str, now: i64) -> anyhow::Result<usize> {
+        let label: String = self.conn.query_row(
+            "SELECT label FROM volumes WHERE volume_id=?1", params![volume_id],
+            |r| r.get(0)).unwrap_or_else(|_| volume_id.to_string());
+        self.conn.execute_batch("BEGIN")?;
+        let removed = self.conn.execute("DELETE FROM files WHERE volume_id=?1", params![volume_id])?;
+        self.conn.execute("DELETE FROM scan_errors WHERE volume_id=?1", params![volume_id])?;
+        self.conn.execute("DELETE FROM volumes WHERE volume_id=?1", params![volume_id])?;
+        self.conn.execute_batch("COMMIT")?;
+        self.log_action("forget", &serde_json::json!({
+            "volume_id": volume_id, "label": label, "removed_files": removed }).to_string(), now)?;
+        Ok(removed)
+    }
+
     /// Append an audit entry to actions_log.
     pub fn log_action(&self, action: &str, details_json: &str, now: i64) -> anyhow::Result<()> {
         self.conn.execute(
             "INSERT INTO actions_log(action, details, occurred_at) VALUES (?1,?2,?3)",
             params![action, details_json, now])?;
         Ok(())
+    }
+
+    /// The most recent `limit` audit entries, newest first: (action, details_json, occurred_at).
+    pub fn recent_actions(&self, limit: usize) -> anyhow::Result<Vec<(String, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT action, IFNULL(details,''), occurred_at FROM actions_log
+             ORDER BY occurred_at DESC, id DESC LIMIT ?1")?;
+        let rows = stmt.query_map(params![limit as i64], |r| Ok((
+            r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?,
+        )))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     fn map_file_record(r: &rusqlite::Row) -> rusqlite::Result<FileRecord> {
@@ -408,6 +473,19 @@ mod tests {
             identified_by: "marker".into(), first_seen_at: 100, last_seen_at: 100,
         }).unwrap();
         (tmp, cat)
+    }
+
+    #[test]
+    fn volume_last_seen_and_scan_errors() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_volume(&crate::catalog::models::Volume {
+            volume_id: "v".into(), label: "V".into(), identified_by: "marker".into(),
+            first_seen_at: 5, last_seen_at: 42 }).unwrap();
+        assert_eq!(cat.volume_last_seen("v").unwrap(), Some(42));
+        assert_eq!(cat.volume_last_seen("nope").unwrap(), None);
+        assert_eq!(cat.volume_has_scan_errors("v").unwrap(), false);
+        cat.log_scan_error(Some("v"), "some/path", "permission denied", 9).unwrap();
+        assert_eq!(cat.volume_has_scan_errors("v").unwrap(), true);
     }
 
     #[test]
@@ -549,6 +627,28 @@ mod tests {
     }
 
     #[test]
+    fn reclaimable_bytes_by_volume_excludes_the_keep() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_volume(&Volume {
+            volume_id: "v".into(), label: "V".into(), identified_by: "marker".into(),
+            first_seen_at: 1, last_seen_at: 1 }).unwrap();
+        let mut f = NewFile {
+            volume_id: "v".into(), relative_path: "a.bin".into(), filename: "a.bin".into(),
+            extension: "bin".into(), size_bytes: 100, content_hash: "dup".into(),
+            created_time: Some(10), modified_time: Some(10), accessed_time: None,
+            category: Category::Other, container_chain: None };
+        cat.upsert_file(&f, 1).unwrap();                     // keep (created 10)
+        f.relative_path = "b.bin".into(); f.filename = "b.bin".into();
+        f.created_time = Some(20);                            // newer duplicate -> reclaimable
+        cat.upsert_file(&f, 1).unwrap();
+        f.relative_path = "u.bin".into(); f.filename = "u.bin".into();
+        f.content_hash = "uniq".into(); f.size_bytes = 999;   // unique -> not counted
+        cat.upsert_file(&f, 1).unwrap();
+        let map = cat.reclaimable_bytes_by_volume().unwrap();
+        assert_eq!(map.get("v").copied().unwrap_or(0), 100); // only the non-keep duplicate
+    }
+
+    #[test]
     fn active_copies_returns_active_rows_for_hash() {
         let (_t, cat) = open_tmp();
         cat.upsert_file(&mk_file("vol-1", "a.txt", "same"), 200).unwrap();
@@ -586,6 +686,20 @@ mod tests {
         cat.log_action("purge", "{\"volume_id\":\"v\"}", 200).unwrap();
         let n: i64 = cat.conn.query_row("SELECT count(*) FROM actions_log", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn recent_actions_returns_newest_first() {
+        let (_t, cat) = open_tmp();
+        cat.log_action("quarantine", "{\"file_id\":1}", 100).unwrap();
+        cat.log_action("purge", "{\"volume_id\":\"v\"}", 200).unwrap();
+        let rows = cat.recent_actions(10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "purge");      // newest first
+        assert_eq!(rows[0].2, 200);
+        assert_eq!(rows[1].0, "quarantine");
+        // limit is respected
+        assert_eq!(cat.recent_actions(1).unwrap().len(), 1);
     }
 
     #[test]
@@ -631,6 +745,25 @@ mod tests {
         assert_eq!(rec.container_chain, None); // now a loose quarantined row
         assert_eq!(rec.relative_path, "_ToDelete/a.zip/x.jpg");
         assert_eq!(rec.original_path.as_deref(), Some("a.zip › x.jpg"));
+    }
+
+    #[test]
+    fn forget_volume_deletes_rows_and_fts_but_returns_count() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_volume(&crate::catalog::models::Volume {
+            volume_id: "v".into(), label: "Gone".into(), identified_by: "marker".into(),
+            first_seen_at: 1, last_seen_at: 1 }).unwrap();
+        let f = crate::catalog::models::NewFile {
+            volume_id: "v".into(), relative_path: "a.txt".into(), filename: "a.txt".into(),
+            extension: "txt".into(), size_bytes: 1, content_hash: "h".into(),
+            created_time: None, modified_time: None, accessed_time: None,
+            category: crate::category::Category::Other, container_chain: None };
+        cat.upsert_file(&f, 1).unwrap();
+        let removed = cat.forget_volume("v", 500).unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(cat.volume_last_seen("v").unwrap(), None);          // volume row gone
+        assert!(cat.search("a", None, None, None).unwrap().is_empty()); // FTS row gone
+        assert!(cat.recent_actions(5).unwrap().iter().any(|(a, _, _)| a == "forget"));
     }
 
     #[test]

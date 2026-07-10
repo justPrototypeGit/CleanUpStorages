@@ -41,20 +41,27 @@ pub fn build_router(catalog_path: PathBuf) -> Router {
 /// The full router. New review routes are added here in later tasks.
 pub fn build_router_with(state: AppState) -> Router {
     Router::new()
-        .route("/", get(index))
+        .route("/", get(overview))
+        .route("/browse", get(browse))
         .route("/api/search", get(api_search))
         .route("/api/volumes", get(api_volumes))
         .route("/api/stats", get(api_stats))
+        .route("/api/activity", get(api_activity))
+        .route("/api/drives", get(api_drives))
         .route("/api/detected-drives", get(api_detected_drives))
         .route("/api/duplicates", get(api_duplicates))
         .route("/api/preview/:id", get(api_preview))
         .route("/api/quarantine", post(api_quarantine))
         .route("/api/repack", post(api_repack))
+        .route("/api/forget-drive", post(api_forget_drive))
+        .route("/api/purge-all", post(api_purge_all))
         .route("/api/scan", post(api_scan))
         .route("/api/scan/status", get(api_scan_status))
         .route("/api/pick-folder", post(api_pick_folder))
         .route("/review", get(review))
-        .route("/scan", get(scan_page))
+        .route("/scan", get(scan_page_h))
+        .route("/drives", get(drives_page_h))
+        .route("/console", get(console_page_h))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|req: &axum::http::Request<axum::body::Body>| {
@@ -70,305 +77,29 @@ pub fn build_router_with(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn index(State(_state): State<AppState>) -> Html<&'static str> {
-    Html(INDEX_HTML)
+async fn overview(State(state): State<AppState>) -> Html<String> {
+    Html(crate::web_ui::overview_page(&state.csrf_token))
+}
+
+async fn browse(State(state): State<AppState>) -> Html<String> {
+    Html(crate::web_ui::browse_page(&state.csrf_token))
 }
 
 async fn review(State(state): State<AppState>) -> Html<String> {
-    Html(REVIEW_HTML.replace("{{CSRF}}", &state.csrf_token))
+    Html(crate::web_ui::review_page(&state.csrf_token))
 }
 
-async fn scan_page(State(state): State<AppState>) -> Html<String> {
-    Html(SCAN_HTML.replace("{{CSRF}}", &state.csrf_token))
+async fn scan_page_h(State(state): State<AppState>) -> Html<String> {
+    Html(crate::web_ui::scan_page(&state.csrf_token))
 }
 
-const INDEX_HTML: &str = r##"<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CleanUpStorages — Browse</title>
-<style>
-  :root { color-scheme: light dark; --bg:#111; --fg:#eee; --mut:#999; --line:#333; --accent:#5aa0ff; }
-  @media (prefers-color-scheme: light) { :root { --bg:#fff; --fg:#111; --mut:#666; --line:#ddd; } }
-  * { box-sizing: border-box; }
-  body { margin:0; font:14px/1.4 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
-  header { padding:12px 16px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--bg); }
-  h1 { font-size:15px; margin:0 0 8px; }
-  .controls { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
-  input, select { background:transparent; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 8px; font:inherit; }
-  input#q { flex:1; min-width:180px; }
-  .meta { color:var(--mut); padding:8px 16px; }
-  main { padding:0 16px 40px; }
-  table { width:100%; border-collapse:collapse; }
-  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); vertical-align:top; }
-  th { color:var(--mut); font-weight:600; position:sticky; top:96px; background:var(--bg); }
-  td.loc { word-break:break-all; }
-  .flag { font-size:11px; padding:1px 6px; border-radius:10px; border:1px solid var(--line); color:var(--mut); }
-  .flag.missing { color:#e06c6c; border-color:#e06c6c; }
-  .flag.quarantined { color:#e0a86c; border-color:#e0a86c; }
-  .size { color:var(--mut); white-space:nowrap; }
-</style>
-</head>
-<body>
-<header>
-  <h1>CleanUpStorages — Browse <span class="meta" id="stats"></span> <a href="/review" style="font-size:12px">Review duplicates →</a> <a href="/scan" style="font-size:12px">Scan a drive →</a></h1>
-  <div class="controls">
-    <input id="q" type="search" placeholder="Search filename or path…" autofocus>
-    <select id="volume"><option value="">All drives</option></select>
-    <select id="category">
-      <option value="">All types</option>
-      <option value="photo">Photo</option><option value="video">Video</option>
-      <option value="document">Document</option><option value="academic">Academic</option>
-      <option value="other">Other</option>
-    </select>
-    <select id="status">
-      <option value="">Any status</option>
-      <option value="active">Active</option><option value="missing">Missing</option>
-      <option value="quarantined">Quarantined</option><option value="purged">Purged</option>
-    </select>
-  </div>
-</header>
-<div class="meta" id="count"></div>
-<main>
-  <table>
-    <thead><tr><th>Location</th><th>Drive</th><th>Type</th><th>Size</th><th>Status</th></tr></thead>
-    <tbody id="results"></tbody>
-  </table>
-</main>
-<script>
-const $ = s => document.querySelector(s);
-function fmtSize(n){ const u=["B","KB","MB","GB","TB"]; let i=0,x=n; while(x>=1024&&i<u.length-1){x/=1024;i++;} return (i?x.toFixed(1):x)+" "+u[i]; }
-function esc(s){ return (s==null?"":String(s)).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
-let timer=null;
-async function run(){
-  try {
-    const params=new URLSearchParams();
-    const q=$("#q").value.trim(); if(q) params.set("q",q);
-    for(const k of ["volume","category","status"]){ const v=$("#"+k).value; if(v) params.set(k,v); }
-    const res=await fetch("/api/search?"+params.toString());
-    const hits=await res.json();
-    $("#count").textContent = hits.length+" result"+(hits.length===1?"":"s")+(hits.length>=500?" (showing first 500)":"");
-    $("#results").innerHTML = hits.map(h=>{
-      const flag = h.status==="active" ? "" : `<span class="flag ${esc(h.status)}">${esc(h.status)}</span>`;
-      return `<tr><td class="loc">${esc(h.location)}</td><td>${esc(h.volume_id)}</td><td>${esc(h.category)}</td><td class="size">${fmtSize(h.size_bytes)}</td><td>${flag}</td></tr>`;
-    }).join("");
-  } catch(e) {
-    $("#count").textContent = "Search error: "+e;
-  }
+async fn drives_page_h(State(state): State<AppState>) -> Html<String> {
+    Html(crate::web_ui::drives_page(&state.csrf_token))
 }
-function debounced(){ clearTimeout(timer); timer=setTimeout(run,180); }
-async function init(){
-  const vs=await (await fetch("/api/volumes")).json();
-  const sel=$("#volume");
-  for(const v of vs){ const o=document.createElement("option"); o.value=v.volume_id; o.textContent=v.label; sel.appendChild(o); }
-  const st=await (await fetch("/api/stats")).json();
-  $("#stats").textContent = "· "+st.duplicate_groups+" duplicate groups · "+st.volumes.length+" drives";
-  $("#q").addEventListener("input",debounced);
-  for(const k of ["volume","category","status"]) $("#"+k).addEventListener("change",run);
-  run();
-}
-init();
-</script>
-</body>
-</html>
-"##;
 
-const REVIEW_HTML: &str = r##"<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="csrf" content="{{CSRF}}">
-<title>CleanUpStorages — Review duplicates</title>
-<style>
-  :root { color-scheme: light dark; --bg:#111; --fg:#eee; --mut:#999; --line:#333; --accent:#5aa0ff; --danger:#e0705a; }
-  @media (prefers-color-scheme: light){ :root{ --bg:#fff; --fg:#111; --mut:#666; --line:#ddd; } }
-  *{box-sizing:border-box;} body{margin:0;font:14px/1.4 system-ui,sans-serif;background:var(--bg);color:var(--fg);}
-  header{padding:12px 16px;border-bottom:1px solid var(--line);display:flex;gap:12px;align-items:center;}
-  header a{color:var(--accent);text-decoration:none;font-size:12px;}
-  main{padding:16px;max-width:1000px;margin:0 auto;}
-  .progress{color:var(--mut);margin-bottom:12px;}
-  .cards{display:flex;flex-wrap:wrap;gap:12px;}
-  .card{border:1px solid var(--line);border-radius:10px;padding:10px;width:230px;}
-  .card.keep{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset;}
-  .thumb{width:100%;height:150px;object-fit:contain;background:#0004;border-radius:6px;}
-  .noimg{width:100%;height:150px;display:flex;align-items:center;justify-content:center;color:var(--mut);background:#0002;border-radius:6px;font-size:12px;text-align:center;}
-  .loc{word-break:break-all;font-size:12px;margin:6px 0 2px;}
-  .kv{color:var(--mut);font-size:12px;} .kv b{color:var(--fg);font-weight:600;}
-  .badge{font-size:11px;color:var(--accent);} .arch{color:var(--mut);font-size:11px;}
-  .actions{display:flex;gap:8px;margin-top:8px;}
-  button{font:inherit;padding:8px 12px;border-radius:8px;border:1px solid var(--line);background:transparent;color:var(--fg);cursor:pointer;}
-  button.primary{border-color:var(--accent);color:var(--accent);}
-  button.danger{border-color:var(--danger);color:var(--danger);}
-  .msg{color:var(--mut);margin-top:10px;min-height:1.4em;}
-</style></head>
-<body>
-<header><strong>Review duplicates</strong><a href="/">← Back to browse</a><a href="/scan">Scan a drive</a></header>
-<main>
-  <div class="progress" id="progress"></div>
-  <div id="group"></div>
-  <div class="actions">
-    <button class="primary" id="confirm">Keep selected, quarantine the rest</button>
-    <button id="skip">Skip</button>
-  </div>
-  <div class="msg" id="msg"></div>
-</main>
-<script>
-const $=s=>document.querySelector(s);
-const CSRF=document.querySelector('meta[name="csrf"]').content;
-function esc(s){return (s==null?"":String(s)).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
-function fmtSize(n){const u=["B","KB","MB","GB","TB"];let i=0,x=n;while(x>=1024&&i<u.length-1){x/=1024;i++;}return (i?x.toFixed(1):x)+" "+u[i];}
-function fmtDate(t){return t?new Date(t*1000).toISOString().slice(0,10):"—";}
-let groups=[],idx=0,keepId=null;
-async function load(){
-  try{ groups=await (await fetch("/api/duplicates")).json(); }catch(e){ $("#msg").textContent="Load error: "+e; return; }
-  idx=0; render();
+async fn console_page_h(State(state): State<AppState>) -> Html<String> {
+    Html(crate::web_ui::console_page(&state.csrf_token))
 }
-function render(){
-  if(idx>=groups.length){ $("#progress").textContent=""; $("#group").innerHTML="<p>All duplicate groups reviewed. 🎉</p>"; $("#confirm").style.display="none"; $("#skip").style.display="none"; return; }
-  const g=groups[idx]; keepId=g.suggested_keep_id;
-  $("#progress").textContent=`Group ${idx+1} of ${groups.length} · ${g.members.length} copies`;
-  $("#group").innerHTML=`<div class="cards">${g.members.map(m=>card(m)).join("")}</div>`;
-  for(const el of document.querySelectorAll(".card")) el.addEventListener("click",()=>{ keepId=Number(el.dataset.id); paint(); });
-  paint();
-  for(const b of document.querySelectorAll(".repack")) b.addEventListener("click", async (ev)=>{
-    ev.stopPropagation();
-    const id=Number(b.dataset.id);
-    b.disabled=true; $("#msg").textContent="Repacking archive…";
-    try{
-      const res=await fetch("/api/repack",{method:"POST",headers:{"content-type":"application/json","x-cleanup-token":CSRF},body:JSON.stringify({entry_id:id})});
-      if(!res.ok){ $("#msg").textContent="Repack error: "+(await res.text()); b.disabled=false; }
-      else{ const j=await res.json(); $("#msg").textContent=`Removed '${j.removed_entry}' from its archive (${j.retained_entries} kept). Original saved in _ToDelete.`; idx++; render(); }
-    }catch(e){ $("#msg").textContent="Repack error: "+e; b.disabled=false; }
-  });
-}
-function card(m){
-  const img=(m.category==="photo"&&m.mounted)?`<img class="thumb" loading="lazy" src="/api/preview/${m.id}" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'noimg',textContent:'no preview'}))">`:`<div class="noimg">${m.mounted?"no preview":"drive not connected"}</div>`;
-  const arch = m.is_loose ? "" :
-    (m.id===keepId ? `<div class="arch">inside archive</div>`
-     : m.mounted ? `<button class="danger repack" data-id="${m.id}">Remove from archive</button>`
-                 : `<div class="arch">drive not connected</div>`);
-  return `<div class="card" data-id="${m.id}">${img}
-    <div class="loc">${esc(m.location)}</div>
-    <div class="kv"><b>${esc(m.volume_label||m.volume_id)}</b></div>
-    <div class="kv">${fmtSize(m.size_bytes)} · created ${fmtDate(m.created_time)}</div>
-    <div class="kv">status: ${esc(m.status)}</div>${arch}
-    <div class="badge kept-badge" style="visibility:hidden">✓ keep this</div></div>`;
-}
-function paint(){
-  for(const el of document.querySelectorAll(".card")){
-    const on=Number(el.dataset.id)===keepId;
-    el.classList.toggle("keep",on);
-    el.querySelector(".kept-badge").style.visibility=on?"visible":"hidden";
-  }
-}
-$("#confirm").addEventListener("click",async()=>{
-  const g=groups[idx]; if(!g)return;
-  const victims=g.members.filter(m=>m.id!==keepId&&m.is_loose).map(m=>m.id);
-  if(victims.length===0){ $("#msg").textContent="Nothing to quarantine (the other copies are inside archives)."; return; }
-  $("#confirm").disabled=true; $("#msg").textContent="Quarantining…";
-  try{
-    const res=await fetch("/api/quarantine",{method:"POST",headers:{"content-type":"application/json","x-cleanup-token":CSRF},body:JSON.stringify({quarantine_ids:victims})});
-    if(!res.ok){ $("#msg").textContent="Error: "+(await res.text()); }
-    else{ const j=await res.json(); let m=`Quarantined ${j.quarantined}, skipped ${j.skipped}.`; if(j.unmounted_volumes&&j.unmounted_volumes.length) m+=" Some drives not connected."; if(j.errors&&j.errors.length) m+=" Errors: "+j.errors.join("; "); $("#msg").textContent=m; idx++; render(); }
-  }catch(e){ $("#msg").textContent="Error: "+e; }
-  $("#confirm").disabled=false;
-});
-$("#skip").addEventListener("click",()=>{ idx++; $("#msg").textContent=""; render(); });
-load();
-</script>
-</body></html>
-"##;
-
-const SCAN_HTML: &str = r##"<!doctype html>
-<html lang="en"><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="csrf" content="{{CSRF}}">
-<title>CleanUpStorages — Scan a drive</title>
-<style>
-  :root{color-scheme:light dark;--bg:#111;--fg:#eee;--mut:#999;--line:#333;--accent:#5aa0ff;}
-  @media (prefers-color-scheme:light){:root{--bg:#fff;--fg:#111;--mut:#666;--line:#ddd;}}
-  *{box-sizing:border-box;} body{margin:0;font:14px/1.4 system-ui,sans-serif;background:var(--bg);color:var(--fg);}
-  header{padding:12px 16px;border-bottom:1px solid var(--line);display:flex;gap:12px;align-items:center;}
-  header a{color:var(--accent);text-decoration:none;font-size:12px;}
-  main{padding:16px;max-width:820px;margin:0 auto;}
-  h2{font-size:14px;color:var(--mut);margin:18px 0 6px;}
-  input,button{font:inherit;color:var(--fg);background:transparent;border:1px solid var(--line);border-radius:6px;padding:8px 10px;}
-  input#path{width:100%;} .row{display:flex;gap:8px;margin:6px 0;}
-  button.primary{border-color:var(--accent);color:var(--accent);cursor:pointer;}
-  button{cursor:pointer;}
-  .drive{border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin:6px 0;cursor:pointer;}
-  .drive:hover{border-color:var(--accent);}
-  .drive .tag{font-size:11px;color:var(--mut);}
-  label.chk{font-size:13px;color:var(--mut);display:flex;gap:6px;align-items:center;margin:6px 0;}
-  .status{margin-top:14px;border-top:1px solid var(--line);padding-top:12px;}
-  .bar{color:var(--mut);} .err{color:#e06c6c;}
-  .recent div{padding:2px 0;border-bottom:1px solid var(--line);font-size:13px;}
-</style></head>
-<body>
-<header><strong>Scan a drive</strong><a href="/">Browse</a><a href="/review">Review</a></header>
-<main>
-  <h2>Detected drives</h2>
-  <div id="drives" class="bar">Looking for connected drives…</div>
-
-  <h2>Or enter a path</h2>
-  <div class="row"><input id="path" type="text" placeholder="e.g. D:\ or /Volumes/MyDrive"><button id="browse">Browse…</button></div>
-  <label class="chk"><input id="force" type="checkbox"> Force full rescan (re-hash every file, slower)</label>
-  <div class="bar" style="font-size:12px;margin:4px 0;">Scanning writes a tiny hidden marker file (.cleanupstorages_id) to the drive root so it's recognised on future scans.</div>
-  <div class="row"><button class="primary" id="scan">Scan</button></div>
-
-  <div class="status">
-    <div id="running" class="bar"></div>
-    <div id="queued" class="bar"></div>
-    <h2>Recent scans</h2>
-    <div id="recent" class="recent bar">None yet.</div>
-  </div>
-</main>
-<script>
-const $=s=>document.querySelector(s);
-const CSRF=document.querySelector('meta[name="csrf"]').content;
-function esc(s){return (s==null?"":String(s)).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
-async function loadDrives(){
-  try{
-    const ds=await (await fetch("/api/detected-drives")).json();
-    if(!ds.length){ $("#drives").textContent="No drives detected. Type a path below."; return; }
-    $("#drives").innerHTML=ds.map(d=>`<div class="drive" data-path="${esc(d.mount_path)}">${esc(d.mount_path)} <span class="tag">${d.catalogued?("· "+esc(d.volume_label||"catalogued")+" (rescan)"):"· new"}</span></div>`).join("");
-    for(const el of document.querySelectorAll(".drive")) el.addEventListener("click",()=>{ $("#path").value=el.dataset.path; });
-  }catch(e){ $("#drives").textContent="Could not list drives: "+e; }
-}
-$("#browse").addEventListener("click",async()=>{
-  try{
-    const r=await fetch("/api/pick-folder",{method:"POST",headers:{"x-cleanup-token":CSRF}});
-    const j=await r.json(); if(j.path) $("#path").value=j.path;
-  }catch(e){ $("#running").textContent="Folder picker error: "+e; }
-});
-$("#scan").addEventListener("click",async()=>{
-  const path=$("#path").value.trim(); if(!path){ $("#running").textContent="Enter a path first."; return; }
-  const force=$("#force").checked;
-  try{
-    const r=await fetch("/api/scan",{method:"POST",headers:{"content-type":"application/json","x-cleanup-token":CSRF},body:JSON.stringify({path,force})});
-    if(!r.ok){ $("#running").innerHTML=`<span class="err">Scan error: ${esc(await r.text())}</span>`; return; }
-    poll();
-  }catch(e){ $("#running").textContent="Scan error: "+e; }
-});
-async function poll(){
-  try{
-    const s=await (await fetch("/api/scan/status")).json();
-    if(s.running){ const r=s.running; $("#running").textContent=`Scanning ${r.path} — ${r.hashed} hashed · ${r.skipped} unchanged · ${r.errors} errors · ${r.archive_entries} archive entries`; }
-    else $("#running").textContent="";
-    $("#queued").textContent = s.queued.length ? ("Queued: "+s.queued.join(", ")) : "";
-    $("#recent").innerHTML = s.recent.length ? s.recent.map(r=>{
-      const msg = r.error_message ? `<span class="err">${esc(r.error_message)}</span>` : `${r.hashed} hashed · ${r.skipped} unchanged · ${r.errors} errors · ${r.archive_entries} archive entries · ${r.marked_missing} newly missing`;
-      return `<div>${esc(r.path)} — ${msg}</div>`;
-    }).join("") : "None yet.";
-    if(s.running || s.queued.length) setTimeout(poll, 1500);
-  }catch(e){ /* stop polling on error */ }
-}
-loadDrives(); poll();
-</script>
-</body></html>
-"##;
 
 /// Web-facing shape for a search hit; keeps serialization concerns out of `catalog::models`.
 #[derive(Serialize)]
@@ -412,6 +143,46 @@ struct VolumeDto { volume_id: String, label: String, active_files: i64, active_b
 
 #[derive(Serialize)]
 struct StatsDto { duplicate_groups: i64, volumes: Vec<VolumeDto> }
+
+#[derive(Serialize)]
+struct ActivityDto { kind: String, summary: String, occurred_at: i64 }
+
+#[derive(Serialize)]
+struct DriveDto {
+    volume_id: String,
+    label: String,
+    mount_path: Option<String>,   // None if not currently connected
+    connected: bool,
+    active_files: i64,
+    active_bytes: i64,
+    total_bytes: Option<u64>,     // None if unmounted or undeterminable
+    free_bytes: Option<u64>,
+    reclaimable_bytes: i64,
+    last_seen_at: Option<i64>,
+    has_errors: bool,
+}
+
+/// Human summary for one audit row. `details` is the JSON stored by the engine; parse best-effort
+/// and fall back to the raw action name so a schema change can never break the feed.
+fn activity_summary(action: &str, details: &str) -> String {
+    let d: serde_json::Value = serde_json::from_str(details).unwrap_or(serde_json::Value::Null);
+    let s = |k: &str| d.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let n = |k: &str| d.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+    match action {
+        "scan" => format!("Scanned {} — {} hashed, {} unchanged", s("label"), n("hashed"), n("skipped")),
+        "quarantine" => {
+            let from = s("from");
+            let name = from.rsplit('/').next().unwrap_or(&from);
+            format!("Quarantined {}", name)
+        }
+        "quarantine_skip" => "Skipped a file to protect the last copy".to_string(),
+        "quarantine_error" => "A file could not be quarantined".to_string(),
+        "repack" => format!("Repacked an archive (removed {})", s("removed_entry")),
+        "purge" => format!("Purged {} file(s), reclaimed {} MiB", n("files_purged"), n("bytes_reclaimed") / (1024 * 1024)),
+        "forget" => format!("Removed drive '{}' from the catalog", s("label")),
+        other => other.to_string(),
+    }
+}
 
 #[derive(Deserialize, Default)]
 struct SearchParams {
@@ -469,6 +240,41 @@ async fn api_stats(State(state): State<AppState>)
     let duplicate_groups = cat.duplicate_group_count().map_err(err500)?;
     let volumes = volume_dtos(&cat).map_err(err500)?;
     Ok(Json(StatsDto { duplicate_groups, volumes }))
+}
+
+async fn api_activity(State(state): State<AppState>)
+    -> Result<Json<Vec<ActivityDto>>, (StatusCode, String)>
+{
+    let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
+    let rows = cat.recent_actions(30).map_err(err500)?;
+    Ok(Json(rows.into_iter().map(|(action, details, occurred_at)| ActivityDto {
+        summary: activity_summary(&action, &details), kind: action, occurred_at,
+    }).collect()))
+}
+
+async fn api_drives(State(state): State<AppState>)
+    -> Result<Json<Vec<DriveDto>>, (StatusCode, String)>
+{
+    let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
+    let reclaim = cat.reclaimable_bytes_by_volume().map_err(err500)?;
+    let mounts = state.mounts.snapshot();
+    let mut out = Vec::new();
+    for (volume_id, label, active_files, active_bytes) in cat.volume_stats().map_err(err500)? {
+        let mount_path = mounts.get(&volume_id).cloned();
+        let (total_bytes, free_bytes) = match &mount_path {
+            Some(p) => match crate::mounts::disk_capacity(p) { Some((t, f)) => (Some(t), Some(f)), None => (None, None) },
+            None => (None, None),
+        };
+        out.push(DriveDto {
+            connected: mount_path.is_some(),
+            mount_path: mount_path.map(|p| p.display().to_string()),
+            reclaimable_bytes: reclaim.get(&volume_id).copied().unwrap_or(0),
+            last_seen_at: cat.volume_last_seen(&volume_id).map_err(err500)?,
+            has_errors: cat.volume_has_scan_errors(&volume_id).map_err(err500)?,
+            volume_id, label, active_files, active_bytes, total_bytes, free_bytes,
+        });
+    }
+    Ok(Json(out))
 }
 
 async fn api_detected_drives(State(state): State<AppState>)
@@ -703,6 +509,73 @@ async fn api_repack(State(state): State<AppState>, headers: HeaderMap, body: Jso
 }
 
 #[derive(Deserialize)]
+struct ForgetReq { volume_id: String }
+
+#[derive(Serialize)]
+struct ForgetResultDto { removed_files: usize }
+
+/// Remove a volume's catalog rows entirely (files on disk untouched; a rescan re-adds them).
+/// All destructive safety lives in `Catalog::forget_volume` (a same-transaction delete); this
+/// handler is just the CSRF gate plus a best-effort pre-mutation snapshot.
+async fn api_forget_drive(State(state): State<AppState>, headers: HeaderMap, body: Json<ForgetReq>)
+    -> Result<Json<ForgetResultDto>, (StatusCode, String)>
+{
+    // CSRF: checked first, before any catalog access, so a bad/missing token does nothing.
+    let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
+    if !ok {
+        tracing::warn!("rejected request: missing or bad CSRF token");
+        return Err((StatusCode::FORBIDDEN, "missing or bad token".into()));
+    }
+    let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map_err(err500)?.as_secs() as i64;
+    if let Ok(cfg) = crate::config::Config::default_paths() {
+        let _ = crate::catalog::backup::snapshot(&state.catalog_path, &cfg.backups_dir(),
+            cfg.snapshot_retention, now);
+    }
+    let removed = cat.forget_volume(&body.volume_id, now).map_err(err500)?;
+    Ok(Json(ForgetResultDto { removed_files: removed }))
+}
+
+#[derive(Serialize)]
+struct PurgeAllResultDto {
+    purged_volumes: usize,
+    files_purged: usize,
+    bytes_reclaimed: i64,
+    skipped_unmounted: Vec<String>,
+    errors: Vec<String>,
+}
+
+/// Purge every mounted volume that has reclaimable quarantine (Task 6's `purge_all`). All
+/// destructive safety lives in `purge::purge_volume` (called per-volume); this handler is just
+/// the CSRF gate plus a best-effort pre-mutation snapshot.
+async fn api_purge_all(State(state): State<AppState>, headers: HeaderMap)
+    -> Result<Json<PurgeAllResultDto>, (StatusCode, String)>
+{
+    // CSRF: checked first, before any catalog access, so a bad/missing token does nothing.
+    let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
+    if !ok {
+        tracing::warn!("rejected request: missing or bad CSRF token");
+        return Err((StatusCode::FORBIDDEN, "missing or bad token".into()));
+    }
+    let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map_err(err500)?.as_secs() as i64;
+    if let Ok(cfg) = crate::config::Config::default_paths() {
+        let _ = crate::catalog::backup::snapshot(&state.catalog_path, &cfg.backups_dir(),
+            cfg.snapshot_retention, now);
+    }
+    let out = crate::purge::purge_all(&cat, &state.mounts.snapshot(), now).map_err(err500)?;
+    Ok(Json(PurgeAllResultDto {
+        purged_volumes: out.purged.len(),
+        files_purged: out.purged.iter().map(|(_, f, _)| f).sum(),
+        bytes_reclaimed: out.purged.iter().map(|(_, _, b)| b).sum(),
+        skipped_unmounted: out.skipped_unmounted,
+        errors: out.errors,
+    }))
+}
+
+#[derive(Deserialize)]
 struct ScanReq { path: String, force: bool }
 
 #[derive(Serialize)]
@@ -929,6 +802,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_drives_lists_catalogued_volume_with_reclaimable() {
+        let (_t, _db, state) = seed_dupes(); // seeds vol-1 "Photos HDD" with a duplicate group
+        let v = get_json_state(state, "/api/drives").await;
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["label"], "Photos HDD");
+        assert_eq!(arr[0]["connected"], true); // Fixed mount is present
+        assert!(arr[0]["reclaimable_bytes"].as_i64().unwrap() >= 0);
+    }
+
+    #[tokio::test]
     async fn api_duplicates_groups_with_suggested_keep_and_mounted() {
         let (_t, _db, state) = seed_dupes();
         let v = get_json_state(state, "/api/duplicates").await;
@@ -1042,6 +926,25 @@ mod tests {
         let bytes = axum::body::to_bytes(res.into_body(), 5_000_000).await.unwrap();
         let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         (status, json)
+    }
+
+    #[tokio::test]
+    async fn forget_drive_requires_token_then_removes() {
+        let (_t, _db, state) = seed_dupes();
+        let (status, _) = post_json(state.clone(), "/api/forget-drive", None,
+            serde_json::json!({"volume_id":"vol-1"})).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, json) = post_json(state, "/api/forget-drive", Some("T"),
+            serde_json::json!({"volume_id":"vol-1"})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["removed_files"].as_i64().unwrap() >= 1);
+    }
+
+    #[tokio::test]
+    async fn purge_all_requires_token() {
+        let (_t, _db, state) = seed_dupes();
+        let (status, _) = post_json(state, "/api/purge-all", None, serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
@@ -1298,7 +1201,7 @@ mod tests {
         use axum::http::Request;
         use tower::ServiceExt;
         let app = build_router(PathBuf::from("unused.db"));
-        let res = app.oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        let res = app.oneshot(Request::builder().uri("/browse").body(Body::empty()).unwrap())
             .await.unwrap();
         let bytes = axum::body::to_bytes(res.into_body(), 2_000_000).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
@@ -1308,6 +1211,21 @@ mod tests {
         // self-contained: no external resource references
         assert!(!body.contains("http://"), "no external http resources");
         assert!(!body.contains("https://"), "no external https resources");
+    }
+
+    #[tokio::test]
+    async fn root_is_overview_and_self_contained() {
+        use axum::body::Body; use axum::http::Request; use tower::ServiceExt;
+        let (_t, _db, state) = seed_dupes();
+        let app = build_router_with(state);
+        let res = app.oneshot(Request::builder().uri("/").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), 2_000_000).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("/api/activity"), "overview loads activity");
+        assert!(body.contains("/api/drives"), "overview loads drives");
+        assert!(body.contains("Recent activity"));
+        assert!(!body.contains("http://") && !body.contains("https://"), "self-contained");
     }
 
     #[tokio::test]
@@ -1335,6 +1253,36 @@ mod tests {
         assert!(body.contains("/api/detected-drives"));
         assert!(body.contains("/api/pick-folder"));
         assert!(!body.contains("http://") && !body.contains("https://"));
+    }
+
+    #[tokio::test]
+    async fn drives_page_is_wired_and_self_contained() {
+        use axum::body::Body; use axum::http::Request; use tower::ServiceExt;
+        let (_t, _db, state) = seed_dupes();
+        let app = build_router_with(state);
+        let res = app.oneshot(Request::builder().uri("/drives").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), 2_000_000).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("name=\"csrf\""));
+        assert!(body.contains("/api/drives"));
+        assert!(body.contains("/api/forget-drive"));
+        assert!(body.contains("/api/purge-all"));
+        assert!(!body.contains("http://") && !body.contains("https://"));
+    }
+
+    #[tokio::test]
+    async fn console_page_is_self_contained_and_maps_commands() {
+        use axum::body::Body; use axum::http::Request; use tower::ServiceExt;
+        let (_t, _db, state) = seed_dupes();
+        let app = build_router_with(state);
+        let res = app.oneshot(Request::builder().uri("/console").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), 2_000_000).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("name=\"csrf\""));
+        assert!(body.contains("/api/stats") && body.contains("/api/scan") && body.contains("/api/purge-all"));
+        assert!(!body.contains("http://") && !body.contains("https://"), "self-contained");
     }
 
     #[derive(Clone)]
@@ -1395,5 +1343,28 @@ mod tests {
         let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(logged.contains("WARN"), "expected a warn line: {logged}");
         assert!(logged.to_lowercase().contains("token"), "reason mentions token: {logged}");
+    }
+
+    #[tokio::test]
+    async fn api_activity_returns_formatted_rows() {
+        let (_t, db, state) = seed_dupes();
+        { // write actions to read back (newest-first: purge@500, then quarantine@400)
+            let cat = crate::catalog::Catalog::open(&db).unwrap();
+            cat.log_action("purge",
+                "{\"volume_id\":\"vol-1\",\"files_purged\":3,\"bytes_reclaimed\":2048}", 500).unwrap();
+            // Real quarantine payload shape from src/quarantine.rs: `from` is the relative path.
+            cat.log_action("quarantine",
+                "{\"file_id\":1,\"volume_id\":\"vol-1\",\"from\":\"docs/report.txt\",\"to\":\"_ToDelete/report.txt\",\"hash\":\"h\"}", 400).unwrap();
+        }
+        let v = get_json_state(state, "/api/activity").await;
+        let arr = v.as_array().unwrap();
+        assert!(!arr.is_empty());
+        assert_eq!(arr[0]["kind"], "purge");
+        assert!(arr[0]["summary"].as_str().unwrap().contains("Purged"));
+        assert_eq!(arr[0]["occurred_at"], 500);
+        // The quarantine feed entry must name the file (basename of `from`), not render blank.
+        let q = arr.iter().find(|e| e["kind"] == "quarantine").expect("quarantine entry present");
+        assert!(q["summary"].as_str().unwrap().contains("report.txt"),
+            "quarantine summary should name the file: {}", q["summary"]);
     }
 }

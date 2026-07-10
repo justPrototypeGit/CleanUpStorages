@@ -4,11 +4,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-Design phase complete; no application code exists yet. The approved design lives in
+Phases 1 and 2 are implemented and the web UI is fully built out. The approved design lives in
 [docs/superpowers/specs/2026-07-04-cleanupstorages-design.md](docs/superpowers/specs/2026-07-04-cleanupstorages-design.md)
-— **read it before writing any code**; it is the source of truth for architecture and behavior. The next step
-is turning it into an implementation plan (Phase 1). Update this file with real build/test/run commands once the
-Rust project is scaffolded.
+— it remains the source of truth for architecture and behavior; read it before changing core behavior.
+Phase 3 (reorganize into a clean taxonomy) is still deferred.
+
+## Build / test / run
+
+- Build: `cargo build --release` → `target/release/cleanupstorages(.exe)`
+- Test: `cargo test`
+- Web UI: `cleanupstorages browse` (serves 127.0.0.1, opens a browser) — six pages (Overview, Browse,
+  Duplicates, Drives, Scan, Console), all self-contained (no CDN/fonts/build step).
+- CLI verbs: `scan`, `search`, `status`, `duplicates`, `quarantine`, `purge` (`--all`), `repack`, `forget`,
+  `browse`. Global `-v/--verbose`; `RUST_LOG` overrides.
+- Safe end-to-end walkthrough: [docs/TESTING-GUIDE.md](docs/TESTING-GUIDE.md) (+ `scripts/make-test-sandbox.ps1`).
 
 ## Project goal
 

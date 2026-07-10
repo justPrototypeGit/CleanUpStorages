@@ -109,11 +109,23 @@ cus browse
 This prints a `http://127.0.0.1:PORT` URL and opens your browser. Leave it running (Ctrl+C to stop). In another
 PowerShell window you can watch the request log if you started it with `RUST_LOG=info` (see step 7).
 
-Try each page:
+The UI opens on the **Overview** dashboard; the left sidebar switches between the six pages
+(Overview, Browse, Duplicates, Drives, Scan, Console). Try each:
 
-- **Browse (home):** type in the search box — results filter live. Filter by drive/type/status. Note that a
+- **Overview (home `/`):** the dashboard — total files catalogued across N drives, the duplicate-groups
+  count with a "Review duplicates" button, a reclaimable-space bar per drive, and a **Recent activity**
+  feed (your scans/quarantines/purges show up here as you do them).
+- **Browse:** type in the search box — results filter live. Filter by drive/type/status. Note that a
   file inside the zip shows its location as `bundle.zip › report.txt`.
-- **Scan a drive →** (top link): this is the UI scanner.
+- **Drives:** one card per catalogued drive with a real capacity bar (used/total), last-scan time, and
+  reclaimable figure. Buttons: **Rescan** (re-queues a scan — labelled "Repair (rescan)" if the drive had
+  scan errors), **Forget…** (removes the drive from the *catalog only* — a confirm dialog spells out that
+  files on the drive are **not** deleted; rescan re-adds it), and a global **Purge all quarantines**
+  (confirm-gated; the only real delete). Try **Forget** on one drive, then re-scan it from the Scan page —
+  it comes back.
+- **Console:** a terminal-style panel that runs the app's own commands (only those — it's not a shell).
+  Type `help`, then e.g. `status`, `search report`, `drives`, `duplicates`. Output prints as JSON scrollback.
+- **Scan a drive:** this is the UI scanner.
   - Your two drives appear under **Detected drives** (click one to fill the path), or use **Browse…** for the
     native folder picker, or paste a path.
   - Click **Scan** and watch the **live counts** tick up; the **Recent scans** list shows the result. (Try
@@ -157,6 +169,17 @@ When you're happy, reclaim the space (**the only real delete — and only inside
 cus purge "$env:USERPROFILE\Documents\cleanup-sandbox\DriveA"
 ```
 ✅ **Expect:** `DriveA\_ToDelete\` is emptied/removed; `status` recoverable drops to 0.
+
+The Drives page's buttons have CLI equivalents too:
+
+```powershell
+cus purge --all                                                   # purge every connected drive's _ToDelete at once
+cus forget "$env:USERPROFILE\Documents\cleanup-sandbox\DriveB"    # drop DriveB from the catalog (files on disk kept)
+cus status                                                        # DriveB no longer listed…
+cus scan "$env:USERPROFILE\Documents\cleanup-sandbox\DriveB"      # …until you rescan, which re-adds it
+```
+✅ **Expect:** `forget` removes the volume's catalog entries only — the files under `DriveB\` are untouched, and
+a rescan brings the drive back. `purge --all` reports which drives it purged and skips any not connected.
 
 ---
 
@@ -236,6 +259,11 @@ That deletes the test files, the isolated catalog, and its snapshots. Your real 
 | Web browse + live search + filters | §3 | |
 | Web scan (detected drives + folder picker + live progress) | §3 | |
 | Review GUI: thumbnails + keep/quarantine | §3 | |
+| Overview dashboard (stats + reclaimable + activity feed) | §3 | |
+| Drives page (capacity, rescan, forget, purge-all) | §3 | |
+| Console (client-side command REPL) | §3 | |
+| Forget a drive (catalog-only; files kept) | §3, §4 | |
+| Purge all quarantines at once | §3, §4 | |
 | Quarantine (reversible) | §3, §4 | |
 | Never-remove-last-copy guard | §4 | |
 | Purge (reclaim space) | §4 | |
