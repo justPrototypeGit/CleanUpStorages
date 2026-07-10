@@ -46,6 +46,7 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/volumes", get(api_volumes))
         .route("/api/stats", get(api_stats))
         .route("/api/activity", get(api_activity))
+        .route("/api/drives", get(api_drives))
         .route("/api/detected-drives", get(api_detected_drives))
         .route("/api/duplicates", get(api_duplicates))
         .route("/api/preview/:id", get(api_preview))
@@ -417,6 +418,21 @@ struct StatsDto { duplicate_groups: i64, volumes: Vec<VolumeDto> }
 #[derive(Serialize)]
 struct ActivityDto { kind: String, summary: String, occurred_at: i64 }
 
+#[derive(Serialize)]
+struct DriveDto {
+    volume_id: String,
+    label: String,
+    mount_path: Option<String>,   // None if not currently connected
+    connected: bool,
+    active_files: i64,
+    active_bytes: i64,
+    total_bytes: Option<u64>,     // None if unmounted or undeterminable
+    free_bytes: Option<u64>,
+    reclaimable_bytes: i64,
+    last_seen_at: Option<i64>,
+    has_errors: bool,
+}
+
 /// Human summary for one audit row. `details` is the JSON stored by the engine; parse best-effort
 /// and fall back to the raw action name so a schema change can never break the feed.
 fn activity_summary(action: &str, details: &str) -> String {
@@ -505,6 +521,31 @@ async fn api_activity(State(state): State<AppState>)
     Ok(Json(rows.into_iter().map(|(action, details, occurred_at)| ActivityDto {
         summary: activity_summary(&action, &details), kind: action, occurred_at,
     }).collect()))
+}
+
+async fn api_drives(State(state): State<AppState>)
+    -> Result<Json<Vec<DriveDto>>, (StatusCode, String)>
+{
+    let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
+    let reclaim = cat.reclaimable_bytes_by_volume().map_err(err500)?;
+    let mounts = state.mounts.snapshot();
+    let mut out = Vec::new();
+    for (volume_id, label, active_files, active_bytes) in cat.volume_stats().map_err(err500)? {
+        let mount_path = mounts.get(&volume_id).cloned();
+        let (total_bytes, free_bytes) = match &mount_path {
+            Some(p) => match crate::mounts::disk_capacity(p) { Some((t, f)) => (Some(t), Some(f)), None => (None, None) },
+            None => (None, None),
+        };
+        out.push(DriveDto {
+            connected: mount_path.is_some(),
+            mount_path: mount_path.map(|p| p.display().to_string()),
+            reclaimable_bytes: reclaim.get(&volume_id).copied().unwrap_or(0),
+            last_seen_at: cat.volume_last_seen(&volume_id).map_err(err500)?,
+            has_errors: cat.volume_has_scan_errors(&volume_id).map_err(err500)?,
+            volume_id, label, active_files, active_bytes, total_bytes, free_bytes,
+        });
+    }
+    Ok(Json(out))
 }
 
 async fn api_detected_drives(State(state): State<AppState>)
@@ -962,6 +1003,17 @@ mod tests {
         assert_eq!(res.status(), axum::http::StatusCode::OK, "uri {uri}");
         let bytes = axum::body::to_bytes(res.into_body(), 5_000_000).await.unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn api_drives_lists_catalogued_volume_with_reclaimable() {
+        let (_t, _db, state) = seed_dupes(); // seeds vol-1 "Photos HDD" with a duplicate group
+        let v = get_json_state(state, "/api/drives").await;
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["label"], "Photos HDD");
+        assert_eq!(arr[0]["connected"], true); // Fixed mount is present
+        assert!(arr[0]["reclaimable_bytes"].as_i64().unwrap() >= 0);
     }
 
     #[tokio::test]

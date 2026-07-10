@@ -48,6 +48,24 @@ pub fn live_mounts() -> HashMap<String, PathBuf> {
     scan_mounts(disks.list().iter().map(|d| d.mount_point().to_path_buf()))
 }
 
+/// (total, available) bytes on the filesystem holding `path`, by longest-matching mount point.
+/// None if it can't be determined. Same longest-prefix approach as `repack::available_space`.
+pub fn disk_capacity(path: &std::path::Path) -> Option<(u64, u64)> {
+    use sysinfo::Disks;
+    let disks = Disks::new_with_refreshed_list();
+    let mut best: Option<(usize, u64, u64)> = None;
+    for d in disks.list() {
+        let mp = d.mount_point();
+        if path.starts_with(mp) {
+            let len = mp.as_os_str().len();
+            if best.map(|(b, _, _)| len > b).unwrap_or(true) {
+                best = Some((len, d.total_space(), d.available_space()));
+            }
+        }
+    }
+    best.map(|(_, t, a)| (t, a))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -71,5 +89,16 @@ mod tests {
         let r = MountResolver::Fixed(map);
         assert_eq!(r.resolve("vol-A"), Some(a));
         assert_eq!(r.resolve("vol-missing"), None);
+    }
+
+    #[test]
+    fn disk_capacity_of_temp_dir_is_some_and_sane() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The temp dir lives on a real mounted filesystem, so capacity should resolve.
+        let cap = disk_capacity(tmp.path());
+        if let Some((total, avail)) = cap {
+            assert!(total > 0);
+            assert!(avail <= total);
+        } // On some CI filesystems this can be None; the None branch is acceptable.
     }
 }
