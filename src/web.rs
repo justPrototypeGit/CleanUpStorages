@@ -41,7 +41,8 @@ pub fn build_router(catalog_path: PathBuf) -> Router {
 /// The full router. New review routes are added here in later tasks.
 pub fn build_router_with(state: AppState) -> Router {
     Router::new()
-        .route("/", get(index))
+        .route("/", get(overview))
+        .route("/browse", get(browse))
         .route("/api/search", get(api_search))
         .route("/api/volumes", get(api_volumes))
         .route("/api/stats", get(api_stats))
@@ -74,7 +75,11 @@ pub fn build_router_with(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn index(State(_state): State<AppState>) -> Html<&'static str> {
+async fn overview(State(state): State<AppState>) -> Html<String> {
+    Html(crate::web_ui::overview_page(&state.csrf_token))
+}
+
+async fn browse(State(_state): State<AppState>) -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
@@ -1474,7 +1479,7 @@ mod tests {
         use axum::http::Request;
         use tower::ServiceExt;
         let app = build_router(PathBuf::from("unused.db"));
-        let res = app.oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        let res = app.oneshot(Request::builder().uri("/browse").body(Body::empty()).unwrap())
             .await.unwrap();
         let bytes = axum::body::to_bytes(res.into_body(), 2_000_000).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
@@ -1484,6 +1489,21 @@ mod tests {
         // self-contained: no external resource references
         assert!(!body.contains("http://"), "no external http resources");
         assert!(!body.contains("https://"), "no external https resources");
+    }
+
+    #[tokio::test]
+    async fn root_is_overview_and_self_contained() {
+        use axum::body::Body; use axum::http::Request; use tower::ServiceExt;
+        let (_t, _db, state) = seed_dupes();
+        let app = build_router_with(state);
+        let res = app.oneshot(Request::builder().uri("/").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), 2_000_000).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("/api/activity"), "overview loads activity");
+        assert!(body.contains("/api/drives"), "overview loads drives");
+        assert!(body.contains("Recent activity"));
+        assert!(!body.contains("http://") && !body.contains("https://"), "self-contained");
     }
 
     #[tokio::test]
