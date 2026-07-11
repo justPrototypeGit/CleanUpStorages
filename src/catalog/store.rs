@@ -159,6 +159,28 @@ impl Catalog {
         Ok(n)
     }
 
+    /// For the given content hashes, those with >1 active copy in the catalog, mapped to their
+    /// active copy count. Bounded by the passed hashes (indexed on content_hash).
+    pub fn duplicate_counts(&self, hashes: &[String])
+        -> anyhow::Result<std::collections::HashMap<String, i64>>
+    {
+        let mut out = std::collections::HashMap::new();
+        if hashes.is_empty() { return Ok(out); }
+        // Deduplicate the input so the IN-list stays small.
+        let uniq: std::collections::HashSet<&String> = hashes.iter().collect();
+        let placeholders = std::iter::repeat("?").take(uniq.len()).collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT content_hash, count(*) FROM files
+             WHERE status='active' AND content_hash IN ({placeholders})
+             GROUP BY content_hash HAVING count(*) > 1");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> =
+            uniq.iter().map(|h| *h as &dyn rusqlite::types::ToSql).collect();
+        let rows = stmt.query_map(params.as_slice(), |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        for row in rows { let (h, n) = row?; out.insert(h, n); }
+        Ok(out)
+    }
+
     pub fn volume_stats(&self) -> anyhow::Result<Vec<(String, String, i64, i64)>> {
         let mut stmt = self.conn.prepare(
             "SELECT v.volume_id, v.label,
@@ -524,6 +546,28 @@ mod tests {
         // (last_seen_at < 300) to missing. Signature: mark_missing_scanned(volume_id, scan_started_at, now).
         cat.mark_missing_scanned("v", 300, 300).unwrap();
         assert_eq!(cat.duplicate_group_count().unwrap(), 0); // active-only: no reviewable groups
+    }
+
+    #[test]
+    fn duplicate_counts_reports_only_multi_active_hashes() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_volume(&crate::catalog::models::Volume {
+            volume_id: "v".into(), label: "V".into(), identified_by: "marker".into(),
+            first_seen_at: 1, last_seen_at: 1 }).unwrap();
+        let mut f = crate::catalog::models::NewFile {
+            volume_id: "v".into(), relative_path: "a".into(), filename: "a".into(),
+            extension: "".into(), size_bytes: 1, content_hash: "dup".into(),
+            created_time: None, modified_time: None, accessed_time: None,
+            category: crate::category::Category::Other, container_chain: None };
+        cat.upsert_file(&f, 1).unwrap();                       // dup copy 1
+        f.relative_path = "b".into(); f.filename = "b".into();
+        cat.upsert_file(&f, 1).unwrap();                       // dup copy 2
+        f.relative_path = "u".into(); f.filename = "u".into(); f.content_hash = "uniq".into();
+        cat.upsert_file(&f, 1).unwrap();                       // unique
+        let m = cat.duplicate_counts(&["dup".to_string(), "uniq".to_string(), "absent".to_string()]).unwrap();
+        assert_eq!(m.get("dup").copied(), Some(2));
+        assert_eq!(m.get("uniq"), None);   // single copy -> not duplicated
+        assert_eq!(m.get("absent"), None); // not in catalog
     }
 
     #[test]
