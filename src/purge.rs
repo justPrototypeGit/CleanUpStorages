@@ -103,7 +103,7 @@ mod tests {
             content_hash: "h".into(), created_time: None, modified_time: None, accessed_time: None,
             category: crate::category::Category::Photo, container_chain: None };
         cat.upsert_file(&f, 100).unwrap();
-        let id = cat.active_file_id("vol-1", "_ToDelete/Photos/a.jpg").unwrap().unwrap();
+        let id = cat.loose_file_id("vol-1", "_ToDelete/Photos/a.jpg").unwrap().unwrap();
         cat.mark_quarantined(id, "_ToDelete/Photos/a.jpg", "Photos/a.jpg", 150).unwrap();
 
         let out = purge_volume(&cat, &root, "vol-1", 200).unwrap();
@@ -178,7 +178,7 @@ mod tests {
             content_hash: "h".into(), created_time: None, modified_time: None, accessed_time: None,
             category: crate::category::Category::Photo, container_chain: None };
         cat.upsert_file(&f, 100).unwrap();
-        let id = cat.active_file_id("vol-1", "_ToDelete/Photos/a.jpg").unwrap().unwrap();
+        let id = cat.loose_file_id("vol-1", "_ToDelete/Photos/a.jpg").unwrap().unwrap();
         cat.mark_quarantined(id, "_ToDelete/Photos/a.jpg", "Photos/a.jpg", 150).unwrap();
 
         let vid = "vol-1".to_string();
@@ -218,7 +218,7 @@ mod tests {
             content_hash: "h2".into(), created_time: None, modified_time: None, accessed_time: None,
             category: crate::category::Category::Photo, container_chain: None };
         cat.upsert_file(&f2, 100).unwrap();
-        let id2 = cat.active_file_id("vol-2", "_ToDelete/b.jpg").unwrap().unwrap();
+        let id2 = cat.loose_file_id("vol-2", "_ToDelete/b.jpg").unwrap().unwrap();
         cat.mark_quarantined(id2, "_ToDelete/b.jpg", "b.jpg", 150).unwrap();
 
         // Only vol-1 is mounted; vol-2 is not.
@@ -250,7 +250,7 @@ mod tests {
             content_hash: "h".into(), created_time: None, modified_time: None, accessed_time: None,
             category: crate::category::Category::Photo, container_chain: None };
         cat.upsert_file(&f, 100).unwrap();
-        let id = cat.active_file_id("vol-1", "_ToDelete/gone.jpg").unwrap().unwrap();
+        let id = cat.loose_file_id("vol-1", "_ToDelete/gone.jpg").unwrap().unwrap();
         cat.mark_quarantined(id, "_ToDelete/gone.jpg", "gone.jpg", 150).unwrap();
 
         // _ToDelete absent -> delete is a no-op, but the quarantined row reconciles to purged

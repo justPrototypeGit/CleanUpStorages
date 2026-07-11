@@ -12,5 +12,6 @@ pub mod archive;
 pub mod repack;
 pub mod web;
 pub mod web_ui;
+pub mod image_preview;
 pub mod scan_queue;
 pub mod observability;

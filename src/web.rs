@@ -1,6 +1,6 @@
 //! Local, read-only web browse/search UI. Binds 127.0.0.1 only.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use axum::{Router, routing::{get, post}, extract::State, response::Html, Json, extract::Query};
 use axum::http::HeaderMap;
 use axum::extract::Path as AxPath;
@@ -203,6 +203,33 @@ fn err500<E: std::fmt::Display>(e: E) -> (axum::http::StatusCode, String) {
     (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 
+/// CSRF gate for mutating endpoints: require the per-run token (a cross-site page can't read it).
+/// Call this FIRST in every mutating handler, before any catalog/filesystem/dialog access.
+fn check_csrf(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, String)> {
+    let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok())
+        == Some(state.csrf_token.as_str());
+    if !ok {
+        tracing::warn!("rejected request: missing or bad CSRF token");
+        return Err((StatusCode::FORBIDDEN, "missing or bad token".into()));
+    }
+    Ok(())
+}
+
+/// Current time as UNIX seconds; a clock error becomes a 500 (matches existing handler behavior).
+fn now_secs() -> Result<i64, (StatusCode, String)> {
+    Ok(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map_err(err500)?.as_secs() as i64)
+}
+
+/// Best-effort catalog snapshot around a mutation (some handlers call this before the mutation as a
+/// pre-mutation safety net, others after). Never fails the request — a snapshot error is swallowed.
+fn snapshot_best_effort(state: &AppState, now: i64) {
+    if let Ok(cfg) = crate::config::Config::default_paths() {
+        let _ = crate::catalog::backup::snapshot(&state.catalog_path, &cfg.backups_dir(),
+            cfg.snapshot_retention, now);
+    }
+}
+
 async fn api_search(State(state): State<AppState>, Query(p): Query<SearchParams>)
     -> Result<Json<Vec<HitDto>>, (axum::http::StatusCode, String)>
 {
@@ -347,25 +374,6 @@ async fn api_duplicates(State(state): State<AppState>)
     Ok(Json(out))
 }
 
-/// Decode any supported image, downscale to fit `max_dim` on the longest side, re-encode as JPEG.
-fn thumbnail_jpeg(bytes: &[u8], max_dim: u32) -> anyhow::Result<Vec<u8>> {
-    let img = image::load_from_memory(bytes)?;
-    let thumb = img.thumbnail(max_dim, max_dim); // preserves aspect ratio, never upsizes past bounds
-    let mut out = std::io::Cursor::new(Vec::new());
-    thumb.write_to(&mut out, image::ImageFormat::Jpeg)?;
-    Ok(out.into_inner())
-}
-
-/// Read one top-level entry's bytes from a zip archive.
-fn read_zip_entry(archive_path: &Path, entry_name: &str) -> anyhow::Result<Vec<u8>> {
-    let file = std::fs::File::open(archive_path)?;
-    let mut zip = zip::ZipArchive::new(file)?;
-    let mut entry = zip.by_name(entry_name)?;
-    let mut buf = Vec::new();
-    std::io::Read::read_to_end(&mut entry, &mut buf)?;
-    Ok(buf)
-}
-
 const PREVIEW_MAX_DIM: u32 = 320;
 
 /// Photo thumbnail for a file that is: a photo, mounted, and either loose or a top-level
@@ -390,12 +398,12 @@ async fn api_preview(State(state): State<AppState>, AxPath(id): AxPath<i64>) -> 
 
     let bytes = match &rec.container_chain {
         None => std::fs::read(mount.join(&rec.relative_path)).ok(),
-        Some(chain) if !chain.contains(" › ") => read_zip_entry(&mount.join(&rec.relative_path), chain).ok(),
+        Some(chain) if !chain.contains(" › ") => crate::image_preview::read_zip_entry(&mount.join(&rec.relative_path), chain).ok(),
         Some(_) => return not_found("nested-archive preview not supported"),
     };
     let Some(bytes) = bytes else { return not_found("file unavailable") };
 
-    match thumbnail_jpeg(&bytes, PREVIEW_MAX_DIM) {
+    match crate::image_preview::thumbnail_jpeg(&bytes, PREVIEW_MAX_DIM) {
         Ok(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
         Err(_) => not_found("not a decodable image"),
     }
@@ -418,17 +426,10 @@ struct QuarantineResultDto {
 async fn api_quarantine(State(state): State<AppState>, headers: HeaderMap, body: Json<QuarantineReq>)
     -> Result<Json<QuarantineResultDto>, (StatusCode, String)>
 {
-    // CSRF: require the per-run token (a cross-site page can't read it). Checked first, before
-    // any catalog access, so a bad/missing token does nothing.
-    let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
-    if !ok {
-        tracing::warn!("rejected request: missing or bad CSRF token");
-        return Err((StatusCode::FORBIDDEN, "missing or bad token".into()));
-    }
+    check_csrf(&headers, &state)?;
 
     let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map_err(err500)?.as_secs() as i64;
+    let now = now_secs()?;
 
     // Group requested ids by their volume; ids that don't resolve to a file are counted skipped.
     let mut by_volume: std::collections::HashMap<String, Vec<i64>> = std::collections::HashMap::new();
@@ -463,10 +464,7 @@ async fn api_quarantine(State(state): State<AppState>, headers: HeaderMap, body:
 
     // Snapshot the catalog this request actually mutated (best-effort; a snapshot failure
     // shouldn't fail the request).
-    if let Ok(cfg) = crate::config::Config::default_paths() {
-        let _ = crate::catalog::backup::snapshot(&state.catalog_path, &cfg.backups_dir(),
-            cfg.snapshot_retention, now);
-    }
+    snapshot_best_effort(&state, now);
     Ok(Json(result))
 }
 
@@ -482,29 +480,20 @@ struct RepackResultDto { removed_entry: String, retained_entries: usize }
 async fn api_repack(State(state): State<AppState>, headers: HeaderMap, body: Json<RepackReq>)
     -> Result<Json<RepackResultDto>, (StatusCode, String)>
 {
-    // CSRF: checked first, before any catalog access, so a bad/missing token does nothing.
-    let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
-    if !ok {
-        tracing::warn!("rejected request: missing or bad CSRF token");
-        return Err((StatusCode::FORBIDDEN, "missing or bad token".into()));
-    }
+    check_csrf(&headers, &state)?;
 
     let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
     let rec = cat.get_file(body.entry_id).map_err(err500)?
         .ok_or((StatusCode::NOT_FOUND, "no such entry".to_string()))?;
     let mount = state.mounts.resolve(&rec.volume_id)
         .ok_or((StatusCode::CONFLICT, "drive not connected".to_string()))?;
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map_err(err500)?.as_secs() as i64;
+    let now = now_secs()?;
     let out = crate::repack::repack_entry(&cat, &mount, &rec.volume_id, body.entry_id, now)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     // Snapshot the catalog this request actually mutated (best-effort; a snapshot failure
     // shouldn't fail the request).
-    if let Ok(cfg) = crate::config::Config::default_paths() {
-        let _ = crate::catalog::backup::snapshot(&state.catalog_path, &cfg.backups_dir(),
-            cfg.snapshot_retention, now);
-    }
+    snapshot_best_effort(&state, now);
     Ok(Json(RepackResultDto { removed_entry: out.removed_entry, retained_entries: out.retained_entries }))
 }
 
@@ -520,19 +509,10 @@ struct ForgetResultDto { removed_files: usize }
 async fn api_forget_drive(State(state): State<AppState>, headers: HeaderMap, body: Json<ForgetReq>)
     -> Result<Json<ForgetResultDto>, (StatusCode, String)>
 {
-    // CSRF: checked first, before any catalog access, so a bad/missing token does nothing.
-    let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
-    if !ok {
-        tracing::warn!("rejected request: missing or bad CSRF token");
-        return Err((StatusCode::FORBIDDEN, "missing or bad token".into()));
-    }
+    check_csrf(&headers, &state)?;
     let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map_err(err500)?.as_secs() as i64;
-    if let Ok(cfg) = crate::config::Config::default_paths() {
-        let _ = crate::catalog::backup::snapshot(&state.catalog_path, &cfg.backups_dir(),
-            cfg.snapshot_retention, now);
-    }
+    let now = now_secs()?;
+    snapshot_best_effort(&state, now);
     let removed = cat.forget_volume(&body.volume_id, now).map_err(err500)?;
     Ok(Json(ForgetResultDto { removed_files: removed }))
 }
@@ -552,19 +532,10 @@ struct PurgeAllResultDto {
 async fn api_purge_all(State(state): State<AppState>, headers: HeaderMap)
     -> Result<Json<PurgeAllResultDto>, (StatusCode, String)>
 {
-    // CSRF: checked first, before any catalog access, so a bad/missing token does nothing.
-    let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
-    if !ok {
-        tracing::warn!("rejected request: missing or bad CSRF token");
-        return Err((StatusCode::FORBIDDEN, "missing or bad token".into()));
-    }
+    check_csrf(&headers, &state)?;
     let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map_err(err500)?.as_secs() as i64;
-    if let Ok(cfg) = crate::config::Config::default_paths() {
-        let _ = crate::catalog::backup::snapshot(&state.catalog_path, &cfg.backups_dir(),
-            cfg.snapshot_retention, now);
-    }
+    let now = now_secs()?;
+    snapshot_best_effort(&state, now);
     let out = crate::purge::purge_all(&cat, &state.mounts.snapshot(), now).map_err(err500)?;
     Ok(Json(PurgeAllResultDto {
         purged_volumes: out.purged.len(),
@@ -587,12 +558,7 @@ struct ScanEnqueuedDto { queued_position: usize }
 async fn api_scan(State(state): State<AppState>, headers: HeaderMap, body: Json<ScanReq>)
     -> Result<Json<ScanEnqueuedDto>, (StatusCode, String)>
 {
-    // CSRF: checked first, before any queue access, so a bad/missing token does nothing.
-    let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
-    if !ok {
-        tracing::warn!("rejected request: missing or bad CSRF token");
-        return Err((StatusCode::FORBIDDEN, "missing or bad token".into()));
-    }
+    check_csrf(&headers, &state)?;
 
     if body.path.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "path is required".into()));
@@ -615,12 +581,7 @@ struct PickFolderDto { path: Option<String> }
 async fn api_pick_folder(State(state): State<AppState>, headers: HeaderMap)
     -> Result<Json<PickFolderDto>, (StatusCode, String)>
 {
-    // CSRF: checked first, before touching the OS dialog, so a bad/missing token does nothing.
-    let ok = headers.get("x-cleanup-token").and_then(|v| v.to_str().ok()) == Some(state.csrf_token.as_str());
-    if !ok {
-        tracing::warn!("rejected request: missing or bad CSRF token");
-        return Err((StatusCode::FORBIDDEN, "missing or bad token".into()));
-    }
+    check_csrf(&headers, &state)?;
 
     let picked = tokio::task::spawn_blocking(|| {
         rfd::FileDialog::new().set_title("Choose a drive or folder to scan").pick_folder()
@@ -838,18 +799,6 @@ mod tests {
         buf.into_inner()
     }
 
-    #[test]
-    fn thumbnail_downscales_and_encodes_jpeg() {
-        // a 100x40 image thumbnails to <=32px longest side, and the output decodes as JPEG.
-        let img = image::RgbImage::from_pixel(100, 40, image::Rgb([0, 128, 255]));
-        let mut src = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgb8(img).write_to(&mut src, image::ImageFormat::Png).unwrap();
-        let thumb = thumbnail_jpeg(&src.into_inner(), 32).unwrap();
-        let decoded = image::load_from_memory(&thumb).unwrap();
-        assert!(decoded.width() <= 32 && decoded.height() <= 32);
-        assert!(decoded.width() >= 1);
-    }
-
     #[tokio::test]
     async fn preview_returns_jpeg_for_loose_photo_on_mounted_drive() {
         use axum::body::Body; use axum::http::Request; use tower::ServiceExt;
@@ -859,7 +808,7 @@ mod tests {
         std::fs::write(drive.join("a.jpg"), tiny_png()).unwrap();
         // find a.jpg's id
         let cat = crate::catalog::Catalog::open_readonly(&db).unwrap();
-        let id = cat.active_file_id("vol-1", "a.jpg").unwrap().unwrap();
+        let id = cat.loose_file_id("vol-1", "a.jpg").unwrap().unwrap();
 
         let app = build_router_with(state);
         let res = app.oneshot(Request::builder().uri(format!("/api/preview/{id}"))
@@ -880,7 +829,7 @@ mod tests {
         std::fs::write(drive.join("a.jpg"), b"this is not an image").unwrap();
         // find a.jpg's id
         let cat = crate::catalog::Catalog::open_readonly(&db).unwrap();
-        let id = cat.active_file_id("vol-1", "a.jpg").unwrap().unwrap();
+        let id = cat.loose_file_id("vol-1", "a.jpg").unwrap().unwrap();
 
         let app = build_router_with(state);
         let res = app.oneshot(Request::builder().uri(format!("/api/preview/{id}"))
@@ -905,7 +854,7 @@ mod tests {
         }
         // find notes.txt's id
         let cat = crate::catalog::Catalog::open_readonly(&db).unwrap();
-        let id = cat.active_file_id("vol-1", "notes.txt").unwrap().unwrap();
+        let id = cat.loose_file_id("vol-1", "notes.txt").unwrap().unwrap();
 
         let app = build_router_with(state);
         let res = app.oneshot(Request::builder().uri(format!("/api/preview/{id}"))
@@ -964,7 +913,7 @@ mod tests {
         std::fs::write(drive.join("a.jpg"), b"DUP").unwrap();
         std::fs::write(drive.join("copy/a.jpg"), b"DUP").unwrap();
         let cat = crate::catalog::Catalog::open_readonly(&db).unwrap();
-        let victim = cat.active_file_id("vol-1", "copy/a.jpg").unwrap().unwrap();
+        let victim = cat.loose_file_id("vol-1", "copy/a.jpg").unwrap().unwrap();
         drop(cat);
 
         let (status, json) = post_json(state, "/api/quarantine", Some("T"),
@@ -990,7 +939,7 @@ mod tests {
                 container_chain: None }, 100).unwrap();
         }
         let cat = crate::catalog::Catalog::open_readonly(&db).unwrap();
-        let id = cat.active_file_id("vol-2", "x.jpg").unwrap().unwrap();
+        let id = cat.loose_file_id("vol-2", "x.jpg").unwrap().unwrap();
         drop(cat);
         let (status, json) = post_json(state, "/api/quarantine", Some("T"),
             serde_json::json!({"quarantine_ids":[id]})).await;
