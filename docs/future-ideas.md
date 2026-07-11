@@ -68,11 +68,10 @@ Shipped clean — the final review found **no Critical issues** and confirmed a 
 
 ## Follow-ups logged from the Phase 2a (quarantine/purge) code review (2026-07-04)
 
-Shipped clean — the final review's two data-safety findings were fixed before merge (disk-aware survivor check so a stale catalog can't cause last-copy loss; catalog-aware `quarantine_dest` so a purged row's path can't orphan a re-quarantined file). Remaining cleanups:
+Shipped clean — the final review's two data-safety findings were fixed before merge (disk-aware survivor check so a stale catalog can't cause last-copy loss; catalog-aware `quarantine_dest` so a purged row's path can't orphan a re-quarantined file).
 
-- **Extract `const FILE_COLUMNS`.** The 16-column `files` SELECT is now duplicated ~6× across `store.rs` (search_filtered, get_file, duplicate_groups, quarantined_rows, active_copies) and `map_file_record` reads by positional `r.get(15)`. Adding a column requires editing every SELECT + the mapper index in lockstep — a runtime-panic trap. Hoist the column list to one const and keep the mapper index-aligned (ideally switch to named-column access).
-- **`active_file_id` naming/filter.** It filters `container_chain IS NULL` but not `status='active'` despite the name; safe today only because the loose-identity partial unique index guarantees one loose row per path. Add the status filter or rename to `loose_file_id`.
-- **Purge catalog bookkeeping isn't transactional.** `purge_volume`'s `mark_purged` loop + `log_action` are separate statements; wrap them in one transaction so a mid-loop failure can't leave rows marked without an audit entry (not data-loss — the physical delete already completed cleanly before this point).
+**Resolved since:** `FILE_COLUMNS` const + named-column mapper and the `active_file_id` → `loose_file_id` rename landed in the PoSD refactor (2026-07-10); purge catalog bookkeeping is now transactional (2026-07-12). Remaining cleanups:
+
 - **Post-rename transient DB error still aborts a quarantine batch** via `?` (leaves the moved file in `_ToDelete`, recoverable, row reconciled to missing on rescan). Consider catching into the same non-fatal skip path so one flaky write doesn't halt a large batch.
 - **UX:** `cmd_purge`'s missing-marker error lacks the "scan the drive first" hint that `cmd_quarantine` gives; `cmd_duplicates` prints a status column that is always "active".
 - **Rescan-before-quarantine guidance.** The disk-aware survivor check protects same-drive copies, but a cross-drive survivor on an *unmounted* drive is trusted without verification (it's a genuinely separate physical copy). The review GUI (2b) should surface "the copy that makes this safe to remove lives on «Other Drive» (not currently connected)" so the user decides with full information.
@@ -82,19 +81,18 @@ Shipped clean — the final review's two data-safety findings were fixed before 
 
 Shipped clean — the final review found no Critical/Important issues (verified additive: no behavior/test change, no sensitive data off-machine, exhaustive command match, no hot-loop logging). Applied before merge: plain logs when stderr is redirected; a comment on the command-span nesting caveat. Remaining minor:
 
-- **CSRF-reject helper.** The `if !ok { tracing::warn!(...); return Err((FORBIDDEN, "missing or bad token")) }` block is now duplicated across four handlers (`api_quarantine`/`api_repack`/`api_scan`/`api_pick_folder`). If a 5th protected route is added, extract a small `reject_missing_csrf()` helper. Also the `CaptureWriter`/`CaptureW` test `MakeWriter` is duplicated between the web and scanner test modules (accepted — no shared test-support module yet).
+- **CaptureWriter test duplication.** The `CaptureWriter`/`CaptureW` test `MakeWriter` is duplicated between the web and scanner test modules (accepted — no shared test-support module yet). *(The CSRF-reject-helper item here was resolved: `check_csrf` was extracted in the PoSD refactor, 2026-07-10.)*
 - **Deferred (from the spec, unchanged):** log files / rotation / retention; a log-viewer panel in the web UI; metrics/telemetry export (Prometheus/OpenTelemetry); redaction modes.
 
 
 ## Follow-ups logged from the UI-integration code review (2026-07-10)
 
-Shipped clean — the final whole-branch review found no Critical/Important issues (verified: self-contained across all six pages, CSRF-first on all six mutating handlers, `open_readonly`/`open` split correct, `forget_volume` never touches disk, `purge_all` delegates only to `purge_volume`, XSS-safe via `esc()`/`textContent`, DTO/JS field names all match). One earlier DTO-contract bug (activity feed read wrong field names) was caught and fixed in-branch (`d453511`). Remaining minor / optional:
+Shipped clean — the final whole-branch review found no Critical/Important issues (verified: self-contained across all six pages, CSRF-first on all six mutating handlers, `open_readonly`/`open` split correct, `forget_volume` never touches disk, `purge_all` delegates only to `purge_volume`, XSS-safe via `esc()`/`textContent`, DTO/JS field names all match). One earlier DTO-contract bug (activity feed read wrong field names) was caught and fixed in-branch (`d453511`).
 
-- **CSRF-reject block is now duplicated across SIX handlers** (the four above plus `api_forget_drive`/`api_purge_all`). The `reject_missing_csrf()` extraction noted above is now clearly worth doing.
+**Resolved since:** the CSRF-reject block was extracted into `check_csrf` and `duplicate_group_count` was aligned to active-only (both PoSD refactor, 2026-07-10); `forget_volume` now logs its audit action inside the delete transaction (2026-07-12). Remaining minor / optional:
+
 - **`api_drives` re-enumerates disks per volume.** It calls `mounts::disk_capacity()` inside the per-volume loop, and each call does `Disks::new_with_refreshed_list()` — O(volumes × all-disks). Harmless for a handful of drives; if drive count grows, add a `disk_capacity` variant taking a pre-refreshed `Disks` list and refresh once per request.
-- **`forget_volume` logs the audit action after `COMMIT`.** An (unlikely) audit-insert failure returns `Err` even though the forget already succeeded — cosmetic, non-destructive. (A `DELETE` error before `COMMIT` self-heals: the open transaction rolls back on connection drop.)
 - **Console flag parser requires flag-after-positional** (`scan D:\ --force` works, `scan --force D:\` doesn't). Fails safe (no request, just a usage hint). Improve the tokenizer if console ergonomics matter.
-- **Pre-existing (not from this branch):** `duplicate_group_count()` counts `status IN ('active','missing')` while `duplicate_groups()` is active-only, so the Overview group count and the review-page count can diverge. Align them if the discrepancy surfaces.
 
 
 ## Follow-ups logged from the Browse-tree code review (2026-07-12)
