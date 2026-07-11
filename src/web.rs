@@ -221,9 +221,9 @@ fn now_secs() -> Result<i64, (StatusCode, String)> {
         .map_err(err500)?.as_secs() as i64)
 }
 
-/// Best-effort catalog snapshot after a mutation. Never fails the request — a snapshot error is
-/// swallowed, exactly as the inlined blocks did.
-fn snapshot_after_mutation(state: &AppState, now: i64) {
+/// Best-effort catalog snapshot around a mutation (some handlers call this before the mutation as a
+/// pre-mutation safety net, others after). Never fails the request — a snapshot error is swallowed.
+fn snapshot_best_effort(state: &AppState, now: i64) {
     if let Ok(cfg) = crate::config::Config::default_paths() {
         let _ = crate::catalog::backup::snapshot(&state.catalog_path, &cfg.backups_dir(),
             cfg.snapshot_retention, now);
@@ -464,7 +464,7 @@ async fn api_quarantine(State(state): State<AppState>, headers: HeaderMap, body:
 
     // Snapshot the catalog this request actually mutated (best-effort; a snapshot failure
     // shouldn't fail the request).
-    snapshot_after_mutation(&state, now);
+    snapshot_best_effort(&state, now);
     Ok(Json(result))
 }
 
@@ -493,7 +493,7 @@ async fn api_repack(State(state): State<AppState>, headers: HeaderMap, body: Jso
 
     // Snapshot the catalog this request actually mutated (best-effort; a snapshot failure
     // shouldn't fail the request).
-    snapshot_after_mutation(&state, now);
+    snapshot_best_effort(&state, now);
     Ok(Json(RepackResultDto { removed_entry: out.removed_entry, retained_entries: out.retained_entries }))
 }
 
@@ -512,7 +512,7 @@ async fn api_forget_drive(State(state): State<AppState>, headers: HeaderMap, bod
     check_csrf(&headers, &state)?;
     let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
     let now = now_secs()?;
-    snapshot_after_mutation(&state, now);
+    snapshot_best_effort(&state, now);
     let removed = cat.forget_volume(&body.volume_id, now).map_err(err500)?;
     Ok(Json(ForgetResultDto { removed_files: removed }))
 }
@@ -535,7 +535,7 @@ async fn api_purge_all(State(state): State<AppState>, headers: HeaderMap)
     check_csrf(&headers, &state)?;
     let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
     let now = now_secs()?;
-    snapshot_after_mutation(&state, now);
+    snapshot_best_effort(&state, now);
     let out = crate::purge::purge_all(&cat, &state.mounts.snapshot(), now).map_err(err500)?;
     Ok(Json(PurgeAllResultDto {
         purged_volumes: out.purged.len(),
