@@ -36,6 +36,11 @@ pub fn purge_volume(
         std::fs::remove_dir_all(&qdir)?; // THE hard delete — user-initiated only.
     }
 
+    // The physical delete above is done and irreversible; the catalog bookkeeping that records it
+    // runs in one transaction so a mid-loop failure can't mark some rows purged without the audit
+    // entry (a rollback here just leaves rows `quarantined`, which the next purge/rescan reconciles
+    // to `purged` since the files are already gone from disk).
+    let tx = cat.conn.unchecked_transaction()?;
     let mut files_purged = 0usize;
     for rec in &rows {
         cat.mark_purged(rec.id, now)?;
@@ -45,6 +50,7 @@ pub fn purge_volume(
         "volume_id": expected_volume_id, "files_purged": files_purged,
         "bytes_reclaimed": bytes_reclaimed,
     }).to_string(), now)?;
+    tx.commit()?;
 
     Ok(PurgeOutcome { files_purged, bytes_reclaimed })
 }

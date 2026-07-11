@@ -397,17 +397,21 @@ impl Catalog {
     /// Remove ALL catalog knowledge of a volume: its file rows (FTS cleaned up by triggers) and
     /// its `volumes` row. Never touches files on disk — a later rescan fully rebuilds the volume.
     /// Returns the number of file rows removed, and logs a `forget` audit action.
+    ///
+    /// All of it — the three deletes and the audit row — runs in one transaction: any error before
+    /// commit rolls everything back (the `Transaction` guard rolls back on drop), so a mid-delete
+    /// failure can never leave a half-forgotten volume or a delete without its audit entry.
     pub fn forget_volume(&self, volume_id: &str, now: i64) -> anyhow::Result<usize> {
         let label: String = self.conn.query_row(
             "SELECT label FROM volumes WHERE volume_id=?1", params![volume_id],
             |r| r.get(0)).unwrap_or_else(|_| volume_id.to_string());
-        self.conn.execute_batch("BEGIN")?;
+        let tx = self.conn.unchecked_transaction()?;
         let removed = self.conn.execute("DELETE FROM files WHERE volume_id=?1", params![volume_id])?;
         self.conn.execute("DELETE FROM scan_errors WHERE volume_id=?1", params![volume_id])?;
         self.conn.execute("DELETE FROM volumes WHERE volume_id=?1", params![volume_id])?;
-        self.conn.execute_batch("COMMIT")?;
         self.log_action("forget", &serde_json::json!({
             "volume_id": volume_id, "label": label, "removed_files": removed }).to_string(), now)?;
+        tx.commit()?;
         Ok(removed)
     }
 
