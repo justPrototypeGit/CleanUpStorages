@@ -95,3 +95,26 @@ Shipped clean — the final whole-branch review found no Critical/Important issu
 - **`forget_volume` logs the audit action after `COMMIT`.** An (unlikely) audit-insert failure returns `Err` even though the forget already succeeded — cosmetic, non-destructive. (A `DELETE` error before `COMMIT` self-heals: the open transaction rolls back on connection drop.)
 - **Console flag parser requires flag-after-positional** (`scan D:\ --force` works, `scan --force D:\` doesn't). Fails safe (no request, just a usage hint). Improve the tokenizer if console ergonomics matter.
 - **Pre-existing (not from this branch):** `duplicate_group_count()` counts `status IN ('active','missing')` while `duplicate_groups()` is active-only, so the Overview group count and the review-page count can diverge. Align them if the discrepancy surfaces.
+
+
+## Follow-ups logged from the Browse-tree code review (2026-07-12)
+
+Shipped clean — the final whole-branch review found no Critical/Important issues (XSS: every
+DB-derived interpolation `esc()`-ed or provably numeric; `duplicate_counts` injection-safe + within
+the bundled-SQLite variable limit at the 3000 cap; reads stay `open_readonly`; self-contained; no
+SHARED_JS collisions; `copies` never 0/1). Optional Minor follow-ups:
+
+- **`◆N` can over-promise on a filtered/capped view.** `copies` is a *global* active-copy count, but
+  the tree only shows the search/filter result set (capped at 3000). A file can show `◆2` while only
+  one copy is visible, and clicking then highlights just itself. Consider a tooltip nuance ("N copies
+  catalogued; not all shown") or counting visible-vs-global separately.
+- **Duplicate marker on non-active files.** With a `missing`/`quarantined` status filter, a shown file
+  whose hash has >1 *active* copy elsewhere still renders as `.leaf.dup`. Defensible ("this content is
+  duplicated"), just a subtle semantic.
+- **`countDups` recomputation.** Re-walks each subtree at every render level (~O(n·depth)); harmless at
+  the 3000-node cap. If the cap rises, memoize the per-node dup count during `buildTree`.
+- **Sibling name collisions in `buildTree`.** A loose file and an archive/folder sharing a name at the
+  same level produce two sibling nodes (or the archive reuses a plain-folder node without the 🗜 flag).
+  No crash, no file mis-attribution — purely cosmetic.
+- **Lazy per-folder loading (from the spec, deferred):** the tree is built from the capped result set;
+  a very large catalog would want server-side lazy expansion.
