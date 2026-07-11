@@ -215,6 +215,21 @@ fn check_csrf(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, 
     Ok(())
 }
 
+/// Current time as UNIX seconds; a clock error becomes a 500 (matches existing handler behavior).
+fn now_secs() -> Result<i64, (StatusCode, String)> {
+    Ok(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map_err(err500)?.as_secs() as i64)
+}
+
+/// Best-effort catalog snapshot after a mutation. Never fails the request — a snapshot error is
+/// swallowed, exactly as the inlined blocks did.
+fn snapshot_after_mutation(state: &AppState, now: i64) {
+    if let Ok(cfg) = crate::config::Config::default_paths() {
+        let _ = crate::catalog::backup::snapshot(&state.catalog_path, &cfg.backups_dir(),
+            cfg.snapshot_retention, now);
+    }
+}
+
 async fn api_search(State(state): State<AppState>, Query(p): Query<SearchParams>)
     -> Result<Json<Vec<HitDto>>, (axum::http::StatusCode, String)>
 {
@@ -433,8 +448,7 @@ async fn api_quarantine(State(state): State<AppState>, headers: HeaderMap, body:
     check_csrf(&headers, &state)?;
 
     let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map_err(err500)?.as_secs() as i64;
+    let now = now_secs()?;
 
     // Group requested ids by their volume; ids that don't resolve to a file are counted skipped.
     let mut by_volume: std::collections::HashMap<String, Vec<i64>> = std::collections::HashMap::new();
@@ -469,10 +483,7 @@ async fn api_quarantine(State(state): State<AppState>, headers: HeaderMap, body:
 
     // Snapshot the catalog this request actually mutated (best-effort; a snapshot failure
     // shouldn't fail the request).
-    if let Ok(cfg) = crate::config::Config::default_paths() {
-        let _ = crate::catalog::backup::snapshot(&state.catalog_path, &cfg.backups_dir(),
-            cfg.snapshot_retention, now);
-    }
+    snapshot_after_mutation(&state, now);
     Ok(Json(result))
 }
 
@@ -495,17 +506,13 @@ async fn api_repack(State(state): State<AppState>, headers: HeaderMap, body: Jso
         .ok_or((StatusCode::NOT_FOUND, "no such entry".to_string()))?;
     let mount = state.mounts.resolve(&rec.volume_id)
         .ok_or((StatusCode::CONFLICT, "drive not connected".to_string()))?;
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map_err(err500)?.as_secs() as i64;
+    let now = now_secs()?;
     let out = crate::repack::repack_entry(&cat, &mount, &rec.volume_id, body.entry_id, now)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     // Snapshot the catalog this request actually mutated (best-effort; a snapshot failure
     // shouldn't fail the request).
-    if let Ok(cfg) = crate::config::Config::default_paths() {
-        let _ = crate::catalog::backup::snapshot(&state.catalog_path, &cfg.backups_dir(),
-            cfg.snapshot_retention, now);
-    }
+    snapshot_after_mutation(&state, now);
     Ok(Json(RepackResultDto { removed_entry: out.removed_entry, retained_entries: out.retained_entries }))
 }
 
@@ -523,12 +530,8 @@ async fn api_forget_drive(State(state): State<AppState>, headers: HeaderMap, bod
 {
     check_csrf(&headers, &state)?;
     let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map_err(err500)?.as_secs() as i64;
-    if let Ok(cfg) = crate::config::Config::default_paths() {
-        let _ = crate::catalog::backup::snapshot(&state.catalog_path, &cfg.backups_dir(),
-            cfg.snapshot_retention, now);
-    }
+    let now = now_secs()?;
+    snapshot_after_mutation(&state, now);
     let removed = cat.forget_volume(&body.volume_id, now).map_err(err500)?;
     Ok(Json(ForgetResultDto { removed_files: removed }))
 }
@@ -550,12 +553,8 @@ async fn api_purge_all(State(state): State<AppState>, headers: HeaderMap)
 {
     check_csrf(&headers, &state)?;
     let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map_err(err500)?.as_secs() as i64;
-    if let Ok(cfg) = crate::config::Config::default_paths() {
-        let _ = crate::catalog::backup::snapshot(&state.catalog_path, &cfg.backups_dir(),
-            cfg.snapshot_retention, now);
-    }
+    let now = now_secs()?;
+    snapshot_after_mutation(&state, now);
     let out = crate::purge::purge_all(&cat, &state.mounts.snapshot(), now).map_err(err500)?;
     Ok(Json(PurgeAllResultDto {
         purged_volumes: out.purged.len(),
