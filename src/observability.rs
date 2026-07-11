@@ -35,6 +35,19 @@ pub fn make_request_span(req: &axum::http::Request<axum::body::Body>) -> tracing
     )
 }
 
+/// Test-only: a process-wide lock serializing the handful of tests that install a `tracing`
+/// subscriber via `set_default` and assert on its captured output. `tracing`'s callsite
+/// interest cache is global, and installing (or tearing down) a subscriber rebuilds it
+/// process-wide; letting two such tests overlap under the parallel test runner races that
+/// rebuild and can drop the very event a test asserts on. Holding this guard for the test's
+/// duration serializes only those tests — every other test still runs fully parallel.
+/// Poison-tolerant: a test panicking while holding it must not cascade-fail the others.
+#[cfg(test)]
+pub(crate) fn tracing_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

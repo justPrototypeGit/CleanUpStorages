@@ -1250,6 +1250,8 @@ mod tests {
     #[tokio::test]
     async fn request_is_traced_with_method_status_and_id() {
         use axum::body::Body; use axum::http::Request; use tower::ServiceExt;
+        // Serialize with other subscriber-installing tests (tracing's interest cache is global).
+        let _tracing_lock = crate::observability::tracing_test_guard();
         let (_t, db) = seed_catalog();
         let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sub = tracing_subscriber::fmt()
@@ -1273,6 +1275,8 @@ mod tests {
     #[tokio::test]
     async fn csrf_rejection_is_logged() {
         use axum::body::Body; use axum::http::Request; use tower::ServiceExt;
+        // Serialize with other subscriber-installing tests (tracing's interest cache is global).
+        let _tracing_lock = crate::observability::tracing_test_guard();
         let (_t, _db, state) = seed_dupes();
         let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sub = tracing_subscriber::fmt()
