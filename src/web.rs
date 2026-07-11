@@ -109,9 +109,12 @@ struct HitDto {
     container_chain: Option<String>,
     filename: String,
     volume_id: String,
+    volume_label: String,
     category: String,
     size_bytes: i64,
     status: String,
+    content_hash: String,
+    copies: Option<i64>,
 }
 
 impl From<FileRecord> for HitDto {
@@ -123,9 +126,12 @@ impl From<FileRecord> for HitDto {
             container_chain: f.container_chain,
             filename: f.filename,
             volume_id: f.volume_id,
+            volume_label: String::new(), // filled by the handler (needs the catalog's label map)
             category: f.category.as_str().to_string(),
             size_bytes: f.size_bytes,
             status: f.status.as_str().to_string(),
+            content_hash: f.content_hash,
+            copies: None, // filled by the handler (needs the global duplicate counts)
         }
     }
 }
@@ -242,7 +248,18 @@ async fn api_search(State(state): State<AppState>, Query(p): Query<SearchParams>
     };
     let limit = p.limit.unwrap_or(500).min(5000);
     let hits = cat.search_filtered(&filters, limit).map_err(err500)?;
-    Ok(Json(hits.into_iter().map(HitDto::from).collect()))
+    // Friendly drive names + which results are duplicated (global active-copy count).
+    let labels: std::collections::HashMap<String, String> = cat.volume_stats().map_err(err500)?
+        .into_iter().map(|(id, label, _, _)| (id, label)).collect();
+    let hashes: Vec<String> = hits.iter().map(|f| f.content_hash.clone()).collect();
+    let dupes = cat.duplicate_counts(&hashes).map_err(err500)?;
+    let out: Vec<HitDto> = hits.into_iter().map(|f| {
+        let mut dto = HitDto::from(f);
+        dto.volume_label = labels.get(&dto.volume_id).cloned().unwrap_or_else(|| dto.volume_id.clone());
+        dto.copies = dupes.get(&dto.content_hash).copied();
+        dto
+    }).collect();
+    Ok(Json(out))
 }
 
 /// Shared by /api/volumes and /api/stats so the two endpoints can't drift apart.
@@ -705,6 +722,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_search_enriches_label_hash_and_copies() {
+        let (_t, db, _state) = seed_dupes();
+        let v = get_json(&db, "/api/search").await; // empty query -> all files
+        let arr = v.as_array().unwrap();
+        assert!(arr.len() >= 2);
+        for h in arr {
+            assert_eq!(h["volume_label"], "Photos HDD");     // friendly name, not the id
+            assert_eq!(h["content_hash"], "DUP");
+            assert_eq!(h["copies"], 2);                       // both are duplicated (2 active copies)
+        }
+    }
+
+    #[tokio::test]
+    async fn api_search_copies_null_for_unique_file() {
+        let (_t, db) = seed_catalog(); // thesis.pdf (h1) + archived inner.jpg (h2): both unique
+        let v = get_json(&db, "/api/search?q=thesis").await;
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["volume_label"], "Test HDD");
+        assert!(arr[0]["copies"].is_null());
+    }
+
+    #[tokio::test]
     async fn api_volumes_lists_the_volume() {
         let (_t, db) = seed_catalog();
         let v = get_json(&db, "/api/volumes").await;
@@ -1157,6 +1197,8 @@ mod tests {
         assert!(body.contains("id=\"q\""), "search input present");
         assert!(body.contains("id=\"results\""), "results container present");
         assert!(body.contains("/api/search"), "page fetches the search API");
+        assert!(body.contains("buildTree") && body.contains("renderTree"), "renders a tree");
+        assert!(body.contains("class=\"tree\""), "tree container present");
         // self-contained: no external resource references
         assert!(!body.contains("http://"), "no external http resources");
         assert!(!body.contains("https://"), "no external https resources");
