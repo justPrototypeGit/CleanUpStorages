@@ -1,6 +1,6 @@
 //! Local, read-only web browse/search UI. Binds 127.0.0.1 only.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use axum::{Router, routing::{get, post}, extract::State, response::Html, Json, extract::Query};
 use axum::http::HeaderMap;
 use axum::extract::Path as AxPath;
@@ -374,25 +374,6 @@ async fn api_duplicates(State(state): State<AppState>)
     Ok(Json(out))
 }
 
-/// Decode any supported image, downscale to fit `max_dim` on the longest side, re-encode as JPEG.
-fn thumbnail_jpeg(bytes: &[u8], max_dim: u32) -> anyhow::Result<Vec<u8>> {
-    let img = image::load_from_memory(bytes)?;
-    let thumb = img.thumbnail(max_dim, max_dim); // preserves aspect ratio, never upsizes past bounds
-    let mut out = std::io::Cursor::new(Vec::new());
-    thumb.write_to(&mut out, image::ImageFormat::Jpeg)?;
-    Ok(out.into_inner())
-}
-
-/// Read one top-level entry's bytes from a zip archive.
-fn read_zip_entry(archive_path: &Path, entry_name: &str) -> anyhow::Result<Vec<u8>> {
-    let file = std::fs::File::open(archive_path)?;
-    let mut zip = zip::ZipArchive::new(file)?;
-    let mut entry = zip.by_name(entry_name)?;
-    let mut buf = Vec::new();
-    std::io::Read::read_to_end(&mut entry, &mut buf)?;
-    Ok(buf)
-}
-
 const PREVIEW_MAX_DIM: u32 = 320;
 
 /// Photo thumbnail for a file that is: a photo, mounted, and either loose or a top-level
@@ -417,12 +398,12 @@ async fn api_preview(State(state): State<AppState>, AxPath(id): AxPath<i64>) -> 
 
     let bytes = match &rec.container_chain {
         None => std::fs::read(mount.join(&rec.relative_path)).ok(),
-        Some(chain) if !chain.contains(" › ") => read_zip_entry(&mount.join(&rec.relative_path), chain).ok(),
+        Some(chain) if !chain.contains(" › ") => crate::image_preview::read_zip_entry(&mount.join(&rec.relative_path), chain).ok(),
         Some(_) => return not_found("nested-archive preview not supported"),
     };
     let Some(bytes) = bytes else { return not_found("file unavailable") };
 
-    match thumbnail_jpeg(&bytes, PREVIEW_MAX_DIM) {
+    match crate::image_preview::thumbnail_jpeg(&bytes, PREVIEW_MAX_DIM) {
         Ok(jpeg) => ([(header::CONTENT_TYPE, "image/jpeg")], jpeg).into_response(),
         Err(_) => not_found("not a decodable image"),
     }
@@ -816,18 +797,6 @@ mod tests {
         image::DynamicImage::ImageRgb8(img)
             .write_to(&mut buf, image::ImageFormat::Png).unwrap();
         buf.into_inner()
-    }
-
-    #[test]
-    fn thumbnail_downscales_and_encodes_jpeg() {
-        // a 100x40 image thumbnails to <=32px longest side, and the output decodes as JPEG.
-        let img = image::RgbImage::from_pixel(100, 40, image::Rgb([0, 128, 255]));
-        let mut src = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgb8(img).write_to(&mut src, image::ImageFormat::Png).unwrap();
-        let thumb = thumbnail_jpeg(&src.into_inner(), 32).unwrap();
-        let decoded = image::load_from_memory(&thumb).unwrap();
-        assert!(decoded.width() <= 32 && decoded.height() <= 32);
-        assert!(decoded.width() >= 1);
     }
 
     #[tokio::test]
