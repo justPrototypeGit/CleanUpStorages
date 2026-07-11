@@ -6,8 +6,9 @@ pub const STYLE: &str = r##"
 :root{color-scheme:light dark;--bg:#f5f5f7;--panel:#ffffffcc;--content:#ffffff;--fg:#1d1d1f;
  --mut:#6e6e73;--line:#1d1d1f1a;--accent:#0071e3;--amber:#b45309;--amber-bg:#f59e0b26;
  --red:#c0392b;--red-bg:#e74c3c22;--green:#1a7f37;--green-bg:#2ecc7122;--gray:#6e6e73;}
-@media (prefers-color-scheme:dark){:root{--bg:#000;--panel:#1d1d1fcc;--content:#1d1d1f;
- --fg:#f5f5f7;--mut:#98989d;--line:#ffffff1a;--accent:#0a84ff;}}
+@media (prefers-color-scheme:dark){:root{--bg:#1c1c1e;--panel:#1d1d1fcc;--content:#2c2c2e;
+ --fg:#f5f5f7;--mut:#98989d;--line:#ffffff1a;--accent:#0a84ff;
+ --amber:#ff9f0a;--amber-bg:#ff9f0a26;--red:#ff453a;--red-bg:#ff453a26;--green:#30d158;--green-bg:#30d15826;--gray:#98989d;}}
 *{box-sizing:border-box;}
 body{margin:0;font:14px/1.45 -apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--fg);}
 .mono{font-family:ui-monospace,"Cascadia Code","SF Mono",Consolas,monospace;font-variant-numeric:tabular-nums;}
@@ -58,6 +59,21 @@ th{color:var(--mut);font-weight:600;font-size:12px;text-transform:uppercase;lett
  background:#0002;border-radius:8px;font-size:12px;text-align:center;padding:8px;}
 .badge{font-size:11px;color:var(--accent);font-weight:600;margin-top:8px;display:block;}
 .arch{color:var(--mut);font-size:11px;margin-top:8px;}
+.branch{margin-left:14px;border-left:1px solid var(--line);padding-left:8px;}
+details.drive>summary,details.folder>summary{cursor:pointer;padding:4px 6px;border-radius:6px;
+ list-style:none;display:flex;align-items:center;gap:8px;user-select:none;}
+details>summary::-webkit-details-marker{display:none;}
+details>summary::before{content:"\25B8";color:var(--mut);font-size:11px;width:10px;transition:transform .12s;}
+details[open]>summary::before{transform:rotate(90deg);}
+details.drive>summary:hover,details.folder>summary:hover{background:var(--line);}
+.dot{width:10px;height:10px;border-radius:50%;flex:none;}
+.leaf{display:flex;align-items:center;gap:8px;padding:3px 6px 3px 24px;border-radius:6px;cursor:default;}
+.leaf:hover{background:var(--line);}
+.leaf .fname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.leaf .meta{font-size:12px;white-space:nowrap;}
+.leaf.dup{background:color-mix(in srgb,var(--dup) 9%,transparent);cursor:pointer;}
+.leaf.hl{background:color-mix(in srgb,var(--dup) 24%,transparent);box-shadow:inset 0 0 0 1px var(--dup);}
+.diamond{font-size:11px;font-weight:600;color:var(--dup);flex:none;}
 "##;
 
 pub const SHARED_JS: &str = r##"
@@ -66,6 +82,9 @@ const CSRF=(document.querySelector('meta[name="csrf"]')||{}).content||"";
 function esc(s){return (s==null?"":String(s)).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
 function fmtSize(n){if(n==null)return"—";const u=["B","KB","MB","GB","TB"];let i=0,x=Number(n);while(x>=1024&&i<u.length-1){x/=1024;i++;}return (i?x.toFixed(1):x)+" "+u[i];}
 function fmtDate(t){return t?new Date(t*1000).toISOString().slice(0,10):"—";}
+function hueOf(s){let h=0;for(let i=0;i<String(s).length;i++)h=(h*31+String(s).charCodeAt(i))>>>0;return h%360;}
+function driveColor(id){return `hsl(${hueOf(id)},60%,55%)`;}
+function dupColor(hash){return `hsl(${hueOf(hash)},72%,52%)`;}
 async function apiGet(u){const r=await fetch(u);if(!r.ok)throw new Error(await r.text());return r.json();}
 async function apiPost(u,body){const r=await fetch(u,{method:"POST",headers:{"content-type":"application/json","x-cleanup-token":CSRF},body:JSON.stringify(body||{})});if(!r.ok)throw new Error(await r.text());return r.json();}
 "##;
@@ -140,7 +159,7 @@ async function init(){
   $("#dupe-reclaim").textContent="~"+fmtSize(totalReclaim)+" reclaimable";
   const max=Math.max(1,...drives.map(d=>d.reclaimable_bytes||0));
   $("#reclaim-bars").innerHTML=drives.map(d=>`<div style="margin:10px 0">
-     <div style="display:flex;justify-content:space-between"><span>${esc(d.label)}</span><span class="mono">${fmtSize(d.reclaimable_bytes)}</span></div>
+     <div style="display:flex;justify-content:space-between"><span><span class="dot" style="background:${driveColor(d.volume_id)};display:inline-block;margin-right:6px"></span>${esc(d.label)}</span><span class="mono">${fmtSize(d.reclaimable_bytes)}</span></div>
      <div class="progressbar"><span style="width:${Math.round(100*(d.reclaimable_bytes||0)/max)}%"></span></div></div>`).join("")||'<span class="mut">Nothing to reclaim.</span>';
   const acts=await apiGet("/api/activity");
   $("#activity").innerHTML=acts.length?acts.map(a=>`<div style="padding:6px 0;border-bottom:1px solid var(--line)">
@@ -163,21 +182,69 @@ pub fn browse_page(csrf: &str) -> String {
     <option value="quarantined">Quarantined</option><option value="purged">Purged</option></select>
 </div>
 <div class="mut" id="count" style="margin-bottom:8px"></div>
-<div class="card" style="padding:0"><table><thead><tr>
-  <th>Location</th><th>Drive</th><th>Type</th><th style="text-align:right">Size</th><th>Status</th>
-</tr></thead><tbody id="results"></tbody></table></div>"##;
+<div class="mut" style="font-size:12px;margin-bottom:8px">Files sharing content share a <span class="diamond" style="--dup:hsl(280,72%,52%)">◆</span> color — click one to highlight its copies.</div>
+<div class="card" style="padding:10px"><div id="results" class="tree"></div></div>"##;
     let script = r##"
 let timer=null;
+// --- data -> tree model (pure) ---
+function buildTree(hits){
+  const drives=new Map();
+  for(const h of hits){
+    if(!drives.has(h.volume_id)) drives.set(h.volume_id,{id:h.volume_id,label:h.volume_label||h.volume_id,size:0,children:new Map(),files:[]});
+    const drive=drives.get(h.volume_id); drive.size+=(h.size_bytes||0);
+    const segs=String(h.relative_path||"").split('/').filter(Boolean);
+    const last=segs.pop()||h.filename||"(file)";
+    let node=drive;
+    for(const seg of segs){ if(!node.children.has(seg)) node.children.set(seg,{name:seg,children:new Map(),files:[]}); node=node.children.get(seg); }
+    if(h.container_chain){
+      if(!node.children.has(last)) node.children.set(last,{name:last,archive:true,children:new Map(),files:[]});
+      node.children.get(last).files.push({name:h.container_chain,hit:h});
+    } else { node.files.push({name:last,hit:h}); }
+  }
+  return drives;
+}
+function countDups(node){ let n=node.files.filter(f=>f.hit.copies).length; for(const c of node.children.values()) n+=countDups(c); return n; }
+// --- model -> HTML (pure; every interpolation esc()'d) ---
+function renderLeaf(f){
+  const h=f.hit;
+  const dia=h.copies?`<span class="diamond" style="--dup:${dupColor(h.content_hash)}" title="${h.copies} copies">◆${h.copies}</span>`:"";
+  const pill=h.status!=="active"?`<span class="pill ${esc(h.status)}">${esc(h.status)}</span>`:"";
+  const cls=h.copies?"leaf dup":"leaf";
+  const style=h.copies?`style="--dup:${dupColor(h.content_hash)}"`:"";
+  return `<div class="${cls}" data-hash="${esc(h.content_hash)}" ${style}><span class="fname">${esc(f.name)}</span>${dia}<span class="meta mut">${fmtSize(h.size_bytes)}</span>${pill}</div>`;
+}
+function renderFolder(node){
+  let html='<div class="branch">';
+  for(const child of node.children.values()){
+    const d=countDups(child); const badge=d?` <span class="mut" style="font-size:11px">${d} dup</span>`:"";
+    html+=`<details class="folder"><summary>${child.archive?"🗜 ":""}${esc(child.name)}${badge}</summary>${renderFolder(child)}</details>`;
+  }
+  for(const f of node.files) html+=renderLeaf(f);
+  return html+'</div>';
+}
+function renderTree(drives){
+  if(!drives.size) return '<div class="mut" style="padding:12px">No files match.</div>';
+  let html="";
+  for(const drive of drives.values()){
+    html+=`<details class="drive" open><summary><span class="dot" style="background:${driveColor(drive.id)}"></span><b>${esc(drive.label)}</b> <span class="mut">${fmtSize(drive.size)}</span></summary>${renderFolder(drive)}</details>`;
+  }
+  return html;
+}
 async function run(){ try{
   const p=new URLSearchParams(); const q=$("#q").value.trim(); if(q)p.set("q",q);
   for(const k of ["volume","category","status"]){ const v=$("#"+k).value; if(v)p.set(k,v); }
+  p.set("limit","3000");
   const hits=await apiGet("/api/search?"+p.toString());
-  $("#count").textContent=hits.length+" result"+(hits.length===1?"":"s")+(hits.length>=500?" (showing first 500)":"");
-  $("#results").innerHTML=hits.map(h=>{
-    const pill=h.status==="active"?"":`<span class="pill ${esc(h.status)}">${esc(h.status)}</span>`;
-    return `<tr><td class="mono">${esc(h.location)}</td><td>${esc(h.volume_id)}</td><td>${esc(h.category)}</td>
-      <td class="mono" style="text-align:right">${fmtSize(h.size_bytes)}</td><td>${pill}</td></tr>`; }).join("");
+  $("#count").textContent=hits.length+" result"+(hits.length===1?"":"s")+(hits.length>=3000?" (showing first 3000 — refine your search)":"");
+  $("#results").innerHTML=renderTree(buildTree(hits));
 }catch(e){ $("#count").textContent="Search error: "+e; } }
+// click a duplicated leaf -> highlight every visible copy (same content hash)
+$("#results").addEventListener("click",e=>{
+  const leaf=e.target.closest(".leaf.dup"); if(!leaf)return;
+  const hash=leaf.dataset.hash, was=leaf.classList.contains("hl");
+  document.querySelectorAll(".leaf.hl").forEach(el=>el.classList.remove("hl"));
+  if(!was) document.querySelectorAll('.leaf[data-hash="'+CSS.escape(hash)+'"]').forEach(el=>el.classList.add("hl"));
+});
 function debounced(){ clearTimeout(timer); timer=setTimeout(run,180); }
 async function init(){
   const vs=await apiGet("/api/volumes"); const sel=$("#volume");
@@ -276,7 +343,7 @@ async function load(){
   const drives=await apiGet("/api/drives");
   $("#drives").innerHTML = drives.length? drives.map(d=>`<div class="card" data-vid="${esc(d.volume_id)}" data-path="${esc(d.mount_path||'')}">
     <div style="display:flex;justify-content:space-between;align-items:start">
-      <div><h3 style="margin:0">${esc(d.label)}</h3>
+      <div><h3 style="margin:0;display:flex;align-items:center;gap:8px"><span class="dot" style="background:${driveColor(d.volume_id)}"></span>${esc(d.label)}</h3>
         <div class="mut" style="font-size:12px">${d.connected?'<span class="pill active">connected</span>':'<span class="pill purged">offline</span>'}
           · ${d.active_files.toLocaleString()} files · last scan ${fmtDate(d.last_seen_at)}
           ${d.has_errors?' · <span class="pill missing">had scan errors</span>':''}</div></div>
