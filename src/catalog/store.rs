@@ -15,6 +15,13 @@ pub struct SearchFilters {
     pub modified_before: Option<i64>,
 }
 
+/// The full `files` column list, in one place. Every full-row SELECT uses this; the mapper
+/// (`map_file_record`) reads results by column NAME, so this list and the mapper cannot drift.
+const FILE_COLUMNS: &str =
+    "id, volume_id, relative_path, filename, extension, size_bytes, content_hash, \
+     created_time, modified_time, accessed_time, category, container_chain, \
+     status, first_seen_at, last_seen_at, original_path";
+
 impl Catalog {
     pub fn upsert_volume(&self, v: &Volume) -> anyhow::Result<()> {
         self.conn.execute(
@@ -146,7 +153,7 @@ impl Catalog {
     pub fn duplicate_group_count(&self) -> anyhow::Result<i64> {
         let n = self.conn.query_row(
             "SELECT count(*) FROM (SELECT content_hash FROM files
-                 WHERE status IN ('active','missing') GROUP BY content_hash HAVING count(*) > 1)",
+                 WHERE status='active' GROUP BY content_hash HAVING count(*) > 1)",
             [], |r| r.get(0),
         )?;
         Ok(n)
@@ -182,11 +189,7 @@ impl Catalog {
 
     /// Full filtered search over the catalog.
     pub fn search_filtered(&self, f: &SearchFilters, limit: usize) -> anyhow::Result<Vec<FileRecord>> {
-        let mut sql = String::from(
-            "SELECT id, volume_id, relative_path, filename, extension, size_bytes, content_hash,
-                    created_time, modified_time, accessed_time, category, container_chain,
-                    status, first_seen_at, last_seen_at, original_path FROM files WHERE 1=1",
-        );
+        let mut sql = format!("SELECT {FILE_COLUMNS} FROM files WHERE 1=1");
         let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         let q = f.query.trim();
         if !q.is_empty() {
@@ -214,13 +217,10 @@ impl Catalog {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Id of the loose file at this path, if catalogued, regardless of status.
-    ///
-    /// Not part of this task's brief, but required by its own tests (and every
-    /// downstream quarantine/purge task): it was specified in the Phase 1a plan
-    /// but never actually implemented. Added here as a small, fully-specified
-    /// helper rather than blocking on it.
-    pub fn active_file_id(&self, volume_id: &str, relative_path: &str) -> anyhow::Result<Option<i64>> {
+    /// Id of the loose file (container_chain IS NULL) at this path, if catalogued, regardless of
+    /// status. Exactly one such row can exist per (volume, path) — the loose-identity partial
+    /// unique index guarantees it.
+    pub fn loose_file_id(&self, volume_id: &str, relative_path: &str) -> anyhow::Result<Option<i64>> {
         let row = self.conn.query_row(
             "SELECT id FROM files WHERE volume_id=?1 AND relative_path=?2 AND container_chain IS NULL",
             params![volume_id, relative_path],
@@ -236,9 +236,7 @@ impl Catalog {
     /// Fetch a single file record by id.
     pub fn get_file(&self, id: i64) -> anyhow::Result<Option<FileRecord>> {
         let row = self.conn.query_row(
-            "SELECT id, volume_id, relative_path, filename, extension, size_bytes, content_hash,
-                    created_time, modified_time, accessed_time, category, container_chain,
-                    status, first_seen_at, last_seen_at, original_path FROM files WHERE id=?1",
+            &format!("SELECT {FILE_COLUMNS} FROM files WHERE id=?1"),
             params![id], Self::map_file_record,
         );
         match row {
@@ -252,13 +250,13 @@ impl Catalog {
     /// ordered by hash then id. Consecutive rows with the same hash form a group.
     pub fn duplicate_groups(&self) -> anyhow::Result<Vec<Vec<FileRecord>>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, volume_id, relative_path, filename, extension, size_bytes, content_hash,
-                    created_time, modified_time, accessed_time, category, container_chain,
-                    status, first_seen_at, last_seen_at, original_path FROM files
+            &format!(
+                "SELECT {FILE_COLUMNS} FROM files
              WHERE status='active' AND content_hash IN (
                  SELECT content_hash FROM files WHERE status='active'
                  GROUP BY content_hash HAVING count(*) > 1)
-             ORDER BY content_hash, id",
+             ORDER BY content_hash, id"
+            ),
         )?;
         let rows = stmt.query_map([], Self::map_file_record)?
             .collect::<Result<Vec<_>, _>>()?;
@@ -292,10 +290,10 @@ impl Catalog {
     /// All currently-active rows sharing this content hash (loose or archived).
     pub fn active_copies(&self, hash: &str) -> anyhow::Result<Vec<FileRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, volume_id, relative_path, filename, extension, size_bytes, content_hash,
-                    created_time, modified_time, accessed_time, category, container_chain,
-                    status, first_seen_at, last_seen_at, original_path FROM files
-             WHERE content_hash=?1 AND status='active' ORDER BY id")?;
+            &format!(
+                "SELECT {FILE_COLUMNS} FROM files
+             WHERE content_hash=?1 AND status='active' ORDER BY id"
+            ))?;
         let rows = stmt.query_map(rusqlite::params![hash], Self::map_file_record)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
@@ -327,11 +325,11 @@ impl Catalog {
     /// relative_path with a non-null container_chain).
     pub fn archive_entries(&self, volume_id: &str, archive_rel_path: &str) -> anyhow::Result<Vec<FileRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, volume_id, relative_path, filename, extension, size_bytes, content_hash,
-                    created_time, modified_time, accessed_time, category, container_chain,
-                    status, first_seen_at, last_seen_at, original_path FROM files
+            &format!(
+                "SELECT {FILE_COLUMNS} FROM files
              WHERE volume_id=?1 AND relative_path=?2 AND container_chain IS NOT NULL AND status='active'
-             ORDER BY id")?;
+             ORDER BY id"
+            ))?;
         let rows = stmt.query_map(params![volume_id, archive_rel_path], Self::map_file_record)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
@@ -348,10 +346,10 @@ impl Catalog {
     /// All quarantined rows for a volume, ordered by id.
     pub fn quarantined_rows(&self, volume_id: &str) -> anyhow::Result<Vec<FileRecord>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, volume_id, relative_path, filename, extension, size_bytes, content_hash,
-                    created_time, modified_time, accessed_time, category, container_chain,
-                    status, first_seen_at, last_seen_at, original_path FROM files
-             WHERE volume_id=?1 AND status='quarantined' ORDER BY id",
+            &format!(
+                "SELECT {FILE_COLUMNS} FROM files
+             WHERE volume_id=?1 AND status='quarantined' ORDER BY id"
+            ),
         )?;
         let rows = stmt.query_map(params![volume_id], Self::map_file_record)?
             .collect::<Result<Vec<_>, _>>()?;
@@ -412,22 +410,22 @@ impl Catalog {
 
     fn map_file_record(r: &rusqlite::Row) -> rusqlite::Result<FileRecord> {
         Ok(FileRecord {
-            id: r.get(0)?,
-            volume_id: r.get(1)?,
-            relative_path: r.get(2)?,
-            filename: r.get(3)?,
-            extension: r.get(4)?,
-            size_bytes: r.get(5)?,
-            content_hash: r.get(6)?,
-            created_time: r.get(7)?,
-            modified_time: r.get(8)?,
-            accessed_time: r.get(9)?,
-            category: Category::from_db(&r.get::<_, String>(10)?),
-            container_chain: r.get(11)?,
-            status: FileStatus::from_db(&r.get::<_, String>(12)?),
-            first_seen_at: r.get(13)?,
-            last_seen_at: r.get(14)?,
-            original_path: r.get(15)?,
+            id: r.get("id")?,
+            volume_id: r.get("volume_id")?,
+            relative_path: r.get("relative_path")?,
+            filename: r.get("filename")?,
+            extension: r.get("extension")?,
+            size_bytes: r.get("size_bytes")?,
+            content_hash: r.get("content_hash")?,
+            created_time: r.get("created_time")?,
+            modified_time: r.get("modified_time")?,
+            accessed_time: r.get("accessed_time")?,
+            category: Category::from_db(&r.get::<_, String>("category")?),
+            container_chain: r.get("container_chain")?,
+            status: FileStatus::from_db(&r.get::<_, String>("status")?),
+            first_seen_at: r.get("first_seen_at")?,
+            last_seen_at: r.get("last_seen_at")?,
+            original_path: r.get("original_path")?,
         })
     }
 }
@@ -505,6 +503,27 @@ mod tests {
         cat.upsert_file(&mk_file("vol-1", "b.txt", "same"), 200).unwrap();
         cat.upsert_file(&mk_file("vol-1", "c.txt", "unique"), 200).unwrap();
         assert_eq!(cat.duplicate_group_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn duplicate_group_count_ignores_all_missing_groups() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_volume(&crate::catalog::models::Volume {
+            volume_id: "v".into(), label: "V".into(), identified_by: "marker".into(),
+            first_seen_at: 1, last_seen_at: 1 }).unwrap();
+        // Two files sharing a hash, both marked missing -> not a reviewable group.
+        let mut f = crate::catalog::models::NewFile {
+            volume_id: "v".into(), relative_path: "a".into(), filename: "a".into(),
+            extension: "".into(), size_bytes: 1, content_hash: "dup".into(),
+            created_time: None, modified_time: None, accessed_time: None,
+            category: crate::category::Category::Other, container_chain: None };
+        cat.upsert_file(&f, 1).unwrap();
+        f.relative_path = "b".into(); f.filename = "b".into();
+        cat.upsert_file(&f, 1).unwrap();
+        // Both rows have last_seen_at=1; a scan starting at 300 sweeps anything not seen this pass
+        // (last_seen_at < 300) to missing. Signature: mark_missing_scanned(volume_id, scan_started_at, now).
+        cat.mark_missing_scanned("v", 300, 300).unwrap();
+        assert_eq!(cat.duplicate_group_count().unwrap(), 0); // active-only: no reviewable groups
     }
 
     #[test]
@@ -664,7 +683,7 @@ mod tests {
         let (_t, cat) = open_tmp();
         let mut f = mk_file("vol-1", "Photos/a.jpg", "h"); f.size_bytes = 2048;
         cat.upsert_file(&f, 200).unwrap();
-        let id = cat.active_file_id("vol-1", "Photos/a.jpg").unwrap().unwrap();
+        let id = cat.loose_file_id("vol-1", "Photos/a.jpg").unwrap().unwrap();
 
         cat.mark_quarantined(id, "_ToDelete/Photos/a.jpg", "Photos/a.jpg", 300).unwrap();
         let rec = cat.get_file(id).unwrap().unwrap();
@@ -770,7 +789,7 @@ mod tests {
     fn update_archive_hash_changes_hash_and_size() {
         let (_t, cat) = open_tmp();
         cat.upsert_file(&mk_file("vol-1", "a.zip", "OLD"), 100).unwrap();
-        let id = cat.active_file_id("vol-1", "a.zip").unwrap().unwrap();
+        let id = cat.loose_file_id("vol-1", "a.zip").unwrap().unwrap();
         cat.update_archive_hash(id, "NEW", 999, 200).unwrap();
         let rec = cat.get_file(id).unwrap().unwrap();
         assert_eq!(rec.content_hash, "NEW");

@@ -27,13 +27,31 @@ fn now_secs() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
 }
 
-pub fn cmd_scan(path: &Path, force: bool, fallback: ReadonlyFallback) -> anyhow::Result<()> {
+/// Open the config and catalog — the prologue every command shares.
+fn open_catalog() -> anyhow::Result<(Config, Catalog)> {
     let cfg = Config::default_paths()?;
     let cat = Catalog::open(&cfg.catalog_path)?;
+    Ok((cfg, cat))
+}
+
+/// Like `open_catalog`, plus the integrity guard used before scanning/serving: refuse to act on a
+/// catalog that fails its check and point at the snapshots.
+fn open_catalog_checked() -> anyhow::Result<(Config, Catalog)> {
+    let (cfg, cat) = open_catalog()?;
     if !cat.integrity_ok()? {
         anyhow::bail!("catalog failed integrity check; restore the latest snapshot from {}",
             cfg.backups_dir().display());
     }
+    Ok((cfg, cat))
+}
+
+/// Timestamped catalog snapshot (the CLI's audit/rollback point).
+fn snapshot(cfg: &Config, now: i64) -> anyhow::Result<std::path::PathBuf> {
+    backup::snapshot(&cfg.catalog_path, &cfg.backups_dir(), cfg.snapshot_retention, now)
+}
+
+pub fn cmd_scan(path: &Path, force: bool, fallback: ReadonlyFallback) -> anyhow::Result<()> {
+    let (cfg, cat) = open_catalog_checked()?;
     let now = now_secs();
     match scanner::run_scan(&cat, path, force, fallback.into(), now, None)? {
         None => { println!("Skipped read-only drive at {}", path.display()); return Ok(()); }
@@ -43,7 +61,7 @@ pub fn cmd_scan(path: &Path, force: bool, fallback: ReadonlyFallback) -> anyhow:
                 s.hashed, s.skipped, s.errors, s.marked_missing, s.archive_entries);
         }
     }
-    let snap = backup::snapshot(&cfg.catalog_path, &cfg.backups_dir(), cfg.snapshot_retention, now)?;
+    let snap = snapshot(&cfg, now)?;
     println!("Catalog snapshot: {}", snap.display());
     Ok(())
 }
@@ -51,8 +69,7 @@ pub fn cmd_scan(path: &Path, force: bool, fallback: ReadonlyFallback) -> anyhow:
 pub fn cmd_search(query: &str, category: Option<&str>, volume: Option<&str>, status: Option<&str>)
     -> anyhow::Result<()>
 {
-    let cfg = Config::default_paths()?;
-    let cat = Catalog::open(&cfg.catalog_path)?;
+    let (_cfg, cat) = open_catalog()?;
     let hits = cat.search(query, category, volume, status)?;
     if hits.is_empty() {
         println!("No matches.");
@@ -77,8 +94,7 @@ pub fn cmd_search(query: &str, category: Option<&str>, volume: Option<&str>, sta
 }
 
 pub fn cmd_status() -> anyhow::Result<()> {
-    let cfg = Config::default_paths()?;
-    let cat = Catalog::open(&cfg.catalog_path)?;
+    let (_cfg, cat) = open_catalog()?;
     let groups = cat.duplicate_group_count()?;
     println!("Duplicate groups (same content hash): {groups}");
     println!("Per-volume (active files):");
@@ -91,8 +107,7 @@ pub fn cmd_status() -> anyhow::Result<()> {
 }
 
 pub fn cmd_duplicates() -> anyhow::Result<()> {
-    let cfg = Config::default_paths()?;
-    let cat = Catalog::open(&cfg.catalog_path)?;
+    let (_cfg, cat) = open_catalog()?;
     let groups = cat.duplicate_groups()?;
     if groups.is_empty() { println!("No duplicate groups."); return Ok(()); }
     for group in &groups {
@@ -107,24 +122,22 @@ pub fn cmd_duplicates() -> anyhow::Result<()> {
 }
 
 pub fn cmd_quarantine(mount: &Path, ids: &[i64]) -> anyhow::Result<()> {
-    let cfg = Config::default_paths()?;
-    let cat = Catalog::open(&cfg.catalog_path)?;
+    let (cfg, cat) = open_catalog()?;
     let vid = crate::volume::read_volume_id(mount)
         .ok_or_else(|| anyhow::anyhow!("no identity marker at {}; scan the drive first", mount.display()))?;
     let now = now_secs();
     let out = quarantine::quarantine_files(&cat, mount, &vid, ids, now)?;
     println!("Quarantined {} file(s), skipped {}.", out.quarantined, out.skipped);
-    let snap = backup::snapshot(&cfg.catalog_path, &cfg.backups_dir(), cfg.snapshot_retention, now)?;
+    let snap = snapshot(&cfg, now)?;
     println!("Catalog snapshot: {}", snap.display());
     Ok(())
 }
 
 pub fn cmd_purge(mount: Option<&Path>, all: bool) -> anyhow::Result<()> {
-    let cfg = Config::default_paths()?;
-    let cat = Catalog::open(&cfg.catalog_path)?;
+    let (cfg, cat) = open_catalog()?;
     let now = now_secs();
     // snapshot BEFORE the irreversible delete
-    let snap = backup::snapshot(&cfg.catalog_path, &cfg.backups_dir(), cfg.snapshot_retention, now)?;
+    let snap = snapshot(&cfg, now)?;
     println!("Catalog snapshot (pre-purge): {}", snap.display());
     if all {
         let mounts = crate::mounts::live_mounts();
@@ -144,12 +157,11 @@ pub fn cmd_purge(mount: Option<&Path>, all: bool) -> anyhow::Result<()> {
 }
 
 pub fn cmd_forget(mount: &Path) -> anyhow::Result<()> {
-    let cfg = Config::default_paths()?;
-    let cat = Catalog::open(&cfg.catalog_path)?;
+    let (cfg, cat) = open_catalog()?;
     let vid = crate::volume::read_volume_id(mount)
         .ok_or_else(|| anyhow::anyhow!("no identity marker at {}; nothing to forget", mount.display()))?;
     let now = now_secs();
-    let snap = backup::snapshot(&cfg.catalog_path, &cfg.backups_dir(), cfg.snapshot_retention, now)?;
+    let snap = snapshot(&cfg, now)?;
     println!("Catalog snapshot (pre-forget): {}", snap.display());
     let removed = cat.forget_volume(&vid, now)?;
     println!("Forgot volume {vid}: removed {removed} catalog entries. Files on disk are untouched; rescan to re-add.");
@@ -157,13 +169,12 @@ pub fn cmd_forget(mount: &Path) -> anyhow::Result<()> {
 }
 
 pub fn cmd_repack(mount: &Path, entry_id: i64) -> anyhow::Result<()> {
-    let cfg = Config::default_paths()?;
-    let cat = Catalog::open(&cfg.catalog_path)?;
+    let (cfg, cat) = open_catalog()?;
     let vid = crate::volume::read_volume_id(mount)
         .ok_or_else(|| anyhow::anyhow!("no identity marker at {}; scan the drive first", mount.display()))?;
     let now = now_secs();
     // snapshot BEFORE modifying an archive
-    let snap = backup::snapshot(&cfg.catalog_path, &cfg.backups_dir(), cfg.snapshot_retention, now)?;
+    let snap = snapshot(&cfg, now)?;
     println!("Catalog snapshot (pre-repack): {}", snap.display());
     let out = repack::repack_entry(&cat, mount, &vid, entry_id, now)?;
     println!("Repacked: removed '{}', {} entries retained. Original archive and removed item saved in _ToDelete (recoverable until purge).",
@@ -172,12 +183,7 @@ pub fn cmd_repack(mount: &Path, entry_id: i64) -> anyhow::Result<()> {
 }
 
 pub fn cmd_browse(open: bool) -> anyhow::Result<()> {
-    let cfg = Config::default_paths()?;
-    let cat = Catalog::open(&cfg.catalog_path)?;
-    if !cat.integrity_ok()? {
-        anyhow::bail!("catalog failed integrity check; restore the latest snapshot from {}",
-            cfg.backups_dir().display());
-    }
+    let (cfg, cat) = open_catalog_checked()?;
     drop(cat); // handlers open their own short-lived connections
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(web::serve(cfg.catalog_path.clone(), open))

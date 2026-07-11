@@ -145,7 +145,7 @@ mod tests {
         let (tmp, cat, root) = fake_drive();
         let root = std::path::PathBuf::from(root);
         // pick the id of Photos/a.jpg
-        let id = cat.active_file_id("vol-1", "Photos/a.jpg").unwrap().unwrap();
+        let id = cat.loose_file_id("vol-1", "Photos/a.jpg").unwrap().unwrap();
         let out = quarantine_files(&cat, &root, "vol-1", &[id], 200).unwrap();
         assert_eq!(out, QuarantineOutcome { quarantined: 1, skipped: 0 });
         // file moved
@@ -164,8 +164,8 @@ mod tests {
     fn refuses_to_quarantine_the_last_copy() {
         let (tmp, cat, root) = fake_drive();
         let root = std::path::PathBuf::from(root);
-        let a = cat.active_file_id("vol-1", "Photos/a.jpg").unwrap().unwrap();
-        let b = cat.active_file_id("vol-1", "copy_a.jpg").unwrap().unwrap();
+        let a = cat.loose_file_id("vol-1", "Photos/a.jpg").unwrap().unwrap();
+        let b = cat.loose_file_id("vol-1", "copy_a.jpg").unwrap().unwrap();
         // trying to quarantine BOTH members leaves no survivor -> second is skipped
         let out = quarantine_files(&cat, &root, "vol-1", &[a, b], 200).unwrap();
         assert_eq!(out.quarantined, 1);
@@ -181,7 +181,7 @@ mod tests {
     fn wrong_marker_aborts() {
         let (tmp, cat, root) = fake_drive();
         let root = std::path::PathBuf::from(root);
-        let id = cat.active_file_id("vol-1", "Photos/a.jpg").unwrap().unwrap();
+        let id = cat.loose_file_id("vol-1", "Photos/a.jpg").unwrap().unwrap();
         let err = quarantine_files(&cat, &root, "vol-DIFFERENT", &[id], 200);
         assert!(err.is_err());
         assert!(root.join("Photos/a.jpg").exists()); // nothing moved
@@ -213,7 +213,7 @@ mod tests {
         let root = std::path::PathBuf::from(root);
         // user deletes the OTHER copy outside the tool; catalog still thinks it's active
         std::fs::remove_file(root.join("copy_a.jpg")).unwrap();
-        let a = cat.active_file_id("vol-1", "Photos/a.jpg").unwrap().unwrap();
+        let a = cat.loose_file_id("vol-1", "Photos/a.jpg").unwrap().unwrap();
         let out = quarantine_files(&cat, &root, "vol-1", &[a], 200).unwrap();
         assert_eq!(out.quarantined, 0);
         assert_eq!(out.skipped, 1);
@@ -232,13 +232,13 @@ mod tests {
             content_hash: "old".into(), created_time: None, modified_time: None, accessed_time: None,
             category: crate::category::Category::Photo, container_chain: None };
         cat.upsert_file(&ghost, 50).unwrap();
-        let ghost_id = cat.active_file_id("vol-1", "_ToDelete/Photos/a.jpg").unwrap().unwrap();
+        let ghost_id = cat.loose_file_id("vol-1", "_ToDelete/Photos/a.jpg").unwrap().unwrap();
         cat.mark_quarantined(ghost_id, "_ToDelete/Photos/a.jpg", "Photos/a.jpg", 60).unwrap();
         cat.mark_purged(ghost_id, 70).unwrap();
         let _ = &mut ghost;
 
         // Now quarantine the live Photos/a.jpg (survivor copy_a.jpg exists on disk)
-        let a = cat.active_file_id("vol-1", "Photos/a.jpg").unwrap().unwrap();
+        let a = cat.loose_file_id("vol-1", "Photos/a.jpg").unwrap().unwrap();
         let out = quarantine_files(&cat, &root, "vol-1", &[a], 200).unwrap();
         assert_eq!(out.quarantined, 1);
         let rec = cat.get_file(a).unwrap().unwrap();
