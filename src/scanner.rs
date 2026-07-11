@@ -390,6 +390,8 @@ mod tests {
 
     #[test]
     fn run_scan_logs_volume_resolution() {
+        // Serialize with other subscriber-installing tests (tracing's interest cache is global).
+        let _tracing_lock = crate::observability::tracing_test_guard();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("drive");
         fs::create_dir_all(&root).unwrap();
