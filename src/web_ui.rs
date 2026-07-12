@@ -217,15 +217,19 @@ pub fn shell(active: &str, csrf: &str, title: &str, main_html: &str, page_script
 
 pub fn overview_page(csrf: &str) -> String {
     let main = r##"
-<section class="card"><div class="mut" style="font-size:11px;text-transform:uppercase;letter-spacing:.08em">System health</div>
-  <h2 id="hero" style="margin:6px 0 2px;font-size:26px">…</h2>
-  <div class="mut" id="hero-sub"></div></section>
+<section class="card" style="position:relative;overflow:hidden">
+  <div style="position:absolute;inset:-40% -20% auto auto;width:340px;height:340px;border-radius:50%;
+    background:radial-gradient(closest-side,var(--accent-weak),transparent);pointer-events:none"></div>
+  <div class="mut" style="font-size:11px;text-transform:uppercase;letter-spacing:.08em">System health</div>
+  <h2 id="hero" class="stat" style="margin:8px 0 2px">…</h2>
+  <div class="mut" id="hero-sub"></div>
+</section>
 <div class="grid">
-  <div class="card" style="grid-column:span 5"><h3 style="margin-top:0">Duplicate groups</h3>
-    <div style="font-size:22px" id="dupe-count">…</div>
+  <div class="card hover" style="grid-column:span 5"><h3 style="margin-top:0">Duplicate groups</h3>
+    <div class="stat" id="dupe-count">…</div>
     <div class="mut" id="dupe-reclaim"></div>
-    <a class="btn btn-primary" href="/review" style="display:inline-block;margin-top:12px;text-decoration:none">Review duplicates</a></div>
-  <div class="card" style="grid-column:span 7"><h3 style="margin-top:0">Reclaimable space</h3>
+    <a class="btn btn-primary" href="/review" style="margin-top:14px;text-decoration:none">Review duplicates</a></div>
+  <div class="card hover" style="grid-column:span 7"><h3 style="margin-top:0">Reclaimable space</h3>
     <div id="reclaim-bars"></div></div>
   <div class="card" style="grid-column:span 12"><h3 style="margin-top:0">Recent activity</h3>
     <div id="activity" class="mut">Loading…</div></div>
@@ -433,10 +437,15 @@ async function load(){
           ${d.has_errors?' · <span class="pill missing">had scan errors</span>':''}</div></div>
       <div class="mut mono">${fmtSize(d.reclaimable_bytes)} reclaimable</div></div>
     ${bar(d)}
-    <div style="display:flex;gap:8px;margin-top:12px">
+    <div class="row" style="margin-top:12px">
       <button class="btn rescan" ${d.connected?'':'disabled'}>${d.has_errors?'Repair (rescan)':'Rescan'}</button>
       <button class="btn edit">Edit…</button>
-      <button class="btn btn-danger forget">Forget…</button></div></div>`).join("")
+      <button class="btn btn-danger forget">Forget…</button></div>
+    <div class="edit-form" style="display:none;margin-top:12px;border-top:1px solid var(--line);padding-top:12px">
+      <input class="ef-name" type="text" placeholder="Custom name (blank = detected)" style="width:100%;margin-bottom:8px" value="${esc(d.display_name||'')}">
+      <input class="ef-desc" type="text" placeholder="Short description" style="width:100%;margin-bottom:8px" value="${esc(d.description||'')}">
+      <div class="row"><button class="btn btn-primary ef-save">Save</button><button class="btn ef-cancel">Cancel</button></div>
+    </div></div>`).join("")
     : '<div class="mut">No drives catalogued yet. Scan one from the Scan page.</div>';
   for(const c of document.querySelectorAll("[data-vid]")){
     c.querySelector(".forget").onclick=async()=>{
@@ -450,15 +459,15 @@ async function load(){
       try{ await apiPost("/api/scan",{path,force:false}); $("#msg").textContent="Rescan queued for "+path+". Watch progress on the Scan page."; }
       catch(e){ $("#msg").textContent="Error: "+e; }
     };
-    c.querySelector(".edit").onclick=()=>{
-      const cur=c.querySelector("h3").textContent.trim();
-      const name=window.prompt("Drive name (blank = use detected name):", cur);
-      if(name===null) return;
-      const desc=window.prompt("Short description (optional):", c.dataset.desc||"");
-      if(desc===null) return;
-      apiPost("/api/rename-drive",{volume_id:c.dataset.vid,name,description:desc})
-        .then(()=>{ $("#msg").textContent="Drive updated."; load(); })
-        .catch(e=>{ $("#msg").textContent="Error: "+e; });
+    const form=c.querySelector(".edit-form");
+    c.querySelector(".edit").onclick=()=>{ form.style.display = form.style.display==="none"?"block":"none"; };
+    c.querySelector(".ef-cancel").onclick=()=>{ form.style.display="none"; };
+    c.querySelector(".ef-save").onclick=async()=>{
+      try{
+        await apiPost("/api/rename-drive",{volume_id:c.dataset.vid,
+          name:c.querySelector(".ef-name").value, description:c.querySelector(".ef-desc").value});
+        $("#msg").textContent="Drive updated."; load();
+      }catch(e){ $("#msg").textContent="Error: "+e; }
     };
   }
 }
