@@ -1306,6 +1306,7 @@ mod tests {
         assert!(body.contains("/api/drives"));
         assert!(body.contains("/api/forget-drive"));
         assert!(body.contains("/api/purge-all"));
+        assert!(body.contains("/api/rename-drive"), "drives page can rename");
         assert!(!body.contains("http://") && !body.contains("https://"));
     }
 
