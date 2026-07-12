@@ -93,6 +93,16 @@ th{color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase;lett
 .cards .card{width:250px;margin:0;}
 #group .cards{justify-content:center;}
 #group .card{width:300px;}
+.drive-ico{width:38px;height:38px;border-radius:9px;flex:none;display:flex;align-items:center;justify-content:center;
+ background:color-mix(in srgb,var(--dc) 16%,transparent);color:var(--dc);}
+.drive-ico svg{width:20px;height:20px;}
+.card.rvcard{padding:0;overflow:hidden;}
+.rvthumb{position:relative;background:var(--line);}
+.rvthumb img,.rvthumb .noimg{width:100%;height:168px;object-fit:cover;border-radius:0;display:block;margin:0;}
+.rvbody{padding:13px 15px 15px;}
+.keep-pill{position:absolute;top:10px;left:10px;background:var(--accent);color:#fff;font-size:10px;font-weight:700;
+ letter-spacing:.04em;text-transform:uppercase;padding:4px 9px;border-radius:999px;display:inline-flex;align-items:center;gap:4px;
+ box-shadow:0 1px 4px #00000030;}
 .cards .card.keep{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent) inset,var(--sh-md);}
 .thumb{width:100%;height:150px;object-fit:contain;border-radius:var(--r-sm);background:var(--line);display:block;}
 .noimg{width:100%;height:150px;display:flex;align-items:center;justify-content:center;color:var(--mut);
@@ -401,12 +411,14 @@ function card(m){
     (m.id===keepId ? `<div class="arch">inside archive</div>`
      : m.mounted ? `<button class="btn btn-danger repack" data-id="${m.id}">Remove from archive</button>`
                  : `<div class="arch">drive not connected</div>`);
-  return `<div class="card" data-id="${m.id}">${img}
-    <div class="mono" style="word-break:break-all;font-size:12px;margin:10px 0 6px">${esc(m.location)}</div>
-    <div class="mut" style="font-size:12px"><b style="color:var(--fg)">${esc(m.volume_label||m.volume_id)}</b></div>
-    <div class="mut" style="font-size:12px">${fmtSize(m.size_bytes)} · created ${fmtDate(m.created_time)}</div>
-    <div class="mut" style="font-size:12px">status: ${esc(m.status)}</div>${arch}
-    <div class="badge kept-badge" style="visibility:hidden">✓ keep this</div></div>`;
+  return `<div class="card rvcard" data-id="${m.id}">
+    <div class="rvthumb">${img}<span class="keep-pill kept-badge" style="visibility:hidden">✓ Keep this</span></div>
+    <div class="rvbody">
+      <div class="mono" style="word-break:break-all;font-size:12px;margin:0 0 8px">${esc(m.location)}</div>
+      <div style="font-size:12.5px;font-weight:600">${esc(m.volume_label||m.volume_id)}</div>
+      <div class="mut" style="font-size:12px;margin-top:2px">${fmtSize(m.size_bytes)} · ${fmtDate(m.created_time)}</div>
+      <div class="mut" style="font-size:12px">status: ${esc(m.status)}</div>${arch}
+    </div></div>`;
 }
 function paint(){
   for(const el of document.querySelectorAll(".cards .card")){
@@ -447,13 +459,15 @@ function bar(d){ if(d.total_bytes==null) return "";
 async function load(){
   const drives=await apiGet("/api/drives");
   $("#drives").innerHTML = drives.length? drives.map(d=>`<div class="card" data-vid="${esc(d.volume_id)}" data-path="${esc(d.mount_path||'')}" data-desc="${esc(d.description||'')}">
-    <div style="display:flex;justify-content:space-between;align-items:start">
-      <div><h3 style="margin:0;display:flex;align-items:center;gap:8px"><span class="dot" style="background:${driveColor(d.volume_id)}"></span>${esc(d.display_name||d.label)}</h3>
+    <div style="display:flex;justify-content:space-between;align-items:start;gap:12px">
+      <div style="display:flex;align-items:start;gap:12px">
+        <div class="drive-ico" style="--dc:${driveColor(d.volume_id)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 13h18"/><circle cx="7" cy="16" r="1" fill="currentColor" stroke="none"/></svg></div>
+        <div><h3 style="margin:0">${esc(d.display_name||d.label)}</h3>
         ${d.description?`<div class="mut" style="font-size:12px;margin-top:2px">${esc(d.description)}</div>`:""}
-        <div class="mut" style="font-size:12px">${d.connected?'<span class="pill active">connected</span>':'<span class="pill purged">offline</span>'}
+        <div class="mut" style="font-size:12px;margin-top:3px">${d.connected?'<span class="pill active">connected</span>':'<span class="pill offline">offline</span>'}
           · ${d.active_files.toLocaleString()} files · last scan ${fmtDate(d.last_seen_at)}
-          ${d.has_errors?' · <span class="pill missing">had scan errors</span>':''}</div></div>
-      <div class="mut mono">${fmtSize(d.reclaimable_bytes)} reclaimable</div></div>
+          ${d.has_errors?' · <span class="pill missing">had scan errors</span>':''}</div></div></div>
+      <div class="mut mono" style="white-space:nowrap">${fmtSize(d.reclaimable_bytes)} reclaimable</div></div>
     ${bar(d)}
     <div class="row" style="margin-top:12px">
       <button class="btn rescan" ${d.connected?'':'disabled'}>${d.has_errors?'Repair (rescan)':'Rescan'}</button>
