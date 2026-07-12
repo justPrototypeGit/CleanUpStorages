@@ -73,6 +73,9 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
         "#,
     )?;
     ensure_column(conn, "files", "original_path", "TEXT")?;
+    ensure_column(conn, "volumes", "last_scanned_path", "TEXT")?;
+    ensure_column(conn, "volumes", "display_name", "TEXT")?;
+    ensure_column(conn, "volumes", "description", "TEXT")?;
     Ok(())
 }
 
