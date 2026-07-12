@@ -3,7 +3,9 @@
 //! `shell()` so the six screens stay visually identical and no markup is duplicated.
 
 pub const STYLE: &str = r##"
-:root{color-scheme:light dark;
+@font-face{font-family:'Inter';src:url(/assets/InterVariable.woff2) format('woff2');
+ font-weight:100 900;font-style:normal;font-display:swap;}
+:root{color-scheme:light dark;--font-ui:'Inter',-apple-system,"Segoe UI",Roboto,system-ui,sans-serif;
  --bg:#ececee;--panel:#ffffffc4;--content:#ffffff;--elev:#ffffff;--fg:#1d1d1f;--mut:#6e6e73;
  --line:#00000014;--line-strong:#00000022;--accent:#0071e3;--accent-weak:#0071e314;
  --amber:#b25000;--amber-bg:#ff9f0a24;--red:#c9382b;--red-bg:#ff453a1f;
@@ -18,18 +20,18 @@ pub const STYLE: &str = r##"
  --amber:#b25000;--amber-bg:#ff9f0a24;--red:#c9382b;--red-bg:#ff453a1f;
  --green:#1a7f37;--green-bg:#30d15824;--gray:#8a8a8e;}
 @media (prefers-color-scheme:dark){:root{
- --bg:#161618;--panel:#1f1f22c4;--content:#1f1f22;--elev:#2a2a2e;--fg:#f5f5f7;--mut:#9a9aa0;
+ --bg:#161618;--panel:#1f1f22c4;--content:#232327;--elev:#2e2e33;--fg:#f5f5f7;--mut:#9a9aa0;
  --line:#ffffff14;--line-strong:#ffffff28;--accent:#0a84ff;--accent-weak:#0a84ff26;
  --amber:#ff9f0a;--amber-bg:#ff9f0a26;--red:#ff453a;--red-bg:#ff453a26;
  --green:#30d158;--green-bg:#30d15826;--gray:#98989d;}}
 :root[data-theme="dark"]{
- --bg:#161618;--panel:#1f1f22c4;--content:#1f1f22;--elev:#2a2a2e;--fg:#f5f5f7;--mut:#9a9aa0;
+ --bg:#161618;--panel:#1f1f22c4;--content:#232327;--elev:#2e2e33;--fg:#f5f5f7;--mut:#9a9aa0;
  --line:#ffffff14;--line-strong:#ffffff28;--accent:#0a84ff;--accent-weak:#0a84ff26;
  --amber:#ff9f0a;--amber-bg:#ff9f0a26;--red:#ff453a;--red-bg:#ff453a26;
  --green:#30d158;--green-bg:#30d15826;--gray:#98989d;}
 *{box-sizing:border-box;}
-body{margin:0;font:14px/1.5 -apple-system,"Segoe UI",Roboto,system-ui,sans-serif;
- background:var(--bg);color:var(--fg);-webkit-font-smoothing:antialiased;}
+body{margin:0;font:14px/1.5 var(--font-ui);letter-spacing:-.006em;
+ background:var(--bg);color:var(--fg);-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;}
 .mono{font-family:ui-monospace,"Cascadia Code","SF Mono",Consolas,monospace;font-variant-numeric:tabular-nums;}
 h1,h2,h3{letter-spacing:-.01em;}
 aside.side{position:fixed;left:0;top:0;bottom:0;width:var(--sidebar);display:flex;flex-direction:column;
@@ -48,8 +50,9 @@ header.top{position:fixed;top:0;left:var(--sidebar);right:0;height:var(--topbar)
  border-bottom:1px solid var(--line);z-index:5;}
 header.top strong{font-size:15px;font-weight:600;letter-spacing:-.01em;}
 header.top .spacer{flex:1;}
-main{margin-left:var(--sidebar);padding:calc(var(--topbar) + 24px) 28px 48px;max-width:1120px;}
-.card{background:var(--content);border:1px solid var(--line);border-radius:var(--r-lg);padding:20px;
+main{margin-left:var(--sidebar);padding:calc(var(--topbar) + 28px) 40px 64px;}
+main>*{max-width:1180px;margin-left:auto;margin-right:auto;}
+.card{background:var(--content);border:1px solid var(--line-strong);border-radius:var(--r-lg);padding:22px;
  margin:0 0 16px;box-shadow:var(--sh-sm);}
 .card.hover{transition:box-shadow .16s,transform .16s,border-color .16s;}
 .card.hover:hover{box-shadow:var(--sh-md);transform:translateY(-1px);border-color:var(--line-strong);}
@@ -87,6 +90,8 @@ th{color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase;lett
  border:1px solid var(--line-strong);background:var(--content);color:var(--fg);}
 .cards{display:flex;flex-wrap:wrap;gap:16px;}
 .cards .card{width:250px;margin:0;}
+#group .cards{justify-content:center;}
+#group .card{width:300px;}
 .cards .card.keep{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent) inset,var(--sh-md);}
 .thumb{width:100%;height:150px;object-fit:contain;border-radius:var(--r-sm);background:var(--line);display:block;}
 .noimg{width:100%;height:150px;display:flex;align-items:center;justify-content:center;color:var(--mut);
@@ -148,7 +153,8 @@ async function apiPost(u,body){const r=await fetch(u,{method:"POST",headers:{"co
 function applyTheme(t){ if(t==='auto'){localStorage.removeItem('theme');delete document.documentElement.dataset.theme;}
   else{localStorage.setItem('theme',t);document.documentElement.dataset.theme=t;}
   for(const b of document.querySelectorAll('.themebar .seg button')) b.classList.toggle('on', b.dataset.theme===(t||'auto')); }
-(function initTheme(){ const cur=localStorage.getItem('theme')||'auto';
+(function initTheme(){ const q=new URLSearchParams(location.search).get('theme');
+  const cur=q||localStorage.getItem('theme')||'auto';
   document.addEventListener('DOMContentLoaded',()=>{
     for(const b of document.querySelectorAll('.themebar .seg button')){ b.onclick=()=>applyTheme(b.dataset.theme); }
     applyTheme(cur);
@@ -202,7 +208,7 @@ pub fn shell(active: &str, csrf: &str, title: &str, main_html: &str, page_script
 <button data-theme="dark" title="Dark">{}<span>Dark</span></button></div></div>"##,
         icon("auto"), icon("light"), icon("dark"));
     format!(r##"<!doctype html><html lang="en"><head>
-<script>(function(){{var t=localStorage.getItem('theme');if(t&&t!=='auto')document.documentElement.dataset.theme=t;}})();</script>
+<script>(function(){{var u=new URLSearchParams(location.search).get('theme');var t=u||localStorage.getItem('theme');if(t&&t!=='auto')document.documentElement.dataset.theme=t;}})();</script>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="csrf" content="{csrf}"><title>CleanUpStorages — {title}</title>
 <style>{style}</style></head><body>
@@ -288,7 +294,16 @@ function buildTree(hits){
       node.children.get(last).files.push({name:h.container_chain,hit:h});
     } else { node.files.push({name:last,hit:h}); }
   }
+  for(const d of drives.values()) reconcile(d);
   return drives;
+}
+// A .zip catalogued both as a loose file AND via its entries would otherwise show twice. Fold the
+// loose archive file's own size onto its archive node and drop the duplicate leaf.
+function reconcile(node){
+  const keep=[];
+  for(const f of node.files){ const a=node.children.get(f.name); if(a&&a.archive){ a.selfHit=f.hit; } else keep.push(f); }
+  node.files=keep;
+  for(const c of node.children.values()) reconcile(c);
 }
 function countDups(node){ let n=node.files.filter(f=>f.hit.copies).length; for(const c of node.children.values()) n+=countDups(c); return n; }
 // --- model -> HTML (pure; every interpolation esc()'d) ---
@@ -304,7 +319,9 @@ function renderFolder(node){
   let html='<div class="branch">';
   for(const child of node.children.values()){
     const d=countDups(child); const badge=d?` <span class="mut" style="font-size:11px">${d} dup</span>`:"";
-    html+=`<details class="folder"><summary>${child.archive?"🗜 ":""}${esc(child.name)}${badge}</summary>${renderFolder(child)}</details>`;
+    const ico=child.archive?'<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" style="opacity:.55;margin-right:5px;vertical-align:-1px"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8M10 12h4"/></svg>':'';
+    const sz=child.archive&&child.selfHit?` <span class="mut mono" style="font-size:11px">${fmtSize(child.selfHit.size_bytes)}</span>`:'';
+    html+=`<details class="folder"><summary>${ico}${esc(child.name)}${badge}${sz}</summary>${renderFolder(child)}</details>`;
   }
   for(const f of node.files) html+=renderLeaf(f);
   return html+'</div>';
@@ -346,14 +363,16 @@ init();"##;
 
 pub fn review_page(csrf: &str) -> String {
     let main = r##"
-<div class="mut" id="progress" style="margin-bottom:12px"></div>
-<div id="group"></div>
-<div style="display:flex;gap:8px;margin-top:16px;align-items:center;justify-content:space-between">
-  <button class="btn" id="skip">Skip this group</button>
-  <button class="btn btn-primary" id="confirm">Keep selected, quarantine the rest</button>
-</div>
-<p class="mut" style="font-size:11px;text-align:center;margin-top:12px">Nothing is deleted — copies move to a recoverable <span class="mono">_ToDelete</span> folder until you purge.</p>
-<div class="mut" id="msg" style="margin-top:10px;min-height:1.4em"></div>"##;
+<div style="max-width:900px;margin:0 auto">
+  <div class="mut" id="progress" style="margin-bottom:16px;text-align:center"></div>
+  <div id="group"></div>
+  <div style="display:flex;gap:12px;margin-top:24px;align-items:center;justify-content:center">
+    <button class="btn" id="skip">Skip this group</button>
+    <button class="btn btn-primary" id="confirm">Keep selected, quarantine the rest</button>
+  </div>
+  <p class="mut" style="font-size:11px;text-align:center;margin-top:14px">Nothing is deleted — copies move to a recoverable <span class="mono">_ToDelete</span> folder until you purge.</p>
+  <div class="mut" id="msg" style="margin-top:10px;min-height:1.4em;text-align:center"></div>
+</div>"##;
     let script = r##"
 let groups=[],idx=0,keepId=null;
 async function load(){
