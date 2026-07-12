@@ -110,7 +110,19 @@ This prints a `http://127.0.0.1:PORT` URL and opens your browser. Leave it runni
 PowerShell window you can watch the request log if you started it with `RUST_LOG=info` (see step 7).
 
 The UI opens on the **Overview** dashboard; the left sidebar switches between the six pages
-(Overview, Browse, Duplicates, Drives, Scan, Console). Try each:
+(Overview, Browse, Duplicates, Drives, Scan, Console).
+
+**New in the visual overhaul — worth a look:**
+- **Theme toggle** (sidebar footer): **Auto / Light / Dark**. Auto follows Windows; Light/Dark force it
+  and your choice is remembered. Check that the **dropdown menus** on Browse now match the theme
+  (previously they showed light popups in dark mode).
+- **Scan page:** while a scan runs you get a progress bar + live **count tiles** (Hashed / Unchanged /
+  Errors / Archive entries) and a recent-scans list with done/error pills; the "force full rescan" is a
+  toggle switch.
+- **Drives page:** **Edit…** now opens an inline form (name + description, Save/Cancel) instead of
+  browser prompts. (Your scanned folder-drives should also show **connected**, not offline.)
+
+Try each:
 
 - **Overview (home `/`):** the dashboard — total files catalogued across N drives, the duplicate-groups
   count with a "Review duplicates" button, a reclaimable-space bar per drive, and a **Recent activity**
