@@ -116,3 +116,26 @@ SHARED_JS collisions; `copies` never 0/1). Optional Minor follow-ups:
   No crash, no file mis-attribution — purely cosmetic.
 - **Lazy per-folder loading (from the spec, deferred):** the tree is built from the capped result set;
   a very large catalog would want server-side lazy expansion.
+
+
+## Follow-ups logged from the drives-fix-and-rename review (2026-07-12)
+
+Shipped clean — the final whole-branch review found no Critical/Important (connectivity change is
+detection-only and marker-gated at two layers: `resolve_live` includes a remembered path only when
+its marker still equals the volume_id, AND the quarantine/purge/repack engines each re-check the
+marker before touching disk; schema additive/idempotent; CSRF-first; self-contained + XSS-safe).
+The "rename bumps last_seen_at" minor was fixed in-branch (62c75dc). Remaining optional minors:
+
+- **`rename` audit entry logs raw request params, not applied values.** A partial update logs
+  `"display_name": null` (reads as "cleared" when it was left untouched), and untrimmed whitespace is
+  logged though the stored value is trimmed. Audit cosmetics only — log the cleaned/applied values and
+  skip fields passed as `None`.
+- **No-op / unknown-volume rename silently "succeeds."** `cus rename <mount>` with no flags writes a
+  no-change `rename` row; `POST /api/rename-drive` against an unknown volume_id updates 0 rows and
+  returns `{name: <id>}` as if OK. Harmless; could 404/short-circuit.
+- **`api_drives` is N+1** (per-volume `volume_meta`/`volume_last_seen`/`volume_has_scan_errors` +
+  `snapshot()`'s readonly open). Fine at realistic drive counts; batch if it ever matters.
+- **No automated test for the concurrent readonly-inside-write-handler pattern** (`snapshot()` opens a
+  readonly connection while a handler holds a write `Catalog`). WAL + 5s busy_timeout make it safe;
+  tests use `MountResolver::Fixed` which never opens the second connection. The sandbox walkthrough in
+  the testing guide is the only guard.
