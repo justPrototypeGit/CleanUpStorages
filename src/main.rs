@@ -74,6 +74,15 @@ enum Command {
         /// Current mount path of the drive to forget.
         mount: std::path::PathBuf,
     },
+    /// Set a drive's custom name and/or description (shown in the UI).
+    Rename {
+        /// Current mount path of the drive.
+        mount: std::path::PathBuf,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        description: Option<String>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -89,6 +98,7 @@ fn main() -> anyhow::Result<()> {
         Command::Purge { .. } => "purge",
         Command::Repack { .. } => "repack",
         Command::Forget { .. } => "forget",
+        Command::Rename { .. } => "rename",
     };
     // Groups a command's log events under `command{name=...}`. Note: this uses a thread-local
     // context, so it reliably nests only synchronous commands; `browse`'s per-connection request
@@ -108,5 +118,7 @@ fn main() -> anyhow::Result<()> {
         Command::Purge { mount, all } => commands::cmd_purge(mount.as_deref(), all),
         Command::Repack { mount, entry_id } => commands::cmd_repack(&mount, entry_id),
         Command::Forget { mount } => commands::cmd_forget(&mount),
+        Command::Rename { mount, name, description } =>
+            commands::cmd_rename(&mount, name.as_deref(), description.as_deref()),
     }
 }

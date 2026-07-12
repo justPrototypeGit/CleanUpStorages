@@ -54,6 +54,7 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/quarantine", post(api_quarantine))
         .route("/api/repack", post(api_repack))
         .route("/api/forget-drive", post(api_forget_drive))
+        .route("/api/rename-drive", post(api_rename_drive))
         .route("/api/purge-all", post(api_purge_all))
         .route("/api/scan", post(api_scan))
         .route("/api/scan/status", get(api_scan_status))
@@ -145,7 +146,7 @@ struct DetectedDriveDto {
 }
 
 #[derive(Serialize)]
-struct VolumeDto { volume_id: String, label: String, active_files: i64, active_bytes: i64 }
+struct VolumeDto { volume_id: String, label: String, display_name: Option<String>, active_files: i64, active_bytes: i64 }
 
 #[derive(Serialize)]
 struct StatsDto { duplicate_groups: i64, volumes: Vec<VolumeDto> }
@@ -157,6 +158,8 @@ struct ActivityDto { kind: String, summary: String, occurred_at: i64 }
 struct DriveDto {
     volume_id: String,
     label: String,
+    display_name: Option<String>,
+    description: Option<String>,
     mount_path: Option<String>,   // None if not currently connected
     connected: bool,
     active_files: i64,
@@ -186,6 +189,7 @@ fn activity_summary(action: &str, details: &str) -> String {
         "repack" => format!("Repacked an archive (removed {})", s("removed_entry")),
         "purge" => format!("Purged {} file(s), reclaimed {} MiB", n("files_purged"), n("bytes_reclaimed") / (1024 * 1024)),
         "forget" => format!("Removed drive '{}' from the catalog", s("label")),
+        "rename" => "Renamed a drive".to_string(),
         other => other.to_string(),
     }
 }
@@ -248,9 +252,9 @@ async fn api_search(State(state): State<AppState>, Query(p): Query<SearchParams>
     };
     let limit = p.limit.unwrap_or(500).min(5000);
     let hits = cat.search_filtered(&filters, limit).map_err(err500)?;
-    // Friendly drive names + which results are duplicated (global active-copy count).
-    let labels: std::collections::HashMap<String, String> = cat.volume_stats().map_err(err500)?
-        .into_iter().map(|(id, label, _, _)| (id, label)).collect();
+    // Friendly drive names (effective: custom-or-detected) + which results are duplicated
+    // (global active-copy count).
+    let labels = cat.effective_labels().map_err(err500)?;
     let hashes: Vec<String> = hits.iter().map(|f| f.content_hash.clone()).collect();
     let dupes = cat.duplicate_counts(&hashes).map_err(err500)?;
     let out: Vec<HitDto> = hits.into_iter().map(|f| {
@@ -264,10 +268,12 @@ async fn api_search(State(state): State<AppState>, Query(p): Query<SearchParams>
 
 /// Shared by /api/volumes and /api/stats so the two endpoints can't drift apart.
 fn volume_dtos(cat: &Catalog) -> anyhow::Result<Vec<VolumeDto>> {
+    let eff = cat.effective_labels()?;
     Ok(cat.volume_stats()?.into_iter()
-        .map(|(volume_id, label, active_files, active_bytes)|
-            VolumeDto { volume_id, label, active_files, active_bytes })
-        .collect())
+        .map(|(volume_id, label, active_files, active_bytes)| {
+            let display_name = eff.get(&volume_id).cloned();
+            VolumeDto { volume_id, label, display_name, active_files, active_bytes }
+        }).collect())
 }
 
 async fn api_volumes(State(state): State<AppState>)
@@ -309,13 +315,14 @@ async fn api_drives(State(state): State<AppState>)
             Some(p) => match crate::mounts::disk_capacity(p) { Some((t, f)) => (Some(t), Some(f)), None => (None, None) },
             None => (None, None),
         };
+        let (display_name, description) = cat.volume_meta(&volume_id).map_err(err500)?;
         out.push(DriveDto {
             connected: mount_path.is_some(),
             mount_path: mount_path.map(|p| p.display().to_string()),
             reclaimable_bytes: reclaim.get(&volume_id).copied().unwrap_or(0),
             last_seen_at: cat.volume_last_seen(&volume_id).map_err(err500)?,
             has_errors: cat.volume_has_scan_errors(&volume_id).map_err(err500)?,
-            volume_id, label, active_files, active_bytes, total_bytes, free_bytes,
+            volume_id, label, display_name, description, active_files, active_bytes, total_bytes, free_bytes,
         });
     }
     Ok(Json(out))
@@ -532,6 +539,28 @@ async fn api_forget_drive(State(state): State<AppState>, headers: HeaderMap, bod
     snapshot_best_effort(&state, now);
     let removed = cat.forget_volume(&body.volume_id, now).map_err(err500)?;
     Ok(Json(ForgetResultDto { removed_files: removed }))
+}
+
+#[derive(Deserialize)]
+struct RenameReq { volume_id: String, name: Option<String>, description: Option<String> }
+
+#[derive(Serialize)]
+struct RenameResultDto { name: String }
+
+/// Set a volume's custom display name and/or description. All persistence lives in
+/// `Catalog::set_volume_meta`; this handler is just the CSRF gate plus resolving the effective
+/// name to return.
+async fn api_rename_drive(State(state): State<AppState>, headers: HeaderMap, body: Json<RenameReq>)
+    -> Result<Json<RenameResultDto>, (StatusCode, String)>
+{
+    check_csrf(&headers, &state)?;
+    let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
+    let now = now_secs()?;
+    cat.set_volume_meta(&body.volume_id, body.name.as_deref(), body.description.as_deref(), now)
+        .map_err(err500)?;
+    let name = cat.effective_labels().map_err(err500)?
+        .get(&body.volume_id).cloned().unwrap_or_else(|| body.volume_id.clone());
+    Ok(Json(RenameResultDto { name }))
 }
 
 #[derive(Serialize)]
@@ -927,6 +956,24 @@ mod tests {
             serde_json::json!({"volume_id":"vol-1"})).await;
         assert_eq!(status, StatusCode::OK);
         assert!(json["removed_files"].as_i64().unwrap() >= 1);
+    }
+
+    #[tokio::test]
+    async fn rename_drive_requires_token_then_persists_effective_name() {
+        let (_t, db, state) = seed_dupes();
+        let (status, _) = post_json(state.clone(), "/api/rename-drive", None,
+            serde_json::json!({"volume_id":"vol-1","name":"Trip 2019"})).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, json) = post_json(state, "/api/rename-drive", Some("T"),
+            serde_json::json!({"volume_id":"vol-1","name":"Trip 2019","description":"summer"})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["name"], "Trip 2019");
+        // effective name now flows into /api/search and /api/drives
+        let v = get_json(&db, "/api/search").await;
+        assert_eq!(v.as_array().unwrap()[0]["volume_label"], "Trip 2019");
+        let d = get_json(&db, "/api/drives").await;
+        assert_eq!(d.as_array().unwrap()[0]["display_name"], "Trip 2019");
+        assert_eq!(d.as_array().unwrap()[0]["description"], "summer");
     }
 
     #[tokio::test]

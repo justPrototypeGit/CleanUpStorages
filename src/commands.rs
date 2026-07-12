@@ -168,6 +168,17 @@ pub fn cmd_forget(mount: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn cmd_rename(mount: &Path, name: Option<&str>, description: Option<&str>) -> anyhow::Result<()> {
+    let (cfg, cat) = open_catalog()?;
+    let vid = crate::volume::read_volume_id(mount)
+        .ok_or_else(|| anyhow::anyhow!("no identity marker at {}; scan the drive first", mount.display()))?;
+    let now = now_secs();
+    cat.set_volume_meta(&vid, name, description, now)?;
+    let _ = snapshot(&cfg, now);
+    println!("Updated drive {vid}.");
+    Ok(())
+}
+
 pub fn cmd_repack(mount: &Path, entry_id: i64) -> anyhow::Result<()> {
     let (cfg, cat) = open_catalog()?;
     let vid = crate::volume::read_volume_id(mount)
