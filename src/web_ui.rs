@@ -477,30 +477,32 @@ load().catch(e=>{$("#drives").textContent="Error: "+e;});"##;
 
 pub fn scan_page(csrf: &str) -> String {
     let main = r##"
-<div class="mut" style="margin-bottom:16px">Scan a drive to catalog its files and find duplicates. Nothing is modified except a tiny hidden marker file used to recognise the drive next time.</div>
-
-<h3 style="margin:0 0 10px">Detected drives</h3>
+<div class="mut" style="margin-bottom:16px">Scan a drive to catalog its files and find duplicates. Nothing is modified except a tiny hidden marker used to recognise the drive next time.</div>
+<h3 style="margin:0 0 10px;font-size:13px;color:var(--mut);text-transform:uppercase;letter-spacing:.05em">Detected drives</h3>
 <div id="drives" class="cards" style="margin-bottom:20px"><span class="mut">Looking for connected drives…</span></div>
-
 <div class="card">
   <h3 style="margin-top:0">Or enter a path</h3>
-  <div style="display:flex;gap:8px;margin-bottom:10px">
-    <input id="path" type="text" placeholder="e.g. D:\ or /Volumes/MyDrive" style="flex:1;padding:8px 12px;border-radius:8px;border:1px solid var(--line);background:var(--content);color:var(--fg)">
+  <div class="row" style="margin-bottom:12px">
+    <input id="path" type="text" placeholder="e.g. D:\ or a folder to scan" style="flex:1">
     <button class="btn" id="browse">Browse…</button>
   </div>
-  <label style="display:flex;gap:8px;align-items:center;font-size:13px;color:var(--mut);margin-bottom:6px">
-    <input id="force" type="checkbox"> Force full rescan (re-hash every file, slower)
+  <label class="row" style="font-size:13px;color:var(--mut);margin-bottom:14px">
+    <span class="switch"><input id="force" type="checkbox"><span class="sl"></span></span> Force full rescan (re-hash every file, slower)
   </label>
-  <div class="mut" style="font-size:11px;margin-bottom:14px">Scanning writes a tiny hidden marker file (.cleanupstorages_id) to the drive root so it's recognised on future scans.</div>
   <button class="btn btn-primary" id="scan">Scan</button>
 </div>
-
-<div class="card">
-  <h3 style="margin-top:0">Live status</h3>
-  <div id="running" class="mut">No scan running.</div>
-  <div id="queued" class="mut" style="margin-top:6px"></div>
+<div class="card" id="status-card">
+  <div class="row" style="justify-content:space-between"><h3 style="margin:0" id="status-title">Live status</h3><span class="mut" id="status-sub"></span></div>
+  <div class="progressbar" id="pbar" style="margin:12px 0;display:none"><span style="width:40%"></span></div>
+  <div class="tiles" id="tiles" style="display:none">
+    <div class="tile"><div class="k">Hashed</div><div class="v mono" id="t-hashed">0</div></div>
+    <div class="tile"><div class="k">Unchanged</div><div class="v mono" id="t-skip">0</div></div>
+    <div class="tile"><div class="k">Errors</div><div class="v mono" id="t-err">0</div></div>
+    <div class="tile"><div class="k">Archive entries</div><div class="v mono" id="t-arch">0</div></div>
+  </div>
+  <div class="mut" id="running" style="margin-top:8px">No scan running.</div>
+  <div class="mut" id="queued" style="margin-top:4px"></div>
 </div>
-
 <div class="card">
   <h3 style="margin-top:0">Recent scans</h3>
   <div id="recent" class="mut">None yet.</div>
@@ -531,15 +533,21 @@ $("#scan").addEventListener("click",async()=>{
     poll();
   }catch(e){ $("#running").innerHTML='<span style="color:var(--red)">Scan error: '+esc(String(e))+'</span>'; }
 });
+function setTiles(on){ $("#tiles").style.display=on?"flex":"none"; const p=$("#pbar"); p.style.display=on?"block":"none"; p.classList.toggle("run",on); }
 async function poll(){
   try{
     const s=await apiGet("/api/scan/status");
-    if(s.running){ const r=s.running; $("#running").textContent=`Scanning ${r.path} — ${r.hashed} hashed · ${r.skipped} unchanged · ${r.errors} errors · ${r.archive_entries} archive entries`; }
-    else $("#running").textContent="No scan running.";
+    if(s.running){ const r=s.running;
+      $("#status-title").textContent="Scanning…"; $("#status-sub").textContent=r.path;
+      $("#t-hashed").textContent=r.hashed.toLocaleString(); $("#t-skip").textContent=r.skipped.toLocaleString();
+      $("#t-err").textContent=r.errors.toLocaleString(); $("#t-arch").textContent=r.archive_entries.toLocaleString();
+      setTiles(true); $("#running").textContent="";
+    } else { $("#status-title").textContent="Live status"; $("#status-sub").textContent=""; setTiles(false); $("#running").textContent="No scan running."; }
     $("#queued").textContent = s.queued.length ? ("Queued: "+s.queued.join(", ")) : "";
     $("#recent").innerHTML = s.recent.length ? s.recent.map(r=>{
+      const mark = r.error_message ? '<span class="pill missing">error</span>' : '<span class="pill active">done</span>';
       const msg = r.error_message ? `<span style="color:var(--red)">${esc(r.error_message)}</span>` : `${r.hashed} hashed · ${r.skipped} unchanged · ${r.errors} errors · ${r.archive_entries} archive entries · ${r.marked_missing} newly missing`;
-      return `<div style="padding:6px 0;border-bottom:1px solid var(--line)"><span class="mono">${esc(r.path)}</span> — ${msg}</div>`;
+      return `<div class="row" style="padding:8px 0;border-bottom:1px solid var(--line);gap:10px">${mark}<span class="mono" style="flex:none">${esc(r.path)}</span><span class="mut" style="font-size:12px">${msg}</span></div>`;
     }).join("") : "None yet.";
     if(s.running || s.queued.length) setTimeout(poll, 1500);
   }catch(e){ /* stop polling on error */ }
