@@ -159,7 +159,7 @@ async function init(){
   $("#dupe-reclaim").textContent="~"+fmtSize(totalReclaim)+" reclaimable";
   const max=Math.max(1,...drives.map(d=>d.reclaimable_bytes||0));
   $("#reclaim-bars").innerHTML=drives.map(d=>`<div style="margin:10px 0">
-     <div style="display:flex;justify-content:space-between"><span><span class="dot" style="background:${driveColor(d.volume_id)};display:inline-block;margin-right:6px"></span>${esc(d.label)}</span><span class="mono">${fmtSize(d.reclaimable_bytes)}</span></div>
+     <div style="display:flex;justify-content:space-between"><span><span class="dot" style="background:${driveColor(d.volume_id)};display:inline-block;margin-right:6px"></span>${esc(d.display_name||d.label)}</span><span class="mono">${fmtSize(d.reclaimable_bytes)}</span></div>
      <div class="progressbar"><span style="width:${Math.round(100*(d.reclaimable_bytes||0)/max)}%"></span></div></div>`).join("")||'<span class="mut">Nothing to reclaim.</span>';
   const acts=await apiGet("/api/activity");
   $("#activity").innerHTML=acts.length?acts.map(a=>`<div style="padding:6px 0;border-bottom:1px solid var(--line)">
@@ -248,7 +248,7 @@ $("#results").addEventListener("click",e=>{
 function debounced(){ clearTimeout(timer); timer=setTimeout(run,180); }
 async function init(){
   const vs=await apiGet("/api/volumes"); const sel=$("#volume");
-  for(const v of vs){ const o=document.createElement("option"); o.value=v.volume_id; o.textContent=v.label; sel.appendChild(o); }
+  for(const v of vs){ const o=document.createElement("option"); o.value=v.volume_id; o.textContent=v.display_name||v.label; sel.appendChild(o); }
   $("#q").addEventListener("input",debounced);
   for(const k of ["volume","category","status"]) $("#"+k).addEventListener("change",run);
   run();
@@ -341,9 +341,10 @@ function bar(d){ if(d.total_bytes==null) return "";
     <div class="progressbar"><span style="width:${pct}%"></span></div></div>`; }
 async function load(){
   const drives=await apiGet("/api/drives");
-  $("#drives").innerHTML = drives.length? drives.map(d=>`<div class="card" data-vid="${esc(d.volume_id)}" data-path="${esc(d.mount_path||'')}">
+  $("#drives").innerHTML = drives.length? drives.map(d=>`<div class="card" data-vid="${esc(d.volume_id)}" data-path="${esc(d.mount_path||'')}" data-desc="${esc(d.description||'')}">
     <div style="display:flex;justify-content:space-between;align-items:start">
-      <div><h3 style="margin:0;display:flex;align-items:center;gap:8px"><span class="dot" style="background:${driveColor(d.volume_id)}"></span>${esc(d.label)}</h3>
+      <div><h3 style="margin:0;display:flex;align-items:center;gap:8px"><span class="dot" style="background:${driveColor(d.volume_id)}"></span>${esc(d.display_name||d.label)}</h3>
+        ${d.description?`<div class="mut" style="font-size:12px;margin-top:2px">${esc(d.description)}</div>`:""}
         <div class="mut" style="font-size:12px">${d.connected?'<span class="pill active">connected</span>':'<span class="pill purged">offline</span>'}
           · ${d.active_files.toLocaleString()} files · last scan ${fmtDate(d.last_seen_at)}
           ${d.has_errors?' · <span class="pill missing">had scan errors</span>':''}</div></div>
@@ -351,6 +352,7 @@ async function load(){
     ${bar(d)}
     <div style="display:flex;gap:8px;margin-top:12px">
       <button class="btn rescan" ${d.connected?'':'disabled'}>${d.has_errors?'Repair (rescan)':'Rescan'}</button>
+      <button class="btn edit">Edit…</button>
       <button class="btn btn-danger forget">Forget…</button></div></div>`).join("")
     : '<div class="mut">No drives catalogued yet. Scan one from the Scan page.</div>';
   for(const c of document.querySelectorAll("[data-vid]")){
@@ -364,6 +366,16 @@ async function load(){
       const path=c.dataset.path; if(!path){ $("#msg").textContent="Drive not connected."; return; }
       try{ await apiPost("/api/scan",{path,force:false}); $("#msg").textContent="Rescan queued for "+path+". Watch progress on the Scan page."; }
       catch(e){ $("#msg").textContent="Error: "+e; }
+    };
+    c.querySelector(".edit").onclick=()=>{
+      const cur=c.querySelector("h3").textContent.trim();
+      const name=window.prompt("Drive name (blank = use detected name):", cur);
+      if(name===null) return;
+      const desc=window.prompt("Short description (optional):", c.dataset.desc||"");
+      if(desc===null) return;
+      apiPost("/api/rename-drive",{volume_id:c.dataset.vid,name,description:desc})
+        .then(()=>{ $("#msg").textContent="Drive updated."; load(); })
+        .catch(e=>{ $("#msg").textContent="Error: "+e; });
     };
   }
 }
