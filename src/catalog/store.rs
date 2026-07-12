@@ -440,16 +440,18 @@ impl Catalog {
         description: Option<&str>, now: i64) -> anyhow::Result<()>
     {
         // None = leave unchanged; Some(s) = set (trim; empty clears to NULL / detected label).
+        // A rename does NOT touch last_seen_at — it isn't a scan, and the Drives card renders
+        // last_seen_at as "last scan", which must stay truthful.
         let to_val = |s: &str| -> Option<String> { let t = s.trim(); if t.is_empty() { None } else { Some(t.to_string()) } };
         if let Some(dn) = display_name {
             let v = to_val(dn);
-            self.conn.execute("UPDATE volumes SET display_name=?2, last_seen_at=?3 WHERE volume_id=?1",
-                params![volume_id, v, now])?;
+            self.conn.execute("UPDATE volumes SET display_name=?2 WHERE volume_id=?1",
+                params![volume_id, v])?;
         }
         if let Some(desc) = description {
             let v = to_val(desc);
-            self.conn.execute("UPDATE volumes SET description=?2, last_seen_at=?3 WHERE volume_id=?1",
-                params![volume_id, v, now])?;
+            self.conn.execute("UPDATE volumes SET description=?2 WHERE volume_id=?1",
+                params![volume_id, v])?;
         }
         self.log_action("rename", &serde_json::json!({
             "volume_id": volume_id, "display_name": display_name, "description": description }).to_string(), now)?;
