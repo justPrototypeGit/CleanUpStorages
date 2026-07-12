@@ -432,21 +432,27 @@ impl Catalog {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Set/clear a volume's user display name + description (empty/whitespace clears to NULL, which
-    /// falls back to the detected label). Logs a `rename` audit action.
+    /// Set a volume's user display name and/or description. Each field updates independently:
+    /// `None` leaves that column unchanged (partial update), `Some(s)` sets it — trimmed, with an
+    /// empty-after-trim value clearing to NULL (which falls back to the detected label). Logs a
+    /// `rename` audit action.
     pub fn set_volume_meta(&self, volume_id: &str, display_name: Option<&str>,
         description: Option<&str>, now: i64) -> anyhow::Result<()>
     {
-        fn clean(s: Option<&str>) -> Option<&str> {
-            s.map(str::trim).filter(|s| !s.is_empty())
+        // None = leave unchanged; Some(s) = set (trim; empty clears to NULL / detected label).
+        let to_val = |s: &str| -> Option<String> { let t = s.trim(); if t.is_empty() { None } else { Some(t.to_string()) } };
+        if let Some(dn) = display_name {
+            let v = to_val(dn);
+            self.conn.execute("UPDATE volumes SET display_name=?2, last_seen_at=?3 WHERE volume_id=?1",
+                params![volume_id, v, now])?;
         }
-        let dn = clean(display_name);
-        let desc = clean(description);
-        self.conn.execute(
-            "UPDATE volumes SET display_name=?2, description=?3, last_seen_at=?4 WHERE volume_id=?1",
-            params![volume_id, dn, desc, now])?;
+        if let Some(desc) = description {
+            let v = to_val(desc);
+            self.conn.execute("UPDATE volumes SET description=?2, last_seen_at=?3 WHERE volume_id=?1",
+                params![volume_id, v, now])?;
+        }
         self.log_action("rename", &serde_json::json!({
-            "volume_id": volume_id, "display_name": dn, "description": desc }).to_string(), now)?;
+            "volume_id": volume_id, "display_name": display_name, "description": description }).to_string(), now)?;
         Ok(())
     }
 
@@ -903,6 +909,25 @@ mod tests {
         assert_eq!(cat.effective_labels().unwrap().get("v").cloned(), Some("My Photos".to_string()));
         // clearing the name (empty) falls back to the detected label
         cat.set_volume_meta("v", Some("  "), None, 7).unwrap();
+        assert_eq!(cat.volume_meta("v").unwrap().0, None);
+        assert_eq!(cat.effective_labels().unwrap().get("v").cloned(), Some("Detected".to_string()));
+    }
+
+    #[test]
+    fn set_volume_meta_partial_update_preserves_other_field() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_volume(&crate::catalog::models::Volume {
+            volume_id: "v".into(), label: "Detected".into(), identified_by: "marker".into(),
+            first_seen_at: 1, last_seen_at: 1 }).unwrap();
+        cat.set_volume_meta("v", Some("My Name"), Some("my desc"), 5).unwrap();
+        // Update only the description (name = None) -> name must survive.
+        cat.set_volume_meta("v", None, Some("new desc"), 6).unwrap();
+        assert_eq!(cat.volume_meta("v").unwrap(), (Some("My Name".to_string()), Some("new desc".to_string())));
+        // Update only the name -> description survives.
+        cat.set_volume_meta("v", Some("Name2"), None, 7).unwrap();
+        assert_eq!(cat.volume_meta("v").unwrap(), (Some("Name2".to_string()), Some("new desc".to_string())));
+        // Explicit clear of the name (empty) falls back to the label; description untouched.
+        cat.set_volume_meta("v", Some(""), None, 8).unwrap();
         assert_eq!(cat.volume_meta("v").unwrap().0, None);
         assert_eq!(cat.effective_labels().unwrap().get("v").cloned(), Some("Detected".to_string()));
     }
