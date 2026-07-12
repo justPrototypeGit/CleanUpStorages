@@ -63,6 +63,7 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/scan", get(scan_page_h))
         .route("/drives", get(drives_page_h))
         .route("/console", get(console_page_h))
+        .route("/assets/InterVariable.woff2", get(asset_inter_font))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|req: &axum::http::Request<axum::body::Body>| {
@@ -100,6 +101,15 @@ async fn drives_page_h(State(state): State<AppState>) -> Html<String> {
 
 async fn console_page_h(State(state): State<AppState>) -> Html<String> {
     Html(crate::web_ui::console_page(&state.csrf_token))
+}
+
+/// The vendored Inter variable font, served same-origin (no external request) and cached hard.
+async fn asset_inter_font() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "font/woff2"),
+         (header::CACHE_CONTROL, "public, max-age=31536000, immutable")],
+        axum::body::Bytes::from_static(include_bytes!("../assets/InterVariable.woff2")),
+    )
 }
 
 /// Web-facing shape for a search hit; keeps serialization concerns out of `catalog::models`.
