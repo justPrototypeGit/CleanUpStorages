@@ -1267,6 +1267,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shell_has_theme_toggle() {
+        use axum::body::Body; use axum::http::Request; use tower::ServiceExt;
+        let (_t, _db, state) = seed_dupes();
+        let app = build_router_with(state);
+        let res = app.oneshot(Request::builder().uri("/").body(Body::empty()).unwrap()).await.unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), 2_000_000).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("data-theme=\"dark\"") && body.contains("themebar"), "theme toggle present");
+        assert!(body.contains("applyTheme"), "theme JS present");
+        assert!(!body.contains("http://") && !body.contains("https://"), "self-contained");
+    }
+
+    #[tokio::test]
     async fn detected_drives_flags_catalogued() {
         let (_t, _db, state) = seed_dupes(); // Fixed mount vol-1 -> driveA (marker vol-1), catalogued
         let v = get_json_state(state, "/api/detected-drives").await;
