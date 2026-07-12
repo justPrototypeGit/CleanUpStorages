@@ -197,6 +197,9 @@ pub fn run_scan(
         identified_by: identity.identified_by.clone(),
         first_seen_at: now, last_seen_at: now,
     })?;
+    // Remember where this volume was scanned so a folder-drive (not a disk root) can be recognized
+    // as connected later. Best-effort: a bookkeeping failure must not fail the scan.
+    let _ = cat.set_volume_path(&identity.volume_id, &mount_root.display().to_string(), now);
     let summary = scan_volume_with_progress(cat, mount_root, &identity, force, now, progress)?;
     // Audit trail: one row per completed scan so the Overview "recent activity" feed can show it.
     let _ = cat.log_action("scan", &serde_json::json!({

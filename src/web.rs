@@ -25,7 +25,7 @@ impl AppState {
     /// Production state: live mount detection and a fresh random CSRF token.
     pub fn new_live(catalog_path: PathBuf) -> AppState {
         AppState {
-            mounts: crate::mounts::MountResolver::Live,
+            mounts: crate::mounts::MountResolver::Live { catalog_path: catalog_path.clone() },
             csrf_token: uuid::Uuid::new_v4().to_string(),
             scan_queue: crate::scan_queue::ScanQueue::new(catalog_path.clone()),
             catalog_path,
@@ -645,7 +645,7 @@ mod tests {
     fn app_state_new_live_has_token_and_live_mounts() {
         let s = AppState::new_live(PathBuf::from("x.db"));
         assert!(!s.csrf_token.is_empty());
-        assert!(matches!(s.mounts, crate::mounts::MountResolver::Live));
+        assert!(matches!(s.mounts, crate::mounts::MountResolver::Live { .. }));
     }
 
     #[tokio::test]
