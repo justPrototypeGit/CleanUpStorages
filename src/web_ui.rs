@@ -163,6 +163,29 @@ details.drive>summary:hover,details.folder>summary:hover{background:var(--line);
 .tile{flex:1;min-width:120px;background:var(--content);border:1px solid var(--line);border-radius:var(--r);padding:12px 14px;box-shadow:var(--sh-sm);}
 .tile .k{font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.05em;}
 .tile .v{font-size:22px;font-weight:650;margin-top:2px;}
+.sec-label{font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--mut);margin:26px 0 12px;}
+.sec-label:first-child{margin-top:4px;}
+.drivegrid{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
+.dcard{cursor:pointer;transition:border-color .12s,box-shadow .12s;}
+.dcard:hover{border-color:var(--line-strong);}
+.dcard.sel{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent) inset;}
+.dcard .dtop{display:flex;gap:14px;align-items:flex-start;}
+.dcard .dtop .txt{flex:1;min-width:0;}
+.dcard .dname{font-weight:600;font-size:14.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.dcard .dpath{font-family:var(--font-mono);font-size:11.5px;color:var(--mut);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px;}
+.dcard .dcap{display:flex;justify-content:space-between;font-size:11.5px;color:var(--mut);margin-top:7px;}
+.statcols{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:18px;}
+.statcol{border-left:1px solid var(--line);padding-left:16px;}
+.statcol:first-child{border-left:0;padding-left:0;}
+.statcol .k{font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--mut);}
+.statcol .v{font-size:26px;font-weight:700;letter-spacing:-.02em;margin-top:5px;}
+.statcol .v.accent{color:var(--accent-text);}
+.recentrow{display:flex;align-items:center;gap:12px;padding:13px 0;border-top:1px solid var(--line);}
+.recentrow:first-child{border-top:0;}
+.folderbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;}
+.folderin{flex:1;min-width:180px;display:flex;align-items:center;gap:10px;background:var(--sidebar-bg);border:1px solid var(--line);border-radius:var(--r);padding:11px 14px;}
+.folderin input{flex:1;border:0;background:transparent;padding:0;font:inherit;color:var(--fg);}
+.folderin input:focus{outline:none;box-shadow:none;}
 .switch{position:relative;display:inline-block;width:38px;height:22px;}
 .switch input{opacity:0;width:0;height:0;}
 .switch .sl{position:absolute;inset:0;background:var(--line-strong);border-radius:999px;transition:.15s;}
@@ -182,6 +205,23 @@ option{background:var(--content);color:var(--fg);}
 .seg button .material-symbols-outlined{font-size:15px;}
 .themebar{margin-top:auto;padding-top:14px;border-top:1px solid var(--line);}
 .themebar .lbl{font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.05em;display:block;margin:0 4px 6px;}
+@media (max-width:1100px){
+  .grid>*{grid-column:1 / -1 !important;}
+  .drivegrid{grid-template-columns:1fr;}
+  main{padding-left:24px;padding-right:24px;}
+}
+@media (max-width:820px){
+  :root{--sidebar:200px;}
+  aside.side h1{font-size:19px;}
+  .statcols{grid-template-columns:1fr 1fr;}
+  #group .cards{flex-direction:column;align-items:stretch;}
+  #group .card{width:auto;}
+  .folderbar{gap:10px;}
+}
+@media (max-width:640px){
+  .statcols{grid-template-columns:1fr 1fr;}
+  .cards .card{width:100%;}
+}
 "##;
 
 pub const SHARED_JS: &str = r##"
@@ -579,46 +619,63 @@ load().catch(e=>{$("#drives").textContent="Error: "+e;});"##;
 
 pub fn scan_page(csrf: &str) -> String {
     let main = r##"
-<div class="mut" style="margin-bottom:16px">Scan a drive to catalog its files and find duplicates. Nothing is modified except a tiny hidden marker used to recognise the drive next time.</div>
-<h3 style="margin:0 0 10px;font-size:13px;color:var(--mut);text-transform:uppercase;letter-spacing:.05em">Detected drives</h3>
-<div id="drives" class="cards" style="margin-bottom:20px"><span class="mut">Looking for connected drives…</span></div>
+<div class="mut" style="margin:0 0 2px;font-size:14px">Connect a drive or select a folder to catalog your files and identify duplicates. Nothing is modified except a tiny hidden marker used to recognise the drive next time.</div>
+<div class="sec-label">Detected drives</div>
+<div id="drives" class="drivegrid"><span class="mut">Looking for connected drives…</span></div>
+<div class="sec-label">Or choose a folder</div>
 <div class="card">
-  <h3 style="margin-top:0">Or enter a path</h3>
-  <div class="row" style="margin-bottom:12px">
-    <input id="path" type="text" placeholder="e.g. D:\ or a folder to scan" style="flex:1">
-    <button class="btn" id="browse">Browse…</button>
+  <div class="folderbar">
+    <label class="folderin"><span class="material-symbols-outlined" style="color:var(--mut);font-size:20px">folder_open</span>
+      <input id="path" type="text" placeholder="Type or browse to a folder to scan…"></label>
+    <button class="linkbtn" id="browse" style="font-size:13px"><span class="material-symbols-outlined">drive_folder_upload</span>Browse…</button>
+    <label class="row" style="font-size:13px;color:var(--mut)">
+      <span class="switch"><input id="force" type="checkbox"><span class="sl"></span></span> Force full rescan
+    </label>
   </div>
-  <label class="row" style="font-size:13px;color:var(--mut);margin-bottom:14px">
-    <span class="switch"><input id="force" type="checkbox"><span class="sl"></span></span> Force full rescan (re-hash every file, slower)
-  </label>
-  <button class="btn btn-primary" id="scan">Scan</button>
 </div>
+<div style="text-align:center;margin:22px 0 4px">
+  <button class="btn btn-primary" id="scan" style="padding:11px 26px;font-size:14px"><span class="material-symbols-outlined">play_arrow</span>Scan Selected</button>
+</div>
+<div class="mut" id="running" style="text-align:center;min-height:1.2em;margin-bottom:16px"></div>
 <div class="card" id="status-card">
-  <div class="row" style="justify-content:space-between"><h3 style="margin:0" id="status-title">Live status</h3><span class="mut" id="status-sub"></span></div>
-  <div class="progressbar" id="pbar" style="margin:12px 0;display:none"><span style="width:40%"></span></div>
-  <div class="tiles" id="tiles" style="display:none">
-    <div class="tile"><div class="k">Hashed</div><div class="v mono" id="t-hashed">0</div></div>
-    <div class="tile"><div class="k">Unchanged</div><div class="v mono" id="t-skip">0</div></div>
-    <div class="tile"><div class="k">Errors</div><div class="v mono" id="t-err">0</div></div>
-    <div class="tile"><div class="k">Archive entries</div><div class="v mono" id="t-arch">0</div></div>
+  <div class="row" style="justify-content:space-between;align-items:flex-start">
+    <div><h3 style="margin:0" id="status-title">Live status</h3><div class="mut" id="status-sub" style="font-size:12.5px;margin-top:2px">No scan running.</div></div>
   </div>
-  <div class="mut" id="running" style="margin-top:8px">No scan running.</div>
-  <div class="mut" id="queued" style="margin-top:4px"></div>
+  <div class="progressbar" id="pbar" style="margin:16px 0 0;display:none"><span style="width:40%"></span></div>
+  <div class="statcols" id="tiles" style="display:none">
+    <div class="statcol"><div class="k">Hashed</div><div class="v mono accent" id="t-hashed">0</div></div>
+    <div class="statcol"><div class="k">Unchanged</div><div class="v mono" id="t-skip">0</div></div>
+    <div class="statcol"><div class="k">Errors</div><div class="v mono" id="t-err">0</div></div>
+    <div class="statcol"><div class="k">Archive entries</div><div class="v mono" id="t-arch">0</div></div>
+  </div>
+  <div class="mut" id="queued" style="margin-top:10px;font-size:12.5px"></div>
 </div>
 <div class="card">
-  <h3 style="margin-top:0">Recent scans</h3>
+  <h3 style="margin:0 0 4px">Recent scans</h3>
   <div id="recent" class="mut">None yet.</div>
 </div>"##;
     let script = r##"
+function baseName(p){ const s=String(p).replace(/[\\/]+$/,""); const m=s.split(/[\\/]/); return m[m.length-1]||s; }
 async function loadDrives(){
   try{
     const ds=await apiGet("/api/detected-drives");
-    if(!ds.length){ $("#drives").innerHTML='<span class="mut">No drives detected. Type a path below.</span>'; return; }
-    $("#drives").innerHTML=ds.map(d=>`<div class="card" data-path="${esc(d.mount_path)}" style="cursor:pointer">
-      <div style="font-weight:600">${esc(d.mount_path)}</div>
-      <div class="mut" style="font-size:12px;margin-top:4px">${d.catalogued?("Catalogued as "+esc(d.volume_label||"—")+" · rescan"):"New drive"}</div>
-      </div>`).join("");
-    for(const el of document.querySelectorAll("#drives [data-path]")) el.addEventListener("click",()=>{ $("#path").value=el.dataset.path; });
+    if(!ds.length){ $("#drives").innerHTML='<span class="mut">No drives detected. Choose a folder below.</span>'; return; }
+    $("#drives").innerHTML=ds.map(d=>{
+      const badge=d.catalogued?'<span class="tag">Catalogued · rescan</span>':'<span class="tag tone-blue" style="font-family:var(--font-ui)">New</span>';
+      let cap="";
+      if(d.total_bytes!=null){ const used=d.total_bytes-(d.free_bytes||0); const pct=Math.round(100*used/d.total_bytes);
+        cap=`<div class="progressbar" style="margin-top:9px"><span style="width:${pct}%"></span></div>
+        <div class="dcap"><span>${fmtSize(d.free_bytes)} free</span><span>${fmtSize(d.total_bytes)} total</span></div>`; }
+      return `<div class="card dcard" data-path="${esc(d.mount_path)}">
+        <div class="dtop"><div class="card-ico"><span class="material-symbols-outlined">hard_drive</span></div>
+          <div class="txt"><div class="row" style="justify-content:space-between;gap:8px"><span class="dname">${esc(d.volume_label||baseName(d.mount_path))}</span>${badge}</div>
+          <div class="dpath">${esc(d.mount_path)}</div></div></div>
+        ${cap}</div>`;
+    }).join("");
+    for(const el of document.querySelectorAll("#drives .dcard")) el.addEventListener("click",()=>{
+      $("#path").value=el.dataset.path;
+      for(const o of document.querySelectorAll("#drives .dcard")) o.classList.toggle("sel",o===el);
+    });
   }catch(e){ $("#drives").innerHTML='<span class="mut">Could not list drives: '+esc(String(e))+'</span>'; }
 }
 $("#browse").addEventListener("click",async()=>{
@@ -628,29 +685,36 @@ $("#browse").addEventListener("click",async()=>{
   }catch(e){ $("#running").textContent="Folder picker error: "+e; }
 });
 $("#scan").addEventListener("click",async()=>{
-  const path=$("#path").value.trim(); if(!path){ $("#running").textContent="Enter a path first."; return; }
+  const path=$("#path").value.trim(); if(!path){ $("#running").textContent="Select a drive or choose a folder first."; return; }
   const force=$("#force").checked;
   try{
     await apiPost("/api/scan",{path,force});
+    $("#running").textContent="";
     poll();
   }catch(e){ $("#running").innerHTML='<span style="color:var(--red)">Scan error: '+esc(String(e))+'</span>'; }
 });
-function setTiles(on){ $("#tiles").style.display=on?"flex":"none"; const p=$("#pbar"); p.style.display=on?"block":"none"; p.classList.toggle("run",on); }
+function setTiles(on){ $("#tiles").style.display=on?"grid":"none"; const p=$("#pbar"); p.style.display=on?"block":"none"; p.classList.toggle("run",on); }
 async function poll(){
   try{
     const s=await apiGet("/api/scan/status");
     if(s.running){ const r=s.running;
-      $("#status-title").textContent="Scanning…"; $("#status-sub").textContent=r.path;
+      $("#status-title").textContent="Active scan: "+baseName(r.path);
+      $("#status-sub").textContent="Recursive deep hash analysis in progress…";
       $("#t-hashed").textContent=r.hashed.toLocaleString(); $("#t-skip").textContent=r.skipped.toLocaleString();
       $("#t-err").textContent=r.errors.toLocaleString(); $("#t-arch").textContent=r.archive_entries.toLocaleString();
-      setTiles(true); $("#running").textContent="";
-    } else { $("#status-title").textContent="Live status"; $("#status-sub").textContent=""; setTiles(false); $("#running").textContent="No scan running."; }
+      setTiles(true);
+    } else { $("#status-title").textContent="Live status"; $("#status-sub").textContent="No scan running."; setTiles(false); }
     $("#queued").textContent = s.queued.length ? ("Queued: "+s.queued.join(", ")) : "";
     $("#recent").innerHTML = s.recent.length ? s.recent.map(r=>{
-      const mark = r.error_message ? '<span class="pill missing">error</span>' : '<span class="pill active">done</span>';
-      const msg = r.error_message ? `<span style="color:var(--red)">${esc(r.error_message)}</span>` : `${r.hashed} hashed · ${r.skipped} unchanged · ${r.errors} errors · ${r.archive_entries} archive entries · ${r.marked_missing} newly missing`;
-      return `<div class="row" style="padding:8px 0;border-bottom:1px solid var(--line);gap:10px">${mark}<span class="mono" style="flex:none">${esc(r.path)}</span><span class="mut" style="font-size:12px">${msg}</span></div>`;
-    }).join("") : "None yet.";
+      const ok=!r.error_message;
+      const ico=ok?'<div class="act-ico tone-green"><span class="material-symbols-outlined">check_circle</span></div>'
+                  :'<div class="act-ico tone-red"><span class="material-symbols-outlined">error</span></div>';
+      const sub=ok?`${r.hashed} hashed · ${r.skipped} unchanged · ${r.errors} errors · ${r.archive_entries} archive entries`
+                  :`<span style="color:var(--red)">${esc(r.error_message)}</span>`;
+      return `<div class="recentrow">${ico}
+        <div style="flex:1;min-width:0"><div class="act-title mono" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.path)}</div>
+        <div class="mut" style="font-size:12px;margin-top:2px">${sub}</div></div></div>`;
+    }).join("") : '<div class="mut" style="padding:6px 0">No scans yet.</div>';
     if(s.running || s.queued.length) setTimeout(poll, 1500);
   }catch(e){ /* stop polling on error */ }
 }
