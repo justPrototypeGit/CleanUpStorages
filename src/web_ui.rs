@@ -45,28 +45,37 @@ h3{font-size:15px;} h2{font-size:22px;}
 aside.side{position:fixed;left:0;top:0;bottom:0;width:var(--sidebar);display:flex;flex-direction:column;
  background:color-mix(in srgb,var(--sidebar-bg) 86%,transparent);
  backdrop-filter:blur(40px) saturate(180%);-webkit-backdrop-filter:blur(40px) saturate(180%);
- border-right:1px solid var(--line);padding:18px 0;overflow-y:auto;}
-aside.side h1{font-size:24px;margin:0;padding:2px 20px 0;font-weight:700;letter-spacing:-.03em;line-height:1.1;}
-aside.side .tagline{margin:0;padding:2px 20px 22px;font-size:12.5px;color:var(--mut2);}
-nav{padding:0 10px;display:flex;flex-direction:column;gap:1px;}
-nav a{display:flex;gap:12px;align-items:center;padding:7px 12px;border-radius:var(--r);
- color:var(--mut);text-decoration:none;font-weight:500;font-size:13px;transition:background .12s,color .12s;}
+ border-right:1px solid var(--line);padding:16px 0;overflow-y:auto;overflow-x:hidden;transition:width .18s ease;}
+.side-head{display:flex;align-items:center;gap:8px;padding:2px 14px 20px;}
+.side-head .brand{flex:1;min-width:0;overflow:hidden;}
+aside.side h1{font-size:22px;margin:0;font-weight:700;letter-spacing:-.03em;line-height:1.1;white-space:nowrap;}
+aside.side .tagline{margin:2px 0 0;font-size:12px;color:var(--mut2);white-space:nowrap;}
+.rail-toggle{flex:none;width:32px;height:32px;border:0;background:transparent;color:var(--mut);border-radius:var(--r-sm);
+ cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .12s;}
+.rail-toggle:hover{background:var(--line);color:var(--fg);}
+.rail-toggle .material-symbols-outlined{font-size:20px;transition:transform .18s;}
+nav{padding:0 10px;display:flex;flex-direction:column;gap:2px;}
+nav a{display:flex;gap:12px;align-items:center;padding:8px 12px;border-radius:var(--r);
+ color:var(--mut);text-decoration:none;font-weight:500;font-size:13px;transition:background .12s,color .12s;white-space:nowrap;}
+nav a .lb{overflow:hidden;}
 nav a.active{background:var(--accent-weak);color:var(--accent-text);font-weight:600;}
 nav a:hover:not(.active){background:var(--line);color:var(--fg);}
-nav a .material-symbols-outlined{font-size:20px;}
-header.top{position:fixed;top:0;left:var(--sidebar);right:0;height:var(--topbar);display:flex;align-items:center;
- gap:14px;padding:0 32px;background:color-mix(in srgb,var(--bg) 80%,transparent);
- backdrop-filter:blur(20px) saturate(150%);-webkit-backdrop-filter:blur(20px) saturate(150%);
- border-bottom:1px solid var(--line);z-index:5;}
-.top-search{flex:1;max-width:620px;display:flex;align-items:center;gap:10px;background:var(--sidebar-bg);
- border:1px solid var(--line);border-radius:999px;padding:9px 16px;}
-.top-search .material-symbols-outlined{color:var(--mut);font-size:19px;}
-.top-search input{flex:1;border:0;background:transparent;padding:0;font:inherit;font-size:13.5px;color:var(--fg);}
-.top-search input:focus{outline:none;box-shadow:none;}
-header.top .spacer{flex:1;}
-.top-actions{display:flex;align-items:center;gap:8px;margin-left:auto;}
-main{margin-left:var(--sidebar);padding:calc(var(--topbar) + 32px) 40px 48px;}
-main>*{max-width:1240px;margin-left:0;margin-right:auto;}
+nav a .material-symbols-outlined{font-size:21px;}
+/* collapsed icon rail */
+:root[data-rail="1"]{--sidebar:70px;}
+:root[data-rail="1"] .side-head{justify-content:center;padding:2px 0 20px;}
+:root[data-rail="1"] .brand{display:none;}
+:root[data-rail="1"] .rail-toggle .material-symbols-outlined{transform:rotate(180deg);}
+:root[data-rail="1"] nav{padding:0 12px;}
+:root[data-rail="1"] nav a{justify-content:center;padding:10px 0;}
+:root[data-rail="1"] nav a .lb{display:none;}
+:root[data-rail="1"] .themebar .lbl{display:none;}
+:root[data-rail="1"] .themebar .seg{flex-direction:column;border-radius:var(--r-lg);}
+:root[data-rail="1"] .themebar .seg button{justify-content:center;padding:7px 0;}
+:root[data-rail="1"] .themebar .seg button .lb{display:none;}
+main{margin-left:var(--sidebar);padding:36px 44px 56px;transition:margin-left .18s ease;}
+main>*{max-width:none;margin:0;}
+main>.narrow{max-width:1120px;margin-left:auto;margin-right:auto;}
 .card{background:var(--content);border:1px solid var(--line);border-radius:var(--r-lg);padding:22px;
  margin:0 0 20px;box-shadow:var(--sh-sm);}
 .card.hover{transition:box-shadow .16s,transform .16s,border-color .16s;}
@@ -114,18 +123,16 @@ th{color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase;lett
 .progressbar{height:8px;background:var(--line);border-radius:999px;overflow:hidden;}
 .progressbar>span{display:block;height:100%;border-radius:999px;
  background:linear-gradient(90deg,var(--accent),color-mix(in srgb,var(--accent) 70%,#fff));}
-.term{border:1px solid var(--line-strong);border-radius:var(--r-lg);overflow:hidden;box-shadow:var(--sh-sm);background:var(--content);}
-.term-head{display:flex;align-items:center;gap:9px;padding:9px 14px;border-bottom:1px solid var(--line);
- background:var(--sidebar-bg);font-size:12.5px;color:var(--mut);}
-.term-head .dots{display:flex;gap:6px;margin-right:2px;}
-.term-head .dots i{width:11px;height:11px;border-radius:50%;display:block;}
-.term-in-wrap{display:flex;align-items:center;gap:8px;border-top:1px solid var(--line);padding:0 14px;}
-.term-in-wrap .prompt{color:var(--green);font-family:var(--font-mono);font-weight:600;flex:none;}
-.console-out{font-family:var(--font-mono),ui-monospace,Consolas,monospace;white-space:pre-wrap;background:transparent;
- border:0;border-radius:0;padding:14px;min-height:300px;max-height:60vh;overflow:auto;font-size:12.5px;}
-.console-in{flex:1;font-family:var(--font-mono),ui-monospace,Consolas,monospace;padding:12px 0;border:0;
+.console-out{font-family:var(--font-mono),ui-monospace,Consolas,monospace;white-space:pre-wrap;background:var(--content);
+ border:1px solid var(--line);border-radius:var(--r-lg);padding:18px;min-height:340px;max-height:64vh;overflow:auto;
+ font-size:12.5px;box-shadow:var(--sh-sm);}
+.console-inbar{display:flex;align-items:center;gap:10px;margin-top:12px;background:var(--content);border:1px solid var(--line-strong);
+ border-radius:var(--r);padding:0 16px;box-shadow:var(--sh-sm);}
+.console-inbar:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-weak);}
+.console-inbar .prompt{color:var(--green);font-family:var(--font-mono);font-weight:600;flex:none;}
+.console-in{flex:1;font-family:var(--font-mono),ui-monospace,Consolas,monospace;padding:13px 0;border:0;
  background:transparent;color:var(--fg);font-size:12.5px;}
-.term-in-wrap .console-in:focus{outline:none;box-shadow:none;}
+.console-in:focus{outline:none;box-shadow:none;}
 .cards{display:flex;flex-wrap:wrap;gap:16px;}
 .cards .card{width:250px;margin:0;}
 #group .cards{justify-content:center;}
@@ -167,7 +174,16 @@ details.drive>summary:hover,details.folder>summary:hover{background:var(--line);
 .searchbar .material-symbols-outlined{color:var(--mut);font-size:20px;}
 .searchbar input{flex:1;border:0;background:transparent;padding:0;font:inherit;font-size:14px;color:var(--fg);}
 .searchbar input:focus{outline:none;box-shadow:none;}
-.browsetools{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px;}
+.browsetools{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px;}
+.browsetools .count{margin-left:auto;font-size:13px;}
+.selpill{position:relative;display:inline-flex;align-items:center;}
+.selpill select{appearance:none;-webkit-appearance:none;-moz-appearance:none;background:var(--content);
+ border:1px solid var(--line-strong);border-radius:999px;padding:8px 32px 8px 15px;font:inherit;font-size:13px;
+ font-weight:500;color:var(--fg);cursor:pointer;box-shadow:var(--sh-sm);}
+.selpill::after{content:"";position:absolute;right:14px;top:calc(50% - 1px);width:6px;height:6px;
+ border-right:1.6px solid var(--mut);border-bottom:1.6px solid var(--mut);transform:translateY(-50%) rotate(45deg);pointer-events:none;}
+.selpill select:hover{background:var(--line);}
+.selpill select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-weak);}
 .leaf{display:flex;align-items:center;gap:9px;padding:6px 10px 6px 22px;border-radius:var(--r-sm);cursor:default;}
 .leaf:hover{background:var(--line);}
 .leaf .fname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
@@ -291,10 +307,12 @@ function applyTheme(t){ if(t==='auto'){localStorage.removeItem('theme');delete d
     for(const b of document.querySelectorAll('.themebar .seg button')){ b.onclick=()=>applyTheme(b.dataset.theme); }
     applyTheme(cur);
   });})();
-// Top-bar search: Enter jumps to Browse (the Browse page wires its own live filtering instead).
+// Sidebar collapse to an icon rail (persisted).
 document.addEventListener('DOMContentLoaded',()=>{
-  const tq=document.getElementById('topq'); if(!tq||location.pathname==='/browse')return;
-  tq.addEventListener('keydown',e=>{ if(e.key==='Enter'){ const v=tq.value.trim(); location.href='/browse'+(v?('?q='+encodeURIComponent(v)):''); }});
+  const rt=document.getElementById('railToggle'); if(!rt)return;
+  rt.onclick=()=>{ const on=document.documentElement.dataset.rail==='1';
+    if(on){ delete document.documentElement.dataset.rail; localStorage.removeItem('rail'); rt.title='Collapse menu'; }
+    else { document.documentElement.dataset.rail='1'; localStorage.setItem('rail','1'); rt.title='Expand menu'; } };
 });
 "##;
 
@@ -330,24 +348,22 @@ pub fn shell(active: &str, csrf: &str, title: &str, main_html: &str, page_script
     let nav = NAV.iter().map(|n| {
         let cls = if n.key == active { "active" } else { "" };
         let current = if n.key == active { r#" aria-current="page""# } else { "" };
-        format!(r#"<a class="{cls}"{current} href="{}"><span class="material-symbols-outlined">{}</span><span>{}</span></a>"#, n.href, glyph(n.key), n.label)
+        format!(r#"<a class="{cls}"{current} href="{}" title="{}"><span class="material-symbols-outlined">{}</span><span class="lb">{}</span></a>"#, n.href, n.label, glyph(n.key), n.label)
     }).collect::<String>();
     let themebar = format!(r##"<div class="themebar"><span class="lbl">Theme</span>
 <div class="seg" role="group" aria-label="Theme">
-<button data-theme="auto" title="Follow system"><span class="material-symbols-outlined">{}</span>Auto</button>
-<button data-theme="light" title="Light"><span class="material-symbols-outlined">{}</span>Light</button>
-<button data-theme="dark" title="Dark"><span class="material-symbols-outlined">{}</span>Dark</button></div></div>"##,
+<button data-theme="auto" title="Follow system"><span class="material-symbols-outlined">{}</span><span class="lb">Auto</span></button>
+<button data-theme="light" title="Light"><span class="material-symbols-outlined">{}</span><span class="lb">Light</span></button>
+<button data-theme="dark" title="Dark"><span class="material-symbols-outlined">{}</span><span class="lb">Dark</span></button></div></div>"##,
         glyph("auto"), glyph("light"), glyph("dark"));
     format!(r##"<!doctype html><html lang="en"><head>
-<script>(function(){{var u=new URLSearchParams(location.search).get('theme');var t=u||localStorage.getItem('theme');if(t&&t!=='auto')document.documentElement.dataset.theme=t;}})();</script>
+<script>(function(){{var q=new URLSearchParams(location.search);var u=q.get('theme');var t=u||localStorage.getItem('theme');if(t&&t!=='auto')document.documentElement.dataset.theme=t;var r=q.get('rail');var rr=r!=null?r:localStorage.getItem('rail');if(rr==='1')document.documentElement.dataset.rail='1';}})();</script>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="csrf" content="{csrf}"><title>CleanUpStorages — {title}</title>
 <style>{style}</style></head><body>
-<aside class="side"><h1>CleanUpStorages</h1><p class="tagline">Storage cleanup</p><nav>{nav}</nav>{themebar}</aside>
-<header class="top">
-<div class="top-search"><span class="material-symbols-outlined">search</span><input id="topq" type="search" placeholder="Search catalog…" aria-label="Search catalog"></div>
-<div class="top-actions"><a class="btn btn-primary" href="/scan">Start Scan</a></div>
-</header>
+<aside class="side"><div class="side-head"><div class="brand"><h1>CleanUpStorages</h1><p class="tagline">Storage cleanup</p></div>
+<button class="rail-toggle" id="railToggle" title="Collapse menu" aria-label="Collapse menu"><span class="material-symbols-outlined">chevron_left</span></button></div>
+<nav>{nav}</nav>{themebar}</aside>
 <main>{main_html}</main>
 <script>{shared}</script><script>{page_script}</script>
 </body></html>"##,
@@ -430,18 +446,22 @@ init().catch(e=>{$("#activity").textContent="Error: "+e;});"##;
 
 pub fn browse_page(csrf: &str) -> String {
     let main = r##"
-<div class="browsetools">
-  <select id="volume" class="btn"><option value="">All drives</option></select>
-  <select id="category" class="btn"><option value="">All types</option>
-    <option value="photo">Photo</option><option value="video">Video</option>
-    <option value="document">Document</option><option value="academic">Academic</option><option value="other">Other</option></select>
-  <select id="status" class="btn"><option value="">Any status</option>
-    <option value="active">Active</option><option value="missing">Missing</option>
-    <option value="quarantined">Quarantined</option><option value="purged">Purged</option></select>
-  <span class="mut" id="count" style="margin-left:auto;font-size:13px"></span>
-</div>
-<div class="mut" style="font-size:12px;margin:0 0 10px">Grouped by drive and folder. Files sharing identical content share a <span class="diamond" style="--dup:hsl(280,72%,52%)">◆</span> color — click one to highlight every copy.</div>
-<div class="card" style="padding:8px"><div id="results" class="tree"></div></div>"##;
+<div class="narrow">
+  <div class="searchbar"><span class="material-symbols-outlined">search</span>
+    <input id="q" type="search" placeholder="Search filename or path…" autofocus></div>
+  <div class="browsetools">
+    <span class="selpill"><select id="volume"><option value="">All drives</option></select></span>
+    <span class="selpill"><select id="category"><option value="">All types</option>
+      <option value="photo">Photos</option><option value="video">Videos</option>
+      <option value="document">Documents</option><option value="academic">Academic</option><option value="other">Other</option></select></span>
+    <span class="selpill"><select id="status"><option value="">Any status</option>
+      <option value="active">Active</option><option value="missing">Missing</option>
+      <option value="quarantined">Quarantined</option><option value="purged">Purged</option></select></span>
+    <span class="mut count" id="count"></span>
+  </div>
+  <div class="mut" style="font-size:12px;margin:0 0 10px">Grouped by drive and folder. Files sharing identical content share a <span class="diamond" style="--dup:hsl(280,72%,52%)">◆</span> color — click one to highlight every copy.</div>
+  <div class="card" style="padding:8px"><div id="results" class="tree"></div></div>
+</div>"##;
     let script = r##"
 let timer=null;
 // --- data -> tree model (pure) ---
@@ -513,7 +533,7 @@ function renderTree(drives){
   return html;
 }
 async function run(){ try{
-  const p=new URLSearchParams(); const q=$("#topq").value.trim(); if(q)p.set("q",q);
+  const p=new URLSearchParams(); const q=$("#q").value.trim(); if(q)p.set("q",q);
   for(const k of ["volume","category","status"]){ const v=$("#"+k).value; if(v)p.set(k,v); }
   p.set("limit","3000");
   const hits=await apiGet("/api/search?"+p.toString());
@@ -531,8 +551,8 @@ function debounced(){ clearTimeout(timer); timer=setTimeout(run,180); }
 async function init(){
   const vs=await apiGet("/api/volumes"); const sel=$("#volume");
   for(const v of vs){ const o=document.createElement("option"); o.value=v.volume_id; o.textContent=v.display_name||v.label; sel.appendChild(o); }
-  const tq=$("#topq"); if(tq){ const urlq=new URLSearchParams(location.search).get("q"); if(urlq)tq.value=urlq;
-    tq.addEventListener("input",debounced); }
+  const urlq=new URLSearchParams(location.search).get("q"); if(urlq)$("#q").value=urlq;
+  $("#q").addEventListener("input",debounced);
   for(const k of ["volume","category","status"]) $("#"+k).addEventListener("change",run);
   run();
 }
@@ -830,13 +850,9 @@ pub fn console_page(csrf: &str) -> String {
     let main = r##"
 <h1 class="page-h">Console</h1>
 <div class="page-sub">Runs this app's own commands only — the same safe actions as the buttons. Type <span class="mono">help</span>.</div>
-<div class="term">
-  <div class="term-head"><span class="dots"><i style="background:#ff5f57"></i><i style="background:#febc2e"></i><i style="background:#28c840"></i></span>
-    <span class="material-symbols-outlined" style="font-size:16px">terminal</span>CleanUpStorages console</div>
-  <div id="out" class="console-out" aria-live="polite"></div>
-  <div class="term-in-wrap"><span class="prompt">$</span>
-    <input id="cmd" class="console-in" placeholder="status  ·  search thesis  ·  scan D:\ --force" autofocus></div>
-</div>"##;
+<div id="out" class="console-out" aria-live="polite"></div>
+<div class="console-inbar"><span class="prompt">$</span>
+  <input id="cmd" class="console-in" placeholder="status  ·  search thesis  ·  scan D:\ --force" autofocus></div>"##;
     let script = r##"
 const out=$("#out");
 function print(s,cls){ const d=document.createElement("div"); if(cls)d.className=cls; d.textContent=s; out.appendChild(d); out.scrollTop=out.scrollHeight; }

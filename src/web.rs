@@ -1266,7 +1266,7 @@ mod tests {
             .await.unwrap();
         let bytes = axum::body::to_bytes(res.into_body(), 2_000_000).await.unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
-        assert!(body.contains("id=\"topq\""), "top-bar search input present");
+        assert!(body.contains("id=\"q\""), "search input present");
         assert!(body.contains("id=\"results\""), "results container present");
         assert!(body.contains("/api/search"), "page fetches the search API");
         assert!(body.contains("buildTree") && body.contains("renderTree"), "renders a tree");
