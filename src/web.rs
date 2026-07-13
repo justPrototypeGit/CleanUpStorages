@@ -161,6 +161,8 @@ struct DetectedDriveDto {
     volume_id: Option<String>,
     catalogued: bool,
     volume_label: Option<String>,
+    total_bytes: Option<u64>,
+    free_bytes: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -359,8 +361,13 @@ async fn api_detected_drives(State(state): State<AppState>)
             Some(vid) => (labels.contains_key(vid), labels.get(vid).cloned()),
             None => (false, None),
         };
+        let (total_bytes, free_bytes) = match crate::mounts::disk_capacity(&root) {
+            Some((t, f)) => (Some(t), Some(f)),
+            None => (None, None),
+        };
         out.push(DetectedDriveDto {
             mount_path: root.display().to_string(), volume_id, catalogued, volume_label,
+            total_bytes, free_bytes,
         });
     }
     out.sort_by(|a, b| a.mount_path.cmp(&b.mount_path));
