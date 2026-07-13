@@ -542,8 +542,8 @@ init();"##;
 
 pub fn review_page(csrf: &str) -> String {
     let main = r##"
-<div style="max-width:1000px;margin:0 auto">
-  <div class="row" style="justify-content:space-between;align-items:baseline;margin-bottom:20px">
+<div>
+  <div class="row" style="justify-content:space-between;align-items:baseline;margin-bottom:22px">
     <h1 class="page-h" style="margin:0">Review duplicates</h1><span class="mut" id="progress"></span></div>
   <div id="group"></div>
   <div class="rvbar">
