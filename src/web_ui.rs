@@ -186,6 +186,29 @@ details.drive>summary:hover,details.folder>summary:hover{background:var(--line);
 .folderin{flex:1;min-width:180px;display:flex;align-items:center;gap:10px;background:var(--sidebar-bg);border:1px solid var(--line);border-radius:var(--r);padding:11px 14px;}
 .folderin input{flex:1;border:0;background:transparent;padding:0;font:inherit;color:var(--fg);}
 .folderin input:focus{outline:none;box-shadow:none;}
+.drivecard{margin:0;display:flex;flex-direction:column;}
+.drivecard.err{border-color:color-mix(in srgb,var(--red) 30%,var(--line));background:color-mix(in srgb,var(--red-bg) 60%,var(--content));}
+.drivecard .dhead{display:flex;gap:14px;align-items:flex-start;}
+.drivecard .lastscan{margin-left:auto;font-size:12px;color:var(--mut);white-space:nowrap;padding-top:2px;}
+.status-line{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--mut);margin-top:4px;}
+.status-line .sdot{width:8px;height:8px;border-radius:50%;flex:none;}
+.cap-line{display:flex;justify-content:space-between;font-size:13px;margin:16px 0 8px;}
+.cap-line .pct{color:var(--mut);}
+.drivecard .actions{display:flex;gap:10px;margin-top:16px;padding-top:16px;border-top:1px solid var(--line);}
+.drivecard .actions .btn{flex:1;}
+.drivecard .actions .iconbtn{flex:0 0 auto;width:40px;padding:8px 0;}
+.drivecard .actions .iconbtn .material-symbols-outlined{font-size:19px;}
+.q-alert{display:flex;align-items:center;gap:14px;background:color-mix(in srgb,var(--red-bg) 70%,var(--content));
+ border:1px solid color-mix(in srgb,var(--red) 22%,var(--line));border-radius:var(--r-lg);padding:12px 14px;}
+.q-alert .q-ico{width:40px;height:40px;border-radius:50%;flex:none;display:flex;align-items:center;justify-content:center;background:var(--red-bg);color:var(--red);}
+.q-alert .qtxt strong{color:var(--red);display:block;font-size:13.5px;}
+.q-alert .qtxt span{font-size:12px;color:var(--mut);}
+.sumgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;}
+.sumcard{margin:0;}
+.sumcard .k{font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--mut);}
+.sumcard .v{font-size:31px;font-weight:700;letter-spacing:-.02em;margin:8px 0 6px;}
+.sumcard .v.accent{color:var(--accent-text);}
+.sumcard .s{font-size:12.5px;color:var(--mut);}
 .switch{position:relative;display:inline-block;width:38px;height:22px;}
 .switch input{opacity:0;width:0;height:0;}
 .switch .sl{position:absolute;inset:0;background:var(--line-strong);border-radius:999px;transition:.15s;}
@@ -208,6 +231,7 @@ option{background:var(--content);color:var(--fg);}
 @media (max-width:1100px){
   .grid>*{grid-column:1 / -1 !important;}
   .drivegrid{grid-template-columns:1fr;}
+  .sumgrid{grid-template-columns:1fr;}
   main{padding-left:24px;padding-right:24px;}
 }
 @media (max-width:820px){
@@ -546,41 +570,68 @@ load();"##;
 
 pub fn drives_page(csrf: &str) -> String {
     let main = r##"
-<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-  <div class="mut">Manage catalogued drives. Nothing here deletes files on your drives.</div>
-  <button class="btn btn-danger" id="purge-all">Purge all quarantines</button></div>
-<div id="drives" class="mut">Loading drives…</div>
+<div class="row" style="justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;margin-bottom:20px">
+  <div class="mut" style="font-size:14px">Manage and monitor your catalogued storage volumes. Nothing here deletes files on your drives.</div>
+  <div id="quarantine-alert"></div>
+</div>
+<div id="drives" class="drivegrid"><span class="mut">Loading drives…</span></div>
+<div class="sumgrid" id="summary" style="margin-top:4px"></div>
 <div class="mut" id="msg" style="margin-top:12px;min-height:1.4em"></div>"##;
     let script = r##"
-function bar(d){ if(d.total_bytes==null) return "";
+function bar(d){
+  if(d.total_bytes==null) return `<div class="cap-line"><span class="mut">Capacity unknown (drive offline)</span></div>
+    <div class="progressbar"><span style="width:0%"></span></div>`;
   const used=d.total_bytes-d.free_bytes, pct=Math.round(100*used/d.total_bytes);
-  return `<div style="margin:10px 0"><div style="display:flex;justify-content:space-between">
-    <span class="mono">${fmtSize(used)} of ${fmtSize(d.total_bytes)} used</span><span class="mut">${pct}% full</span></div>
-    <div class="progressbar"><span style="width:${pct}%"></span></div></div>`; }
+  const col=d.has_errors?'var(--red)':d.connected?'var(--accent)':'var(--gray)';
+  return `<div class="cap-line"><span>${fmtSize(used)} of ${fmtSize(d.total_bytes)} used</span><span class="pct">${pct}% full</span></div>
+    <div class="progressbar"><span style="width:${pct}%;background:${col}"></span></div>`;
+}
+function statusLine(d){
+  if(d.has_errors) return `<span class="sdot" style="background:var(--red)"></span><span style="color:var(--red)">Error · scan had errors</span>`;
+  if(d.connected) return `<span class="sdot" style="background:var(--green)"></span>Active · connected`;
+  return `<span class="sdot" style="background:var(--gray)"></span>Offline`;
+}
 async function load(){
-  const drives=await apiGet("/api/drives");
-  $("#drives").innerHTML = drives.length? drives.map(d=>`<div class="card" data-vid="${esc(d.volume_id)}" data-path="${esc(d.mount_path||'')}" data-desc="${esc(d.description||'')}">
-    <div style="display:flex;justify-content:space-between;align-items:start;gap:12px">
-      <div style="display:flex;align-items:start;gap:12px">
-        <div class="drive-ico" style="--dc:${driveColor(d.volume_id)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 13h18"/><circle cx="7" cy="16" r="1" fill="currentColor" stroke="none"/></svg></div>
-        <div><h3 style="margin:0">${esc(d.display_name||d.label)}</h3>
-        ${d.description?`<div class="mut" style="font-size:12px;margin-top:2px">${esc(d.description)}</div>`:""}
-        <div class="mut" style="font-size:12px;margin-top:3px">${d.connected?'<span class="pill active">connected</span>':'<span class="pill offline">offline</span>'}
-          · ${d.active_files.toLocaleString()} files · last scan ${fmtDate(d.last_seen_at)}
-          ${d.has_errors?' · <span class="pill missing">had scan errors</span>':''}</div></div></div>
-      <div class="mut mono" style="white-space:nowrap">${fmtSize(d.reclaimable_bytes)} reclaimable</div></div>
+  const [drives,st]=await Promise.all([apiGet("/api/drives"),apiGet("/api/stats").catch(()=>null)]);
+  $("#drives").innerHTML = drives.length? drives.map(d=>`<div class="card drivecard${d.has_errors?' err':''}" data-vid="${esc(d.volume_id)}" data-path="${esc(d.mount_path||'')}">
+    <div class="dhead">
+      <div class="card-ico" style="background:color-mix(in srgb,${driveColor(d.volume_id)} 14%,transparent);color:${driveColor(d.volume_id)}"><span class="material-symbols-outlined">hard_drive</span></div>
+      <div style="flex:1;min-width:0">
+        <div class="row" style="gap:8px"><h3 style="margin:0">${esc(d.display_name||d.label)}</h3><span class="lastscan">Last scan: ${fmtDate(d.last_seen_at)}</span></div>
+        <div class="status-line">${statusLine(d)} · ${d.active_files.toLocaleString()} files</div>
+        ${d.description?`<div class="mut" style="font-size:12px;margin-top:4px">${esc(d.description)}</div>`:""}
+      </div>
+    </div>
     ${bar(d)}
-    <div class="row" style="margin-top:12px">
-      <button class="btn rescan" ${d.connected?'':'disabled'}>${d.has_errors?'Repair (rescan)':'Rescan'}</button>
-      <button class="btn edit">Edit…</button>
-      <button class="btn btn-danger forget">Forget…</button></div>
-    <div class="edit-form" style="display:none;margin-top:12px;border-top:1px solid var(--line);padding-top:12px">
+    <div class="actions">
+      <button class="btn rescan" ${d.connected?'':'disabled'}><span class="material-symbols-outlined">${d.has_errors?'build':'refresh'}</span>${d.has_errors?'Repair':'Update catalog'}</button>
+      <button class="btn edit"><span class="material-symbols-outlined">edit</span>Edit</button>
+      <button class="btn btn-danger iconbtn forget" title="Forget this drive"><span class="material-symbols-outlined">delete</span></button>
+    </div>
+    <div class="edit-form" style="display:none;margin-top:14px;padding-top:14px;border-top:1px solid var(--line)">
       <input class="ef-name" type="text" placeholder="Custom name (blank = detected)" style="width:100%;margin-bottom:8px" value="${esc(d.display_name||'')}">
-      <input class="ef-desc" type="text" placeholder="Short description" style="width:100%;margin-bottom:8px" value="${esc(d.description||'')}">
+      <input class="ef-desc" type="text" placeholder="Short description" style="width:100%;margin-bottom:10px" value="${esc(d.description||'')}">
       <div class="row"><button class="btn btn-primary ef-save">Save</button><button class="btn ef-cancel">Cancel</button></div>
     </div></div>`).join("")
-    : '<div class="mut">No drives catalogued yet. Scan one from the Scan page.</div>';
-  for(const c of document.querySelectorAll("[data-vid]")){
+    : '<div class="mut" style="grid-column:1 / -1">No drives catalogued yet. Scan one from the Scan page.</div>';
+
+  const totReclaim=drives.reduce((a,d)=>a+(d.reclaimable_bytes||0),0);
+  const withQ=drives.filter(d=>(d.reclaimable_bytes||0)>0).length;
+  $("#quarantine-alert").innerHTML = totReclaim>0 ? `<div class="q-alert">
+    <div class="q-ico"><span class="material-symbols-outlined">delete_sweep</span></div>
+    <div class="qtxt"><strong>Quarantined files</strong><span>${fmtSize(totReclaim)} across ${withQ} drive${withQ===1?'':'s'}</span></div>
+    <button class="btn btn-danger" id="purge-all" style="margin-left:6px">Purge all</button></div>` : "";
+  const q=$("#purge-all"); if(q) q.onclick=purgeAll;
+
+  const totBytes=drives.reduce((a,d)=>a+(d.active_bytes||0),0);
+  const totFiles=drives.reduce((a,d)=>a+(d.active_files||0),0);
+  const groups=st?st.duplicate_groups:0;
+  $("#summary").innerHTML = drives.length ? `
+    <div class="card sumcard"><div class="k">Total catalogued</div><div class="v">${fmtSize(totBytes)}</div><div class="s">Across ${drives.length} volume${drives.length===1?'':'s'}</div></div>
+    <div class="card sumcard"><div class="k">Files indexed</div><div class="v">${totFiles.toLocaleString()}</div><div class="s">Active entries in the catalog</div></div>
+    <div class="card sumcard"><div class="k">Reclaimable</div><div class="v accent">${fmtSize(totReclaim)}</div><div class="s">${groups} duplicate group${groups===1?'':'s'} pending</div></div>` : "";
+
+  for(const c of document.querySelectorAll(".drivecard[data-vid]")){
     c.querySelector(".forget").onclick=async()=>{
       const vid=c.dataset.vid, label=c.querySelector("h3").textContent;
       if(!window.confirm(`Forget "${label}"? This removes it from the catalog only — files on the drive are NOT deleted. You can rescan to re-add it.`))return;
@@ -604,7 +655,7 @@ async function load(){
     };
   }
 }
-$("#purge-all").onclick=async()=>{
+async function purgeAll(){
   if(!window.confirm("Permanently delete every drive's _ToDelete quarantine? This is the only real delete and cannot be undone."))return;
   try{ const r=await apiPost("/api/purge-all",{});
     let m=`Purged ${r.purged_volumes} volume(s), reclaimed ${fmtSize(r.bytes_reclaimed)}.`;
@@ -612,7 +663,7 @@ $("#purge-all").onclick=async()=>{
     if(r.errors.length)m+=" Errors: "+r.errors.join("; ");
     $("#msg").textContent=m; load(); }
   catch(e){ $("#msg").textContent="Error: "+e; }
-};
+}
 load().catch(e=>{$("#drives").textContent="Error: "+e;});"##;
     shell("drives", csrf, "Drives", main, script)
 }
