@@ -63,7 +63,7 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/scan", get(scan_page_h))
         .route("/drives", get(drives_page_h))
         .route("/console", get(console_page_h))
-        .route("/assets/InterVariable.woff2", get(asset_inter_font))
+        .route("/assets/:file", get(asset))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|req: &axum::http::Request<axum::body::Body>| {
@@ -103,13 +103,21 @@ async fn console_page_h(State(state): State<AppState>) -> Html<String> {
     Html(crate::web_ui::console_page(&state.csrf_token))
 }
 
-/// The vendored Inter variable font, served same-origin (no external request) and cached hard.
-async fn asset_inter_font() -> impl IntoResponse {
+/// Vendored fonts, served same-origin (no external request) and cached hard. Everything is
+/// self-hosted so the UI stays 100% offline.
+async fn asset(AxPath(file): AxPath<String>) -> Response {
+    let bytes: &'static [u8] = match file.as_str() {
+        "InterVariable.woff2" => include_bytes!("../assets/InterVariable.woff2"),
+        "JetBrainsMono-Regular.woff2" => include_bytes!("../assets/JetBrainsMono-Regular.woff2"),
+        "JetBrainsMono-Medium.woff2" => include_bytes!("../assets/JetBrainsMono-Medium.woff2"),
+        "MaterialSymbolsOutlined.woff2" => include_bytes!("../assets/MaterialSymbolsOutlined.woff2"),
+        _ => return (StatusCode::NOT_FOUND, "no such asset").into_response(),
+    };
     (
         [(header::CONTENT_TYPE, "font/woff2"),
          (header::CACHE_CONTROL, "public, max-age=31536000, immutable")],
-        axum::body::Bytes::from_static(include_bytes!("../assets/InterVariable.woff2")),
-    )
+        axum::body::Bytes::from_static(bytes),
+    ).into_response()
 }
 
 /// Web-facing shape for a search hit; keeps serialization concerns out of `catalog::models`.

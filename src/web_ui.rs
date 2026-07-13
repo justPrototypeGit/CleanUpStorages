@@ -5,70 +5,92 @@
 pub const STYLE: &str = r##"
 @font-face{font-family:'Inter';src:url(/assets/InterVariable.woff2) format('woff2');
  font-weight:100 900;font-style:normal;font-display:swap;}
-:root{color-scheme:light dark;--font-ui:'Inter',-apple-system,"Segoe UI",Roboto,system-ui,sans-serif;
- --bg:#ececee;--panel:#ffffffc4;--content:#ffffff;--elev:#ffffff;--fg:#1d1d1f;--mut:#6e6e73;
- --line:#00000014;--line-strong:#00000022;--accent:#0071e3;--accent-weak:#0071e314;
- --amber:#b25000;--amber-bg:#ff9f0a24;--red:#c9382b;--red-bg:#ff453a1f;
- --green:#1a7f37;--green-bg:#30d15824;--gray:#8a8a8e;
- --r-sm:6px;--r:9px;--r-lg:11px;
- --sh-sm:0 1px 1px #0000000a,0 1px 3px #0000000d;
- --sh-md:0 4px 14px #00000012,0 1px 3px #0000000d;--sh-lg:0 12px 30px #0000001a;
- --sidebar:240px;--topbar:52px;}
+@font-face{font-family:'JetBrains Mono';src:url(/assets/JetBrainsMono-Regular.woff2) format('woff2');font-weight:400;font-display:swap;}
+@font-face{font-family:'JetBrains Mono';src:url(/assets/JetBrainsMono-Medium.woff2) format('woff2');font-weight:500;font-display:swap;}
+@font-face{font-family:'Material Symbols Outlined';src:url(/assets/MaterialSymbolsOutlined.woff2) format('woff2');font-weight:100 700;font-style:normal;font-display:block;}
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:normal;font-style:normal;font-size:20px;
+ line-height:1;letter-spacing:normal;text-transform:none;display:inline-block;white-space:nowrap;word-wrap:normal;
+ direction:ltr;-webkit-font-feature-settings:'liga';-webkit-font-smoothing:antialiased;
+ font-variation-settings:'FILL' 0,'wght' 300,'GRAD' 0,'opsz' 24;flex:none;}
+:root{color-scheme:light dark;
+ --font-ui:'Inter',-apple-system,"Segoe UI",Roboto,system-ui,sans-serif;
+ --font-mono:'JetBrains Mono',ui-monospace,"SF Mono",Consolas,monospace;
+ --bg:#fcf8fb;--sidebar-bg:#f6f3f5;--content:#ffffff;--elev:#ffffff;--fg:#1b1b1d;--mut:#5c626e;--mut2:#8a8f99;
+ --line:#1b1b1d1a;--line-strong:#1b1b1d2b;--accent:#0071e3;--accent-text:#0059b5;--accent-weak:#0071e31a;
+ --amber:#9a5b00;--amber-bg:#f59e0b26;--red:#ba1a1a;--red-bg:#ba1a1a17;--green:#1a7f37;--green-bg:#2ecc7122;--gray:#717785;
+ --r-sm:6px;--r:8px;--r-lg:12px;
+ --sh-sm:0 1px 3px #0000000d,0 1px 2px #0000001a;
+ --sh-md:0 6px 16px #0000001f,0 1px 3px #00000014;--sh-lg:0 16px 40px #00000026;
+ --sidebar:260px;--topbar:52px;}
 :root[data-theme="light"]{
- --bg:#ececee;--panel:#ffffffc4;--content:#ffffff;--elev:#ffffff;--fg:#1d1d1f;--mut:#6e6e73;
- --line:#00000014;--line-strong:#00000022;--accent:#0071e3;--accent-weak:#0071e314;
- --amber:#b25000;--amber-bg:#ff9f0a24;--red:#c9382b;--red-bg:#ff453a1f;
- --green:#1a7f37;--green-bg:#30d15824;--gray:#8a8a8e;}
+ --bg:#fcf8fb;--sidebar-bg:#f6f3f5;--content:#ffffff;--elev:#ffffff;--fg:#1b1b1d;--mut:#5c626e;--mut2:#8a8f99;
+ --line:#1b1b1d1a;--line-strong:#1b1b1d2b;--accent:#0071e3;--accent-text:#0059b5;--accent-weak:#0071e31a;
+ --amber:#9a5b00;--amber-bg:#f59e0b26;--red:#ba1a1a;--red-bg:#ba1a1a17;--green:#1a7f37;--green-bg:#2ecc7122;--gray:#717785;}
 @media (prefers-color-scheme:dark){:root{
- --bg:#161618;--panel:#1f1f22c4;--content:#232327;--elev:#2e2e33;--fg:#f5f5f7;--mut:#9a9aa0;
- --line:#ffffff14;--line-strong:#ffffff28;--accent:#0a84ff;--accent-weak:#0a84ff26;
- --amber:#ff9f0a;--amber-bg:#ff9f0a26;--red:#ff453a;--red-bg:#ff453a26;
- --green:#30d158;--green-bg:#30d15826;--gray:#98989d;}}
+ --bg:#161618;--sidebar-bg:#1c1c1f;--content:#232327;--elev:#2e2e33;--fg:#f3f0f2;--mut:#9a9aa2;--mut2:#75757e;
+ --line:#ffffff14;--line-strong:#ffffff26;--accent:#0a84ff;--accent-text:#57a8ff;--accent-weak:#0a84ff26;
+ --amber:#ff9f0a;--amber-bg:#ff9f0a26;--red:#ff5a4d;--red-bg:#ff453a26;--green:#30d158;--green-bg:#30d15826;--gray:#98989d;}}
 :root[data-theme="dark"]{
- --bg:#161618;--panel:#1f1f22c4;--content:#232327;--elev:#2e2e33;--fg:#f5f5f7;--mut:#9a9aa0;
- --line:#ffffff14;--line-strong:#ffffff28;--accent:#0a84ff;--accent-weak:#0a84ff26;
- --amber:#ff9f0a;--amber-bg:#ff9f0a26;--red:#ff453a;--red-bg:#ff453a26;
- --green:#30d158;--green-bg:#30d15826;--gray:#98989d;}
+ --bg:#161618;--sidebar-bg:#1c1c1f;--content:#232327;--elev:#2e2e33;--fg:#f3f0f2;--mut:#9a9aa2;--mut2:#75757e;
+ --line:#ffffff14;--line-strong:#ffffff26;--accent:#0a84ff;--accent-text:#57a8ff;--accent-weak:#0a84ff26;
+ --amber:#ff9f0a;--amber-bg:#ff9f0a26;--red:#ff5a4d;--red-bg:#ff453a26;--green:#30d158;--green-bg:#30d15826;--gray:#98989d;}
 *{box-sizing:border-box;}
-body{margin:0;font:13px/1.5 var(--font-ui);letter-spacing:-.003em;
+body{margin:0;font:14px/1.45 var(--font-ui);letter-spacing:-.006em;
  background:var(--bg);color:var(--fg);-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;}
-.mono{font-family:ui-monospace,"SF Mono","Cascadia Code",Consolas,monospace;font-variant-numeric:tabular-nums;font-size:.92em;}
-h1,h2,h3{letter-spacing:-.014em;font-weight:600;margin-top:0;}
-h3{font-size:14px;} h2{font-size:19px;}
+.mono{font-family:var(--font-mono);font-variant-numeric:tabular-nums;font-size:12px;letter-spacing:-.02em;}
+h1,h2,h3{letter-spacing:-.02em;font-weight:600;margin-top:0;}
+h3{font-size:15px;} h2{font-size:22px;}
 aside.side{position:fixed;left:0;top:0;bottom:0;width:var(--sidebar);display:flex;flex-direction:column;
- background:var(--panel);backdrop-filter:blur(24px) saturate(180%);-webkit-backdrop-filter:blur(24px) saturate(180%);
- border-right:1px solid var(--line);padding:18px 12px;overflow-y:auto;}
-aside.side h1{font-size:16px;margin:2px 8px 0;font-weight:650;}
-aside.side .tagline{margin:0 8px 18px;font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.06em;}
-nav a{display:flex;gap:10px;align-items:center;padding:6px 9px;margin:1px 0;border-radius:var(--r-sm);
- color:var(--fg);text-decoration:none;font-weight:500;font-size:13px;transition:background .12s,color .12s;}
-nav a.active{background:var(--accent-weak);color:var(--accent);}
+ background:color-mix(in srgb,var(--sidebar-bg) 86%,transparent);
+ backdrop-filter:blur(40px) saturate(180%);-webkit-backdrop-filter:blur(40px) saturate(180%);
+ border-right:1px solid var(--line);padding:18px 0;overflow-y:auto;}
+aside.side h1{font-size:24px;margin:0;padding:2px 20px 0;font-weight:700;letter-spacing:-.03em;line-height:1.1;}
+aside.side .tagline{margin:0;padding:2px 20px 22px;font-size:12.5px;color:var(--mut2);}
+nav{padding:0 10px;display:flex;flex-direction:column;gap:1px;}
+nav a{display:flex;gap:12px;align-items:center;padding:7px 12px;border-radius:var(--r);
+ color:var(--mut);text-decoration:none;font-weight:500;font-size:13px;transition:background .12s,color .12s;}
+nav a.active{background:var(--accent-weak);color:var(--accent-text);font-weight:600;}
 nav a:hover:not(.active){background:var(--line);color:var(--fg);}
-nav a svg{width:18px;height:18px;flex:none;}
+nav a .material-symbols-outlined{font-size:20px;}
 header.top{position:fixed;top:0;left:var(--sidebar);right:0;height:var(--topbar);display:flex;align-items:center;
- gap:12px;padding:0 24px;background:color-mix(in srgb,var(--bg) 72%,transparent);
- backdrop-filter:blur(24px) saturate(180%);-webkit-backdrop-filter:blur(24px) saturate(180%);
+ gap:12px;padding:0 24px;background:color-mix(in srgb,var(--bg) 80%,transparent);
+ backdrop-filter:blur(20px) saturate(150%);-webkit-backdrop-filter:blur(20px) saturate(150%);
  border-bottom:1px solid var(--line);z-index:5;}
-header.top strong{font-size:13.5px;font-weight:600;letter-spacing:-.01em;}
+header.top strong{font-size:15px;font-weight:600;letter-spacing:-.02em;}
 header.top .spacer{flex:1;}
-main{margin-left:var(--sidebar);padding:calc(var(--topbar) + 28px) 40px 64px;}
-main>*{max-width:1180px;margin-left:auto;margin-right:auto;}
-.card{background:var(--content);border:1px solid var(--line-strong);border-radius:var(--r-lg);padding:18px;
- margin:0 0 14px;box-shadow:var(--sh-sm);}
+main{margin-left:var(--sidebar);padding:calc(var(--topbar) + 32px) 32px 48px;}
+main>*{max-width:1152px;margin-left:auto;margin-right:auto;}
+.card{background:var(--content);border:1px solid var(--line);border-radius:var(--r-lg);padding:22px;
+ margin:0 0 20px;box-shadow:var(--sh-sm);}
 .card.hover{transition:box-shadow .16s,transform .16s,border-color .16s;}
-.card.hover:hover{box-shadow:var(--sh-md);transform:translateY(-1px);border-color:var(--line-strong);}
-.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:16px;}
+.card.hover:hover{box-shadow:var(--sh-md);transform:translateY(-1px);}
+.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:20px;}
 .mut{color:var(--mut);} .row{display:flex;align-items:center;gap:8px;}
-.btn{font:inherit;font-weight:500;padding:5px 12px;border-radius:var(--r-sm);border:1px solid var(--line-strong);
- background:var(--content);color:var(--fg);cursor:pointer;display:inline-flex;align-items:center;gap:6px;
- transition:background .12s,box-shadow .12s;box-shadow:var(--sh-sm);}
-.btn:hover{background:var(--line);} .btn:active{background:var(--line-strong);}
-.btn svg{width:14px;height:14px;}
-.btn-primary{background:linear-gradient(color-mix(in srgb,var(--accent) 94%,#fff),var(--accent));
- border-color:color-mix(in srgb,var(--accent) 60%,#000);color:#fff;box-shadow:inset 0 1px 0 #ffffff2e,var(--sh-sm);}
-.btn-primary:hover{filter:brightness(1.04);}
-.btn-danger{background:var(--content);border-color:color-mix(in srgb,var(--red) 45%,var(--line-strong));color:var(--red);}
+.btn{font:inherit;font-weight:500;font-size:13px;padding:8px 15px;border-radius:var(--r);border:1px solid var(--line-strong);
+ background:var(--content);color:var(--fg);cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:6px;
+ transition:background .12s,box-shadow .12s,filter .12s;box-shadow:var(--sh-sm);white-space:nowrap;}
+.btn:hover{background:var(--line);} .btn:active{transform:translateY(.5px);}
+.btn .material-symbols-outlined{font-size:18px;}
+.btn-primary{background:var(--accent);border-color:transparent;color:#fff;box-shadow:0 1px 2px #0071e340;}
+.btn-primary:hover{filter:brightness(1.06);background:var(--accent);}
+.btn-danger{background:var(--content);border-color:color-mix(in srgb,var(--red) 40%,var(--line-strong));color:var(--red);}
 .btn-danger:hover{background:var(--red-bg);}
+.card-ico{width:44px;height:44px;border-radius:10px;display:flex;align-items:center;justify-content:center;flex:none;
+ background:var(--accent-weak);color:var(--accent);}
+.card-ico .material-symbols-outlined{font-size:22px;}
+.tag{font-size:11px;font-weight:500;padding:3px 9px;border-radius:6px;background:var(--line);color:var(--mut);font-family:var(--font-mono);}
+.linkbtn{display:inline-flex;align-items:center;gap:5px;background:none;border:0;cursor:pointer;color:var(--mut);font:inherit;font-size:12.5px;padding:2px 4px;border-radius:6px;}
+.linkbtn:hover{color:var(--accent);}
+.linkbtn .material-symbols-outlined{font-size:16px;}
+.actrow{display:flex;align-items:center;gap:14px;padding:12px 2px;border-top:1px solid var(--line);}
+.actrow:first-child{border-top:0;}
+.act-ico{width:40px;height:40px;border-radius:10px;flex:none;display:flex;align-items:center;justify-content:center;}
+.act-ico .material-symbols-outlined{font-size:20px;}
+.act-title{font-weight:500;font-size:13.5px;}
+.act-time{margin-left:auto;font-size:12px;color:var(--mut2);font-family:var(--font-mono);white-space:nowrap;}
+.tone-red{background:var(--red-bg);color:var(--red);} .tone-blue{background:var(--accent-weak);color:var(--accent);}
+.tone-gray{background:var(--line);color:var(--mut);} .tone-green{background:var(--green-bg);color:var(--green);}
+.tone-amber{background:var(--amber-bg);color:var(--amber);}
 .icon-btn{border:0;background:transparent;color:var(--mut);border-radius:999px;width:30px;height:30px;
  display:inline-flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:none;padding:0;}
 .icon-btn:hover{background:var(--line);color:var(--fg);}
@@ -125,6 +147,11 @@ details.drive>summary:hover,details.folder>summary:hover{background:var(--line);
 .leaf.hl{background:color-mix(in srgb,var(--dup) 24%,transparent);box-shadow:inset 0 0 0 1px var(--dup);}
 .diamond{font-size:11px;font-weight:700;color:var(--dup);flex:none;}
 .stat{font-size:23px;font-weight:600;letter-spacing:-.02em;}
+.hero{position:relative;overflow:hidden;padding:26px 28px;}
+.hero-glow{position:absolute;top:-60%;right:-10%;width:60%;height:220%;pointer-events:none;
+ background:radial-gradient(closest-side,var(--accent-weak),transparent 72%);opacity:.9;}
+.hero-label{position:relative;font-size:11px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:var(--accent-text);}
+.hero-stat{position:relative;font-size:40px;font-weight:700;letter-spacing:-.03em;margin:8px 0 4px;line-height:1.05;}
 .tiles{display:flex;gap:12px;flex-wrap:wrap;}
 .tile{flex:1;min-width:120px;background:var(--content);border:1px solid var(--line);border-radius:var(--r);padding:12px 14px;box-shadow:var(--sh-sm);}
 .tile .k{font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.05em;}
@@ -145,7 +172,7 @@ option{background:var(--content);color:var(--fg);}
 .seg button{border:0;background:transparent;color:var(--mut);border-radius:999px;padding:4px 9px;
  cursor:pointer;display:flex;align-items:center;gap:5px;font:inherit;font-size:12px;}
 .seg button.on{background:var(--content);color:var(--fg);box-shadow:var(--sh-sm);}
-.seg button svg{width:14px;height:14px;}
+.seg button .material-symbols-outlined{font-size:15px;}
 .themebar{margin-top:auto;padding-top:14px;border-top:1px solid var(--line);}
 .themebar .lbl{font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.05em;display:block;margin:0 4px 6px;}
 "##;
@@ -156,6 +183,7 @@ const CSRF=(document.querySelector('meta[name="csrf"]')||{}).content||"";
 function esc(s){return (s==null?"":String(s)).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
 function fmtSize(n){if(n==null)return"—";const u=["B","KB","MB","GB","TB"];let i=0,x=Number(n);while(x>=1024&&i<u.length-1){x/=1024;i++;}return (i?x.toFixed(1):x)+" "+u[i];}
 function fmtDate(t){return t?new Date(t*1000).toISOString().slice(0,10):"—";}
+function fmtAgo(t){if(!t)return"—";const s=Math.max(0,Math.floor(Date.now()/1000-t));if(s<60)return s+"s ago";const m=Math.floor(s/60);if(m<60)return m+"m ago";const h=Math.floor(m/60);if(h<24)return h+"h ago";const d=Math.floor(h/24);if(d<7)return d+"d ago";return fmtDate(t);}
 function hueOf(s){let h=0;for(let i=0;i<String(s).length;i++)h=(h*31+String(s).charCodeAt(i))>>>0;return h%360;}
 function driveColor(id){return `hsl(${hueOf(id)},46%,52%)`;}
 function dupColor(hash){return `hsl(${hueOf(hash)},42%,56%)`;}
@@ -172,26 +200,20 @@ function applyTheme(t){ if(t==='auto'){localStorage.removeItem('theme');delete d
   });})();
 "##;
 
-/// Inline SVG for a nav glyph (stroke-based, currentColor). Unknown keys get a generic dot.
-fn icon(name: &str) -> &'static str {
-    match name {
-        "overview" => r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>"#,
-        "browse" => r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7h5l2 2h11v9a2 2 0 0 1-2 2H3z"/></svg>"#,
-        "duplicates" => r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>"#,
-        "drives" => r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><circle cx="7" cy="7.5" r="1"/><circle cx="7" cy="16.5" r="1"/></svg>"#,
-        "scan" => r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>"#,
-        "console" => r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/></svg>"#,
-        "auto" => r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 3v18"/></svg>"#,
-        "light" => r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M5 5l1.5 1.5M17.5 17.5 19 19M19 5l-1.5 1.5M6.5 17.5 5 19"/></svg>"#,
-        "dark" => r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A8 8 0 1 1 11.2 3a6.5 6.5 0 0 0 9.8 9.8Z"/></svg>"#,
-        "edit" => r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>"#,
-        "trash" => r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/></svg>"#,
-        "refresh" => r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>"#,
-        "folder" => r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7h5l2 2h11v9a2 2 0 0 1-2 2H3z"/></svg>"#,
-        "check" => r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6 9 17l-5-5"/></svg>"#,
-        "warn" => r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3 2 20h20L12 3Z"/><path d="M12 9v5M12 17h.01"/></svg>"#,
-        "plus" => r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>"#,
-        _ => r#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/></svg>"#,
+/// Material Symbols (Outlined) glyph name for a UI key. The self-hosted icon font renders these as
+/// ligatures via `<span class="material-symbols-outlined">{glyph}</span>`.
+fn glyph(key: &str) -> &'static str {
+    match key {
+        "overview" => "dashboard",
+        "browse" => "folder_open",
+        "duplicates" => "content_copy",
+        "drives" => "hard_drive",
+        "scan" => "frame_inspect",
+        "console" => "terminal",
+        "auto" => "brightness_auto",
+        "light" => "light_mode",
+        "dark" => "dark_mode",
+        _ => "circle",
     }
 }
 
@@ -210,14 +232,14 @@ pub fn shell(active: &str, csrf: &str, title: &str, main_html: &str, page_script
     let nav = NAV.iter().map(|n| {
         let cls = if n.key == active { "active" } else { "" };
         let current = if n.key == active { r#" aria-current="page""# } else { "" };
-        format!(r#"<a class="{cls}"{current} href="{}">{}<span>{}</span></a>"#, n.href, icon(n.key), n.label)
+        format!(r#"<a class="{cls}"{current} href="{}"><span class="material-symbols-outlined">{}</span><span>{}</span></a>"#, n.href, glyph(n.key), n.label)
     }).collect::<String>();
     let themebar = format!(r##"<div class="themebar"><span class="lbl">Theme</span>
 <div class="seg" role="group" aria-label="Theme">
-<button data-theme="auto" title="Follow system">{}<span>Auto</span></button>
-<button data-theme="light" title="Light">{}<span>Light</span></button>
-<button data-theme="dark" title="Dark">{}<span>Dark</span></button></div></div>"##,
-        icon("auto"), icon("light"), icon("dark"));
+<button data-theme="auto" title="Follow system"><span class="material-symbols-outlined">{}</span>Auto</button>
+<button data-theme="light" title="Light"><span class="material-symbols-outlined">{}</span>Light</button>
+<button data-theme="dark" title="Dark"><span class="material-symbols-outlined">{}</span>Dark</button></div></div>"##,
+        glyph("auto"), glyph("light"), glyph("dark"));
     format!(r##"<!doctype html><html lang="en"><head>
 <script>(function(){{var u=new URLSearchParams(location.search).get('theme');var t=u||localStorage.getItem('theme');if(t&&t!=='auto')document.documentElement.dataset.theme=t;}})();</script>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -234,39 +256,69 @@ pub fn shell(active: &str, csrf: &str, title: &str, main_html: &str, page_script
 
 pub fn overview_page(csrf: &str) -> String {
     let main = r##"
-<section class="card" style="padding:20px 22px">
-  <div class="mut" style="font-size:10.5px;text-transform:uppercase;letter-spacing:.07em;font-weight:600">System health</div>
-  <h2 id="hero" class="stat" style="margin:7px 0 3px">…</h2>
-  <div class="mut" id="hero-sub" style="font-size:12.5px"></div>
+<section class="card hero">
+  <div class="hero-glow"></div>
+  <div class="hero-label">System health</div>
+  <h2 id="hero" class="hero-stat">…</h2>
+  <div class="mut" id="hero-sub" style="font-size:13px"></div>
 </section>
 <div class="grid">
-  <div class="card hover" style="grid-column:span 5"><h3 style="margin-top:0">Duplicate groups</h3>
-    <div class="stat" id="dupe-count">…</div>
-    <div class="mut" id="dupe-reclaim"></div>
-    <a class="btn btn-primary" href="/review" style="margin-top:14px;text-decoration:none">Review duplicates</a></div>
-  <div class="card hover" style="grid-column:span 7"><h3 style="margin-top:0">Reclaimable space</h3>
-    <div id="reclaim-bars"></div></div>
-  <div class="card" style="grid-column:span 12"><h3 style="margin-top:0">Recent activity</h3>
+  <div class="card" style="grid-column:span 5;display:flex;flex-direction:column">
+    <div class="row" style="justify-content:space-between;margin-bottom:14px">
+      <div class="card-ico"><span class="material-symbols-outlined">content_copy</span></div>
+      <span class="tag" id="dupe-tag" style="display:none">High Priority</span>
+    </div>
+    <h3 style="margin:0">Duplicate groups</h3>
+    <div class="hero-stat" id="dupe-count" style="font-size:34px;margin:2px 0 2px">…</div>
+    <div class="mut" id="dupe-reclaim" style="font-size:12.5px;margin-bottom:16px"></div>
+    <a class="btn btn-primary" href="/review" style="margin-top:auto;text-decoration:none;width:100%">Review duplicates</a>
+  </div>
+  <div class="card" style="grid-column:span 7">
+    <div class="row" style="justify-content:space-between;margin-bottom:6px">
+      <h3 style="margin:0">Reclaimable space</h3>
+      <button class="linkbtn" id="purge-link"><span class="material-symbols-outlined">delete_sweep</span>Purge quarantine</button>
+    </div>
+    <div id="reclaim-bars"></div>
+  </div>
+  <div class="card" style="grid-column:span 12"><h3 style="margin:0 0 6px">Recent activity</h3>
     <div id="activity" class="mut">Loading…</div></div>
-</div>"##;
+</div>
+<div class="mut" id="msg" style="margin-top:4px;min-height:1.2em;text-align:center"></div>"##;
     let script = r##"
+const ACT_ICO={scan:["frame_inspect","tone-blue"],quarantine:["inventory_2","tone-amber"],
+  quarantine_skip:["shield","tone-gray"],quarantine_error:["error","tone-red"],
+  repack:["archive","tone-blue"],purge:["delete_sweep","tone-red"],
+  forget:["hard_drive","tone-gray"],rename:["edit","tone-gray"]};
 async function init(){
   const st=await apiGet("/api/stats");
   const totalFiles=st.volumes.reduce((a,v)=>a+v.active_files,0);
-  $("#hero").textContent=totalFiles.toLocaleString()+" files catalogued";
-  $("#hero-sub").textContent="across "+st.volumes.length+" drive"+(st.volumes.length===1?"":"s")+" · catalog stored on this computer";
-  $("#dupe-count").textContent=st.duplicate_groups+" group"+(st.duplicate_groups===1?"":"s");
+  $("#hero").innerHTML=totalFiles.toLocaleString()+' <span style="font-weight:500;font-size:.5em;color:var(--mut)">files catalogued</span>';
+  $("#hero-sub").textContent="Across "+st.volumes.length+" drive"+(st.volumes.length===1?"":"s")+" · catalog stored safely on this computer";
+  $("#dupe-count").textContent=st.duplicate_groups.toLocaleString();
+  if(st.duplicate_groups>0)$("#dupe-tag").style.display="";
   const drives=await apiGet("/api/drives");
   const totalReclaim=drives.reduce((a,d)=>a+(d.reclaimable_bytes||0),0);
-  $("#dupe-reclaim").textContent="~"+fmtSize(totalReclaim)+" reclaimable";
+  $("#dupe-reclaim").textContent="≈ "+fmtSize(totalReclaim)+" reclaimable";
   const max=Math.max(1,...drives.map(d=>d.reclaimable_bytes||0));
-  $("#reclaim-bars").innerHTML=drives.map(d=>`<div style="margin:10px 0">
-     <div style="display:flex;justify-content:space-between"><span><span class="dot" style="background:${driveColor(d.volume_id)};display:inline-block;margin-right:6px"></span>${esc(d.display_name||d.label)}</span><span class="mono">${fmtSize(d.reclaimable_bytes)}</span></div>
-     <div class="progressbar"><span style="width:${Math.round(100*(d.reclaimable_bytes||0)/max)}%"></span></div></div>`).join("")||'<span class="mut">Nothing to reclaim.</span>';
+  $("#reclaim-bars").innerHTML=drives.length?drives.map(d=>`<div style="margin:12px 0 2px">
+     <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:5px"><span><span class="dot" style="background:${driveColor(d.volume_id)};display:inline-block;margin-right:7px"></span>${esc(d.display_name||d.label)}</span><span class="mono">${fmtSize(d.reclaimable_bytes)}</span></div>
+     <div class="progressbar"><span style="width:${Math.round(100*(d.reclaimable_bytes||0)/max)}%"></span></div></div>`).join(""):'<span class="mut">No drives catalogued yet.</span>';
   const acts=await apiGet("/api/activity");
-  $("#activity").innerHTML=acts.length?acts.map(a=>`<div style="padding:6px 0;border-bottom:1px solid var(--line)">
-     <span>${esc(a.summary)}</span> <span class="mut mono" style="float:right">${fmtDate(a.occurred_at)}</span></div>`).join(""):"No activity yet.";
+  $("#activity").innerHTML=acts.length?acts.map(a=>{
+     const[ic,tone]=ACT_ICO[a.kind]||["bolt","tone-gray"];
+     return `<div class="actrow"><div class="act-ico ${tone}"><span class="material-symbols-outlined">${ic}</span></div>
+       <div><div class="act-title">${esc(a.summary)}</div></div>
+       <div class="act-time">${fmtAgo(a.occurred_at)}</div></div>`;}).join(""):'<div class="mut" style="padding:8px 0">No activity yet.</div>';
 }
+$("#purge-link").onclick=async()=>{
+  if(!window.confirm("Permanently delete every drive's _ToDelete quarantine? This is the only real delete and cannot be undone."))return;
+  try{ const r=await apiPost("/api/purge-all",{});
+    let m=`Purged ${r.purged_volumes} volume(s), reclaimed ${fmtSize(r.bytes_reclaimed)}.`;
+    if(r.skipped_unmounted.length)m+=" Skipped (offline): "+r.skipped_unmounted.join(", ")+".";
+    if(r.errors.length)m+=" Errors: "+r.errors.join("; ");
+    $("#msg").textContent=m; init(); }
+  catch(e){ $("#msg").textContent="Error: "+e; }
+};
 init().catch(e=>{$("#activity").textContent="Error: "+e;});"##;
     shell("overview", csrf, "Overview", main, script)
 }
