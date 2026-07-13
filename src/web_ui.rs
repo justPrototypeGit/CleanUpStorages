@@ -139,14 +139,21 @@ th{color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase;lett
 .badge{font-size:11px;color:var(--accent);font-weight:600;margin-top:8px;display:block;}
 .arch{color:var(--mut);font-size:11px;margin-top:8px;}
 .branch{margin-left:14px;border-left:1px solid var(--line);padding-left:8px;}
-details.drive>summary,details.folder>summary{cursor:pointer;padding:5px 7px;border-radius:var(--r-sm);
- list-style:none;display:flex;align-items:center;gap:8px;user-select:none;}
+details.drive>summary,details.folder>summary{cursor:pointer;padding:7px 9px;border-radius:var(--r-sm);
+ list-style:none;display:flex;align-items:center;gap:8px;user-select:none;font-size:13.5px;}
 details>summary::-webkit-details-marker{display:none;}
-details>summary::before{content:"\25B8";color:var(--mut);font-size:11px;width:10px;transition:transform .12s;}
+details>summary::before{content:"\25B8";color:var(--mut);font-size:11px;width:10px;transition:transform .12s;flex:none;}
 details[open]>summary::before{transform:rotate(90deg);}
 details.drive>summary:hover,details.folder>summary:hover{background:var(--line);}
 .dot{width:10px;height:10px;border-radius:50%;flex:none;box-shadow:inset 0 0 0 1px #00000018;}
-.leaf{display:flex;align-items:center;gap:8px;padding:4px 7px 4px 24px;border-radius:var(--r-sm);cursor:default;}
+.fico{font-size:18px!important;color:var(--mut);flex:none;}
+.searchbar{display:flex;align-items:center;gap:11px;background:var(--content);border:1px solid var(--line-strong);
+ border-radius:999px;padding:11px 18px;box-shadow:var(--sh-sm);margin-bottom:14px;}
+.searchbar .material-symbols-outlined{color:var(--mut);font-size:20px;}
+.searchbar input{flex:1;border:0;background:transparent;padding:0;font:inherit;font-size:14px;color:var(--fg);}
+.searchbar input:focus{outline:none;box-shadow:none;}
+.browsetools{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px;}
+.leaf{display:flex;align-items:center;gap:9px;padding:6px 10px 6px 22px;border-radius:var(--r-sm);cursor:default;}
 .leaf:hover{background:var(--line);}
 .leaf .fname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .leaf .meta{font-size:12px;white-space:nowrap;}
@@ -396,8 +403,9 @@ init().catch(e=>{$("#activity").textContent="Error: "+e;});"##;
 
 pub fn browse_page(csrf: &str) -> String {
     let main = r##"
-<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:12px">
-  <input id="q" type="search" placeholder="Search filename or path…" style="flex:1;min-width:220px;padding:8px 12px;border-radius:999px;border:1px solid var(--line);background:var(--content);color:var(--fg)" autofocus>
+<div class="searchbar"><span class="material-symbols-outlined">search</span>
+  <input id="q" type="search" placeholder="Search filename or path…" autofocus></div>
+<div class="browsetools">
   <select id="volume" class="btn"><option value="">All drives</option></select>
   <select id="category" class="btn"><option value="">All types</option>
     <option value="photo">Photo</option><option value="video">Video</option>
@@ -405,10 +413,10 @@ pub fn browse_page(csrf: &str) -> String {
   <select id="status" class="btn"><option value="">Any status</option>
     <option value="active">Active</option><option value="missing">Missing</option>
     <option value="quarantined">Quarantined</option><option value="purged">Purged</option></select>
+  <span class="mut" id="count" style="margin-left:auto;font-size:13px"></span>
 </div>
-<div class="mut" id="count" style="margin-bottom:8px"></div>
-<div class="mut" style="font-size:12px;margin-bottom:8px">Files sharing content share a <span class="diamond" style="--dup:hsl(280,72%,52%)">◆</span> color — click one to highlight its copies.</div>
-<div class="card" style="padding:10px"><div id="results" class="tree"></div></div>"##;
+<div class="mut" style="font-size:12px;margin:0 0 10px">Grouped by drive and folder. Files sharing identical content share a <span class="diamond" style="--dup:hsl(280,72%,52%)">◆</span> color — click one to highlight every copy.</div>
+<div class="card" style="padding:8px"><div id="results" class="tree"></div></div>"##;
     let script = r##"
 let timer=null;
 // --- data -> tree model (pure) ---
@@ -439,19 +447,32 @@ function reconcile(node){
 }
 function countDups(node){ let n=node.files.filter(f=>f.hit.copies).length; for(const c of node.children.values()) n+=countDups(c); return n; }
 // --- model -> HTML (pure; every interpolation esc()'d) ---
+function fileGlyph(name){
+  const e=(String(name).split('.').pop()||'').toLowerCase();
+  if(['jpg','jpeg','png','gif','webp','heic','heif','bmp','tif','tiff','svg','raw','cr2','nef'].includes(e))return 'image';
+  if(['mp4','mov','avi','mkv','webm','m4v','wmv','flv'].includes(e))return 'movie';
+  if(['mp3','wav','flac','aac','ogg','m4a','aiff'].includes(e))return 'audio_file';
+  if(['zip','rar','7z','tar','gz','bz2','xz'].includes(e))return 'folder_zip';
+  if(e==='pdf')return 'picture_as_pdf';
+  if(['doc','docx','txt','md','rtf','pages','odt'].includes(e))return 'description';
+  if(['xls','xlsx','csv','numbers','ods'].includes(e))return 'table_chart';
+  if(['ppt','pptx','key','odp'].includes(e))return 'slideshow';
+  if(['js','ts','rs','py','html','css','json','c','cpp','h','java','go','sh','rb','php'].includes(e))return 'code';
+  return 'draft';
+}
 function renderLeaf(f){
   const h=f.hit;
   const dia=h.copies?`<span class="diamond" style="--dup:${dupColor(h.content_hash)}" title="${h.copies} copies">◆${h.copies}</span>`:"";
   const pill=h.status!=="active"?`<span class="pill ${esc(h.status)}">${esc(h.status)}</span>`:"";
   const cls=h.copies?"leaf dup":"leaf";
   const style=h.copies?`style="--dup:${dupColor(h.content_hash)}"`:"";
-  return `<div class="${cls}" data-hash="${esc(h.content_hash)}" ${style}><span class="fname">${esc(f.name)}</span>${dia}<span class="meta mut">${fmtSize(h.size_bytes)}</span>${pill}</div>`;
+  return `<div class="${cls}" data-hash="${esc(h.content_hash)}" ${style}><span class="material-symbols-outlined fico">${fileGlyph(f.name)}</span><span class="fname">${esc(f.name)}</span>${dia}<span class="meta mut">${fmtSize(h.size_bytes)}</span>${pill}</div>`;
 }
 function renderFolder(node){
   let html='<div class="branch">';
   for(const child of node.children.values()){
     const d=countDups(child); const badge=d?` <span class="mut" style="font-size:11px">${d} dup</span>`:"";
-    const ico=child.archive?'<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" style="opacity:.55;margin-right:5px;vertical-align:-1px"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8M10 12h4"/></svg>':'';
+    const ico=`<span class="material-symbols-outlined fico" style="font-size:17px!important">${child.archive?'folder_zip':'folder'}</span>`;
     const sz=child.archive&&child.selfHit?` <span class="mut mono" style="font-size:11px">${fmtSize(child.selfHit.size_bytes)}</span>`:'';
     html+=`<details class="folder"><summary>${ico}${esc(child.name)}${badge}${sz}</summary>${renderFolder(child)}</details>`;
   }
