@@ -107,10 +107,18 @@ th{color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase;lett
 .progressbar{height:8px;background:var(--line);border-radius:999px;overflow:hidden;}
 .progressbar>span{display:block;height:100%;border-radius:999px;
  background:linear-gradient(90deg,var(--accent),color-mix(in srgb,var(--accent) 70%,#fff));}
-.console-out{font-family:ui-monospace,Consolas,monospace;white-space:pre-wrap;background:var(--content);
- border:1px solid var(--line);border-radius:var(--r);padding:14px;min-height:320px;max-height:60vh;overflow:auto;box-shadow:var(--sh-sm);}
-.console-in{width:100%;font-family:ui-monospace,Consolas,monospace;padding:11px 12px;border-radius:var(--r-sm);
- border:1px solid var(--line-strong);background:var(--content);color:var(--fg);}
+.term{border:1px solid var(--line-strong);border-radius:var(--r-lg);overflow:hidden;box-shadow:var(--sh-sm);background:var(--content);}
+.term-head{display:flex;align-items:center;gap:9px;padding:9px 14px;border-bottom:1px solid var(--line);
+ background:var(--sidebar-bg);font-size:12.5px;color:var(--mut);}
+.term-head .dots{display:flex;gap:6px;margin-right:2px;}
+.term-head .dots i{width:11px;height:11px;border-radius:50%;display:block;}
+.term-in-wrap{display:flex;align-items:center;gap:8px;border-top:1px solid var(--line);padding:0 14px;}
+.term-in-wrap .prompt{color:var(--green);font-family:var(--font-mono);font-weight:600;flex:none;}
+.console-out{font-family:var(--font-mono),ui-monospace,Consolas,monospace;white-space:pre-wrap;background:transparent;
+ border:0;border-radius:0;padding:14px;min-height:300px;max-height:60vh;overflow:auto;font-size:12.5px;}
+.console-in{flex:1;font-family:var(--font-mono),ui-monospace,Consolas,monospace;padding:12px 0;border:0;
+ background:transparent;color:var(--fg);font-size:12.5px;}
+.term-in-wrap .console-in:focus{outline:none;box-shadow:none;}
 .cards{display:flex;flex-wrap:wrap;gap:16px;}
 .cards .card{width:250px;margin:0;}
 #group .cards{justify-content:center;}
@@ -800,9 +808,14 @@ loadDrives(); poll();"##;
 /// prints a usage hint and makes no request.
 pub fn console_page(csrf: &str) -> String {
     let main = r##"
-<div class="mut" style="margin-bottom:8px">Runs this app's own commands only — the same safe actions as the buttons. Type <span class="mono">help</span>.</div>
-<div id="out" class="console-out" aria-live="polite"></div>
-<input id="cmd" class="console-in" style="margin-top:10px" placeholder="e.g. status  ·  search thesis  ·  scan D:\ --force" autofocus>"##;
+<div class="mut" style="margin-bottom:12px;font-size:14px">Runs this app's own commands only — the same safe actions as the buttons. Type <span class="mono">help</span>.</div>
+<div class="term">
+  <div class="term-head"><span class="dots"><i style="background:#ff5f57"></i><i style="background:#febc2e"></i><i style="background:#28c840"></i></span>
+    <span class="material-symbols-outlined" style="font-size:16px">terminal</span>CleanUpStorages console</div>
+  <div id="out" class="console-out" aria-live="polite"></div>
+  <div class="term-in-wrap"><span class="prompt">$</span>
+    <input id="cmd" class="console-in" placeholder="status  ·  search thesis  ·  scan D:\ --force" autofocus></div>
+</div>"##;
     let script = r##"
 const out=$("#out");
 function print(s,cls){ const d=document.createElement("div"); if(cls)d.className=cls; d.textContent=s; out.appendChild(d); out.scrollTop=out.scrollHeight; }
