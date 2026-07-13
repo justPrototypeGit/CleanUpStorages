@@ -120,12 +120,19 @@ th{color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase;lett
 .drive-ico svg{width:20px;height:20px;}
 .card.rvcard{padding:0;overflow:hidden;}
 .rvthumb{position:relative;background:var(--line);}
-.rvthumb img,.rvthumb .noimg{width:100%;height:168px;object-fit:cover;border-radius:0;display:block;margin:0;}
-.rvbody{padding:13px 15px 15px;}
+.rvthumb img,.rvthumb .noimg{width:100%;height:200px;object-fit:cover;border-radius:0;display:block;margin:0;}
+.rvbody{padding:15px 16px 16px;}
+.rvpath{font-family:var(--font-mono);font-size:12.5px;color:var(--fg);word-break:break-all;margin:0 0 12px;line-height:1.45;}
+.rvcard.keep .rvpath{color:var(--accent-text);}
+.dl{display:flex;justify-content:space-between;gap:12px;font-size:13px;padding:6px 0;border-top:1px solid var(--line);}
+.dl:first-of-type{border-top:0;}
+.dl .k{color:var(--mut);} .dl .v{font-weight:500;text-align:right;}
 .keep-pill{position:absolute;top:10px;left:10px;background:var(--accent);color:#fff;font-size:10px;font-weight:700;
- letter-spacing:.04em;text-transform:uppercase;padding:4px 9px;border-radius:999px;display:inline-flex;align-items:center;gap:4px;
+ letter-spacing:.04em;text-transform:uppercase;padding:5px 10px;border-radius:999px;display:inline-flex;align-items:center;gap:4px;
  box-shadow:0 1px 4px #00000030;}
+.keep-pill .material-symbols-outlined{font-size:13px;}
 .cards .card.keep{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent) inset,var(--sh-md);}
+.rvbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:26px;}
 .thumb{width:100%;height:150px;object-fit:contain;border-radius:var(--r-sm);background:var(--line);display:block;}
 .noimg{width:100%;height:150px;display:flex;align-items:center;justify-content:center;color:var(--mut);
  background:var(--line);border-radius:var(--r-sm);font-size:12px;text-align:center;padding:8px;}
@@ -424,14 +431,14 @@ init();"##;
 
 pub fn review_page(csrf: &str) -> String {
     let main = r##"
-<div style="max-width:900px;margin:0 auto">
-  <div class="mut" id="progress" style="margin-bottom:16px;text-align:center"></div>
+<div style="max-width:1000px;margin:0 auto">
+  <div class="row" style="justify-content:flex-end;margin-bottom:18px"><span class="mut" id="progress"></span></div>
   <div id="group"></div>
-  <div style="display:flex;gap:12px;margin-top:24px;align-items:center;justify-content:center">
-    <button class="btn" id="skip">Skip this group</button>
+  <div class="rvbar">
+    <button class="linkbtn" id="skip" style="font-size:13px">Skip this group</button>
     <button class="btn btn-primary" id="confirm">Keep selected, quarantine the rest</button>
   </div>
-  <p class="mut" style="font-size:11px;text-align:center;margin-top:14px">Nothing is deleted — copies move to a recoverable <span class="mono">_ToDelete</span> folder until you purge.</p>
+  <p class="mut" style="font-size:11.5px;text-align:center;margin-top:16px">Nothing is deleted — copies move to a recoverable <span class="mono">_ToDelete</span> folder until you purge.</p>
   <div class="mut" id="msg" style="margin-top:10px;min-height:1.4em;text-align:center"></div>
 </div>"##;
     let script = r##"
@@ -461,15 +468,17 @@ function card(m){
   const img=(m.category==="photo"&&m.mounted)?`<img class="thumb" loading="lazy" src="/api/preview/${m.id}" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'noimg',textContent:'no preview'}))">`:`<div class="noimg">${m.mounted?"no preview":"drive not connected"}</div>`;
   const arch = m.is_loose ? "" :
     (m.id===keepId ? `<div class="arch">inside archive</div>`
-     : m.mounted ? `<button class="btn btn-danger repack" data-id="${m.id}">Remove from archive</button>`
+     : m.mounted ? `<button class="btn repack" data-id="${m.id}" style="width:100%;margin-top:12px">Remove from archive</button>`
                  : `<div class="arch">drive not connected</div>`);
+  const created=m.created_time?`<div class="dl"><span class="k">Created</span><span class="v">${fmtDate(m.created_time)}</span></div>`:"";
   return `<div class="card rvcard" data-id="${m.id}">
-    <div class="rvthumb">${img}<span class="keep-pill kept-badge" style="visibility:hidden">✓ Keep this</span></div>
+    <div class="rvthumb">${img}<span class="keep-pill kept-badge" style="visibility:hidden"><span class="material-symbols-outlined">check_circle</span>Keep this</span></div>
     <div class="rvbody">
-      <div class="mono" style="word-break:break-all;font-size:12px;margin:0 0 8px">${esc(m.location)}</div>
-      <div style="font-size:12.5px;font-weight:600">${esc(m.volume_label||m.volume_id)}</div>
-      <div class="mut" style="font-size:12px;margin-top:2px">${fmtSize(m.size_bytes)} · ${fmtDate(m.created_time)}</div>
-      <div class="mut" style="font-size:12px">status: ${esc(m.status)}</div>${arch}
+      <div class="rvpath">${esc(m.location)}</div>
+      <div class="dl"><span class="k">Drive</span><span class="v">${esc(m.volume_label||m.volume_id)}</span></div>
+      <div class="dl"><span class="k">Size</span><span class="v mono">${fmtSize(m.size_bytes)}</span></div>
+      ${created}
+      <div class="dl"><span class="k">Status</span><span class="v">${esc(m.status)}</span></div>${arch}
     </div></div>`;
 }
 function paint(){
