@@ -18,10 +18,10 @@ pub const STYLE: &str = r##"
  --bg:#fcf8fb;--sidebar-bg:#f6f3f5;--content:#ffffff;--elev:#ffffff;--fg:#1b1b1d;--mut:#5c626e;--mut2:#8a8f99;
  --line:#1b1b1d1a;--line-strong:#1b1b1d2b;--accent:#0071e3;--accent-text:#0059b5;--accent-weak:#0071e31a;
  --amber:#9a5b00;--amber-bg:#f59e0b26;--red:#ba1a1a;--red-bg:#ba1a1a17;--green:#1a7f37;--green-bg:#2ecc7122;--gray:#717785;
- --r-sm:6px;--r:8px;--r-lg:12px;
+ --r-sm:6px;--r:8px;--r-lg:16px;
  --sh-sm:0 1px 3px #0000000d,0 1px 2px #0000001a;
  --sh-md:0 6px 16px #0000001f,0 1px 3px #00000014;--sh-lg:0 16px 40px #00000026;
- --sidebar:260px;--topbar:52px;}
+ --sidebar:260px;--topbar:64px;}
 :root[data-theme="light"]{
  --bg:#fcf8fb;--sidebar-bg:#f6f3f5;--content:#ffffff;--elev:#ffffff;--fg:#1b1b1d;--mut:#5c626e;--mut2:#8a8f99;
  --line:#1b1b1d1a;--line-strong:#1b1b1d2b;--accent:#0071e3;--accent-text:#0059b5;--accent-weak:#0071e31a;
@@ -40,6 +40,8 @@ body{margin:0;font:14px/1.45 var(--font-ui);letter-spacing:-.006em;
 .mono{font-family:var(--font-mono);font-variant-numeric:tabular-nums;font-size:12px;letter-spacing:-.02em;}
 h1,h2,h3{letter-spacing:-.02em;font-weight:600;margin-top:0;}
 h3{font-size:15px;} h2{font-size:22px;}
+.page-h{font-size:27px;font-weight:700;letter-spacing:-.03em;margin:0 0 4px;}
+.page-sub{color:var(--mut);font-size:14px;margin:0 0 22px;}
 aside.side{position:fixed;left:0;top:0;bottom:0;width:var(--sidebar);display:flex;flex-direction:column;
  background:color-mix(in srgb,var(--sidebar-bg) 86%,transparent);
  backdrop-filter:blur(40px) saturate(180%);-webkit-backdrop-filter:blur(40px) saturate(180%);
@@ -53,13 +55,18 @@ nav a.active{background:var(--accent-weak);color:var(--accent-text);font-weight:
 nav a:hover:not(.active){background:var(--line);color:var(--fg);}
 nav a .material-symbols-outlined{font-size:20px;}
 header.top{position:fixed;top:0;left:var(--sidebar);right:0;height:var(--topbar);display:flex;align-items:center;
- gap:12px;padding:0 24px;background:color-mix(in srgb,var(--bg) 80%,transparent);
+ gap:14px;padding:0 32px;background:color-mix(in srgb,var(--bg) 80%,transparent);
  backdrop-filter:blur(20px) saturate(150%);-webkit-backdrop-filter:blur(20px) saturate(150%);
  border-bottom:1px solid var(--line);z-index:5;}
-header.top strong{font-size:15px;font-weight:600;letter-spacing:-.02em;}
+.top-search{flex:1;max-width:620px;display:flex;align-items:center;gap:10px;background:var(--sidebar-bg);
+ border:1px solid var(--line);border-radius:999px;padding:9px 16px;}
+.top-search .material-symbols-outlined{color:var(--mut);font-size:19px;}
+.top-search input{flex:1;border:0;background:transparent;padding:0;font:inherit;font-size:13.5px;color:var(--fg);}
+.top-search input:focus{outline:none;box-shadow:none;}
 header.top .spacer{flex:1;}
-main{margin-left:var(--sidebar);padding:calc(var(--topbar) + 32px) 32px 48px;}
-main>*{max-width:1152px;margin-left:auto;margin-right:auto;}
+.top-actions{display:flex;align-items:center;gap:8px;margin-left:auto;}
+main{margin-left:var(--sidebar);padding:calc(var(--topbar) + 32px) 40px 48px;}
+main>*{max-width:1240px;margin-left:0;margin-right:auto;}
 .card{background:var(--content);border:1px solid var(--line);border-radius:var(--r-lg);padding:22px;
  margin:0 0 20px;box-shadow:var(--sh-sm);}
 .card.hover{transition:box-shadow .16s,transform .16s,border-color .16s;}
@@ -68,7 +75,7 @@ main>*{max-width:1152px;margin-left:auto;margin-right:auto;}
 .mut{color:var(--mut);} .row{display:flex;align-items:center;gap:8px;}
 .btn{font:inherit;font-weight:500;font-size:13px;padding:8px 15px;border-radius:var(--r);border:1px solid var(--line-strong);
  background:var(--content);color:var(--fg);cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:6px;
- transition:background .12s,box-shadow .12s,filter .12s;box-shadow:var(--sh-sm);white-space:nowrap;}
+ transition:background .12s,box-shadow .12s,filter .12s;box-shadow:var(--sh-sm);white-space:nowrap;text-decoration:none;}
 .btn:hover{background:var(--line);} .btn:active{transform:translateY(.5px);}
 .btn .material-symbols-outlined{font-size:18px;}
 .btn-primary{background:var(--accent);border-color:transparent;color:#fff;box-shadow:0 1px 2px #0071e340;}
@@ -169,7 +176,7 @@ details.drive>summary:hover,details.folder>summary:hover{background:var(--line);
 .leaf.hl{background:color-mix(in srgb,var(--dup) 24%,transparent);box-shadow:inset 0 0 0 1px var(--dup);}
 .diamond{font-size:11px;font-weight:700;color:var(--dup);flex:none;}
 .stat{font-size:23px;font-weight:600;letter-spacing:-.02em;}
-.hero{position:relative;overflow:hidden;padding:26px 28px;}
+.hero{position:relative;overflow:hidden;padding:30px 32px;}
 .hero-glow{position:absolute;top:-60%;right:-10%;width:60%;height:220%;pointer-events:none;
  background:radial-gradient(closest-side,var(--accent-weak),transparent 72%);opacity:.9;}
 .hero-label{position:relative;font-size:11px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:var(--accent-text);}
@@ -284,6 +291,11 @@ function applyTheme(t){ if(t==='auto'){localStorage.removeItem('theme');delete d
     for(const b of document.querySelectorAll('.themebar .seg button')){ b.onclick=()=>applyTheme(b.dataset.theme); }
     applyTheme(cur);
   });})();
+// Top-bar search: Enter jumps to Browse (the Browse page wires its own live filtering instead).
+document.addEventListener('DOMContentLoaded',()=>{
+  const tq=document.getElementById('topq'); if(!tq||location.pathname==='/browse')return;
+  tq.addEventListener('keydown',e=>{ if(e.key==='Enter'){ const v=tq.value.trim(); location.href='/browse'+(v?('?q='+encodeURIComponent(v)):''); }});
+});
 "##;
 
 /// Material Symbols (Outlined) glyph name for a UI key. The self-hosted icon font renders these as
@@ -332,7 +344,10 @@ pub fn shell(active: &str, csrf: &str, title: &str, main_html: &str, page_script
 <meta name="csrf" content="{csrf}"><title>CleanUpStorages — {title}</title>
 <style>{style}</style></head><body>
 <aside class="side"><h1>CleanUpStorages</h1><p class="tagline">Storage cleanup</p><nav>{nav}</nav>{themebar}</aside>
-<header class="top"><strong>{title}</strong></header>
+<header class="top">
+<div class="top-search"><span class="material-symbols-outlined">search</span><input id="topq" type="search" placeholder="Search catalog…" aria-label="Search catalog"></div>
+<div class="top-actions"><a class="btn btn-primary" href="/scan">Start Scan</a></div>
+</header>
 <main>{main_html}</main>
 <script>{shared}</script><script>{page_script}</script>
 </body></html>"##,
@@ -350,13 +365,12 @@ pub fn overview_page(csrf: &str) -> String {
 </section>
 <div class="grid">
   <div class="card" style="grid-column:span 5;display:flex;flex-direction:column">
-    <div class="row" style="justify-content:space-between;margin-bottom:14px">
+    <div class="row" style="justify-content:space-between;margin-bottom:34px">
       <div class="card-ico"><span class="material-symbols-outlined">content_copy</span></div>
       <span class="tag" id="dupe-tag" style="display:none">High Priority</span>
     </div>
-    <h3 style="margin:0">Duplicate groups</h3>
-    <div class="hero-stat" id="dupe-count" style="font-size:34px;margin:2px 0 2px">…</div>
-    <div class="mut" id="dupe-reclaim" style="font-size:12.5px;margin-bottom:16px"></div>
+    <div id="dupe-count" style="font-size:26px;font-weight:600;letter-spacing:-.02em;margin:0">…</div>
+    <div class="mut" id="dupe-reclaim" style="font-size:13px;margin:6px 0 18px"></div>
     <a class="btn btn-primary" href="/review" style="margin-top:auto;text-decoration:none;width:100%">Review duplicates</a>
   </div>
   <div class="card" style="grid-column:span 7">
@@ -371,29 +385,34 @@ pub fn overview_page(csrf: &str) -> String {
 </div>
 <div class="mut" id="msg" style="margin-top:4px;min-height:1.2em;text-align:center"></div>"##;
     let script = r##"
-const ACT_ICO={scan:["frame_inspect","tone-blue"],quarantine:["inventory_2","tone-amber"],
+const ACT_ICO={scan:["frame_inspect","tone-gray"],quarantine:["inventory_2","tone-red"],
   quarantine_skip:["shield","tone-gray"],quarantine_error:["error","tone-red"],
-  repack:["archive","tone-blue"],purge:["delete_sweep","tone-red"],
+  repack:["deployed_code","tone-blue"],purge:["delete_sweep","tone-red"],
   forget:["hard_drive","tone-gray"],rename:["edit","tone-gray"]};
 async function init(){
   const st=await apiGet("/api/stats");
   const totalFiles=st.volumes.reduce((a,v)=>a+v.active_files,0);
   $("#hero").innerHTML=totalFiles.toLocaleString()+' <span style="font-weight:500;font-size:.5em;color:var(--mut)">files catalogued</span>';
-  $("#hero-sub").textContent="Across "+st.volumes.length+" drive"+(st.volumes.length===1?"":"s")+" · catalog stored safely on this computer";
-  $("#dupe-count").textContent=st.duplicate_groups.toLocaleString();
-  if(st.duplicate_groups>0)$("#dupe-tag").style.display="";
+  $("#hero-sub").innerHTML='<span style="color:var(--fg)">Across '+st.volumes.length+" drive"+(st.volumes.length===1?"":"s")+'</span> · catalog stored safely on this computer';
+  const g=st.duplicate_groups;
+  $("#dupe-count").textContent=g.toLocaleString()+" duplicate group"+(g===1?"":"s");
+  if(g>0)$("#dupe-tag").style.display="";
   const drives=await apiGet("/api/drives");
   const totalReclaim=drives.reduce((a,d)=>a+(d.reclaimable_bytes||0),0);
   $("#dupe-reclaim").textContent="≈ "+fmtSize(totalReclaim)+" reclaimable";
   const max=Math.max(1,...drives.map(d=>d.reclaimable_bytes||0));
-  $("#reclaim-bars").innerHTML=drives.length?drives.map(d=>`<div style="margin:12px 0 2px">
-     <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:5px"><span><span class="dot" style="background:${driveColor(d.volume_id)};display:inline-block;margin-right:7px"></span>${esc(d.display_name||d.label)}</span><span class="mono">${fmtSize(d.reclaimable_bytes)}</span></div>
+  $("#reclaim-bars").innerHTML=drives.length?drives.map(d=>`<div style="margin:14px 0 2px">
+     <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:6px"><span>${esc(d.display_name||d.label)}</span><span class="mono">${fmtSize(d.reclaimable_bytes)}</span></div>
      <div class="progressbar"><span style="width:${Math.round(100*(d.reclaimable_bytes||0)/max)}%"></span></div></div>`).join(""):'<span class="mut">No drives catalogued yet.</span>';
+  const SUBS={quarantine:"Flagged as duplicate",quarantine_skip:"Protected the last copy",quarantine_error:"Action failed",
+    repack:"Archive optimized",purge:"Space reclaimed",forget:"Removed from catalog",rename:"Details updated"};
+  function actParts(a){ const s=a.summary||""; const i=s.indexOf(" — ");
+    if(i>=0) return [s.slice(0,i), s.slice(i+3)]; return [s, SUBS[a.kind]||""]; }
   const acts=await apiGet("/api/activity");
   $("#activity").innerHTML=acts.length?acts.map(a=>{
-     const[ic,tone]=ACT_ICO[a.kind]||["bolt","tone-gray"];
+     const[ic,tone]=ACT_ICO[a.kind]||["bolt","tone-gray"]; const[title,sub]=actParts(a);
      return `<div class="actrow"><div class="act-ico ${tone}"><span class="material-symbols-outlined">${ic}</span></div>
-       <div><div class="act-title">${esc(a.summary)}</div></div>
+       <div style="flex:1;min-width:0"><div class="act-title">${esc(title)}</div>${sub?`<div class="mut" style="font-size:12px;margin-top:1px">${esc(sub)}</div>`:""}</div>
        <div class="act-time">${fmtAgo(a.occurred_at)}</div></div>`;}).join(""):'<div class="mut" style="padding:8px 0">No activity yet.</div>';
 }
 $("#purge-link").onclick=async()=>{
@@ -411,8 +430,6 @@ init().catch(e=>{$("#activity").textContent="Error: "+e;});"##;
 
 pub fn browse_page(csrf: &str) -> String {
     let main = r##"
-<div class="searchbar"><span class="material-symbols-outlined">search</span>
-  <input id="q" type="search" placeholder="Search filename or path…" autofocus></div>
 <div class="browsetools">
   <select id="volume" class="btn"><option value="">All drives</option></select>
   <select id="category" class="btn"><option value="">All types</option>
@@ -496,7 +513,7 @@ function renderTree(drives){
   return html;
 }
 async function run(){ try{
-  const p=new URLSearchParams(); const q=$("#q").value.trim(); if(q)p.set("q",q);
+  const p=new URLSearchParams(); const q=$("#topq").value.trim(); if(q)p.set("q",q);
   for(const k of ["volume","category","status"]){ const v=$("#"+k).value; if(v)p.set(k,v); }
   p.set("limit","3000");
   const hits=await apiGet("/api/search?"+p.toString());
@@ -514,7 +531,8 @@ function debounced(){ clearTimeout(timer); timer=setTimeout(run,180); }
 async function init(){
   const vs=await apiGet("/api/volumes"); const sel=$("#volume");
   for(const v of vs){ const o=document.createElement("option"); o.value=v.volume_id; o.textContent=v.display_name||v.label; sel.appendChild(o); }
-  $("#q").addEventListener("input",debounced);
+  const tq=$("#topq"); if(tq){ const urlq=new URLSearchParams(location.search).get("q"); if(urlq)tq.value=urlq;
+    tq.addEventListener("input",debounced); }
   for(const k of ["volume","category","status"]) $("#"+k).addEventListener("change",run);
   run();
 }
@@ -525,7 +543,8 @@ init();"##;
 pub fn review_page(csrf: &str) -> String {
     let main = r##"
 <div style="max-width:1000px;margin:0 auto">
-  <div class="row" style="justify-content:flex-end;margin-bottom:18px"><span class="mut" id="progress"></span></div>
+  <div class="row" style="justify-content:space-between;align-items:baseline;margin-bottom:20px">
+    <h1 class="page-h" style="margin:0">Review duplicates</h1><span class="mut" id="progress"></span></div>
   <div id="group"></div>
   <div class="rvbar">
     <button class="linkbtn" id="skip" style="font-size:13px">Skip this group</button>
@@ -599,8 +618,8 @@ load();"##;
 
 pub fn drives_page(csrf: &str) -> String {
     let main = r##"
-<div class="row" style="justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;margin-bottom:20px">
-  <div class="mut" style="font-size:14px">Manage and monitor your catalogued storage volumes. Nothing here deletes files on your drives.</div>
+<div class="row" style="justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap;margin-bottom:22px">
+  <div><h1 class="page-h">Drives</h1><div class="page-sub" style="margin:0">Manage and monitor your catalogued storage volumes. Nothing here deletes files on your drives.</div></div>
   <div id="quarantine-alert"></div>
 </div>
 <div id="drives" class="drivegrid"><span class="mut">Loading drives…</span></div>
@@ -699,8 +718,9 @@ load().catch(e=>{$("#drives").textContent="Error: "+e;});"##;
 
 pub fn scan_page(csrf: &str) -> String {
     let main = r##"
-<div class="mut" style="margin:0 0 2px;font-size:14px">Connect a drive or select a folder to catalog your files and identify duplicates. Nothing is modified except a tiny hidden marker used to recognise the drive next time.</div>
-<div class="sec-label">Detected drives</div>
+<h1 class="page-h">Scan a Drive</h1>
+<div class="page-sub">Connect a drive or select a folder to catalog your files and identify duplicates. Nothing is modified except a tiny hidden marker used to recognise the drive next time.</div>
+<div class="sec-label" style="margin-top:6px">Detected drives</div>
 <div id="drives" class="drivegrid"><span class="mut">Looking for connected drives…</span></div>
 <div class="sec-label">Or choose a folder</div>
 <div class="card">
@@ -808,7 +828,8 @@ loadDrives(); poll();"##;
 /// prints a usage hint and makes no request.
 pub fn console_page(csrf: &str) -> String {
     let main = r##"
-<div class="mut" style="margin-bottom:12px;font-size:14px">Runs this app's own commands only — the same safe actions as the buttons. Type <span class="mono">help</span>.</div>
+<h1 class="page-h">Console</h1>
+<div class="page-sub">Runs this app's own commands only — the same safe actions as the buttons. Type <span class="mono">help</span>.</div>
 <div class="term">
   <div class="term-head"><span class="dots"><i style="background:#ff5f57"></i><i style="background:#febc2e"></i><i style="background:#28c840"></i></span>
     <span class="material-symbols-outlined" style="font-size:16px">terminal</span>CleanUpStorages console</div>
