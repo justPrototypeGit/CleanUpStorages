@@ -646,16 +646,52 @@ async fn api_scan_status(State(state): State<AppState>) -> Json<crate::scan_queu
 #[derive(Serialize)]
 struct PickFolderDto { path: Option<String> }
 
+/// A borrowed Win32 `HWND` we can hand to `rfd::FileDialog::set_parent`, so the folder dialog opens
+/// owned by (and on top of) the browser window instead of behind it. The raw handle value is just an
+/// `isize`, which is `Send`; we rebuild the window handle inside the blocking closure.
+#[cfg(windows)]
+struct HwndOwner(isize);
+#[cfg(windows)]
+impl raw_window_handle::HasWindowHandle for HwndOwner {
+    fn window_handle(&self)
+        -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError>
+    {
+        let hwnd = std::num::NonZeroIsize::new(self.0).ok_or(raw_window_handle::HandleError::Unavailable)?;
+        let handle = raw_window_handle::Win32WindowHandle::new(hwnd);
+        // SAFETY: the HWND is valid for the lifetime of the (blocking, synchronous) dialog call.
+        Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(raw_window_handle::RawWindowHandle::Win32(handle)) })
+    }
+}
+#[cfg(windows)]
+impl raw_window_handle::HasDisplayHandle for HwndOwner {
+    fn display_handle(&self)
+        -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError>
+    {
+        let raw = raw_window_handle::RawDisplayHandle::Windows(raw_window_handle::WindowsDisplayHandle::new());
+        // SAFETY: the Windows display handle carries no pointer; it is valid for any lifetime.
+        Ok(unsafe { raw_window_handle::DisplayHandle::borrow_raw(raw) })
+    }
+}
+
 /// Open the native OS folder-picker dialog and return the chosen path (or `null` on cancel).
 /// The dialog call is blocking, so it runs on a `spawn_blocking` thread rather than the async
-/// runtime. This handler is just the CSRF gate plus that thread hop.
+/// runtime. This handler is just the CSRF gate plus that thread hop. On Windows the dialog is
+/// parented to the current foreground window (the browser) so it opens on top, not behind it.
 async fn api_pick_folder(State(state): State<AppState>, headers: HeaderMap)
     -> Result<Json<PickFolderDto>, (StatusCode, String)>
 {
     check_csrf(&headers, &state)?;
 
-    let picked = tokio::task::spawn_blocking(|| {
-        rfd::FileDialog::new().set_title("Choose a drive or folder to scan").pick_folder()
+    #[cfg(windows)]
+    let owner: isize = unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() as isize
+    };
+
+    let picked = tokio::task::spawn_blocking(move || {
+        let dialog = rfd::FileDialog::new().set_title("Choose a drive or folder to scan");
+        #[cfg(windows)]
+        let dialog = if owner != 0 { dialog.set_parent(&HwndOwner(owner)) } else { dialog };
+        dialog.pick_folder()
     }).await.map_err(err500)?;
     Ok(Json(PickFolderDto { path: picked.map(|p| p.display().to_string()) }))
 }

@@ -86,6 +86,17 @@ enum Command {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Mark the process per-monitor DPI-aware so the native folder dialog (Browse… on the Scan page)
+    // renders crisply instead of being bitmap-scaled (blurry) on high-DPI displays. Must run before
+    // any window/dialog is created.
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::UI::HiDpi::{
+            SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        };
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+
     let cli = Cli::parse();
     cleanupstorages::observability::init(cli.verbose);
     let name = match &cli.command {
