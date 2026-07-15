@@ -137,15 +137,18 @@ th{color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase;lett
 .console-in:focus{outline:none;box-shadow:none;}
 .cards{display:flex;flex-wrap:wrap;gap:16px;}
 .cards .card{width:250px;margin:0;}
-#group .cards{justify-content:center;}
-#group .card{width:300px;}
+.rv-page{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;}
+#group{flex:1 1 auto;min-height:0;display:flex;}
+#group .cards{flex:1 1 auto;min-height:0;justify-content:center;align-items:stretch;gap:20px;width:100%;}
+#group .card{width:auto;flex:1 1 0;min-width:260px;max-width:460px;}
+#group .empty{margin:auto;text-align:center;}
 .drive-ico{width:38px;height:38px;border-radius:9px;flex:none;display:flex;align-items:center;justify-content:center;
  background:color-mix(in srgb,var(--dc) 16%,transparent);color:var(--dc);}
 .drive-ico svg{width:20px;height:20px;}
-.card.rvcard{padding:0;overflow:hidden;}
-.rvthumb{position:relative;background:var(--line);}
-.rvthumb img,.rvthumb .noimg{width:100%;height:200px;object-fit:cover;border-radius:0;display:block;margin:0;}
-.rvbody{padding:15px 16px 16px;}
+.card.rvcard{padding:0;overflow:hidden;display:flex;flex-direction:column;}
+.rvthumb{position:relative;background:var(--line);flex:1 1 auto;min-height:150px;}
+.rvthumb img,.rvthumb .noimg{width:100%;height:100%;object-fit:cover;border-radius:0;display:block;margin:0;}
+.rvbody{padding:15px 16px 16px;flex:none;}
 .rvpath{font-family:var(--font-mono);font-size:12.5px;color:var(--fg);word-break:break-all;margin:0 0 12px;line-height:1.45;}
 .rvcard.keep .rvpath{color:var(--accent-text);}
 .dl{display:flex;justify-content:space-between;gap:12px;font-size:13px;padding:6px 0;border-top:1px solid var(--line);}
@@ -567,8 +570,8 @@ init();"##;
 
 pub fn review_page(csrf: &str) -> String {
     let main = r##"
-<div>
-  <div class="row" style="justify-content:space-between;align-items:baseline;margin-bottom:22px">
+<div class="rv-page">
+  <div class="row" style="justify-content:space-between;align-items:baseline;margin-bottom:20px">
     <h1 class="page-h" style="margin:0">Review duplicates</h1><span class="mut" id="progress"></span></div>
   <div id="group"></div>
   <div class="rvbar">
@@ -585,7 +588,7 @@ async function load(){
   idx=0; render();
 }
 function render(){
-  if(idx>=groups.length){ $("#progress").textContent=""; $("#group").innerHTML="<p>All duplicate groups reviewed. 🎉</p>"; $("#confirm").style.display="none"; $("#skip").style.display="none"; return; }
+  if(idx>=groups.length){ $("#progress").textContent=""; $("#group").innerHTML='<div class="empty"><h2 style="margin:0 0 6px">All duplicate groups reviewed 🎉</h2><p class="mut">Nothing left to compare.</p></div>'; $("#confirm").style.display="none"; $("#skip").style.display="none"; return; }
   const g=groups[idx]; keepId=g.suggested_keep_id;
   $("#progress").textContent=`Group ${idx+1} of ${groups.length} · ${g.members.length} copies`;
   $("#group").innerHTML=`<div class="cards">${g.members.map(m=>card(m)).join("")}</div>`;
