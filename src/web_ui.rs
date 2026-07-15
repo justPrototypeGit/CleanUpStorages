@@ -73,9 +73,11 @@ nav a .material-symbols-outlined{font-size:21px;}
 :root[data-rail="1"] .themebar .seg{flex-direction:column;border-radius:var(--r-lg);}
 :root[data-rail="1"] .themebar .seg button{justify-content:center;padding:7px 0;}
 :root[data-rail="1"] .themebar .seg button .lb{display:none;}
-main{margin-left:var(--sidebar);padding:36px 44px 56px;transition:margin-left .18s ease;}
-main>*{max-width:none;margin:0;}
-main>.narrow{max-width:1120px;margin-left:auto;margin-right:auto;}
+main{margin-left:var(--sidebar);padding:36px 44px 40px;display:flex;flex-direction:column;
+ min-height:100vh;min-height:100dvh;transition:margin-left .18s ease;}
+main>*{max-width:none;margin:0;flex:none;}
+main>.narrow{max-width:1120px;margin-left:auto;margin-right:auto;flex:1 1 auto;display:flex;flex-direction:column;min-height:0;width:100%;}
+.narrow>.tree-card{flex:1 1 auto;min-height:0;overflow:auto;}
 .card{background:var(--content);border:1px solid var(--line);border-radius:var(--r-lg);padding:22px;
  margin:0 0 20px;box-shadow:var(--sh-sm);}
 .card.hover{transition:box-shadow .16s,transform .16s,border-color .16s;}
@@ -124,7 +126,7 @@ th{color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase;lett
 .progressbar>span{display:block;height:100%;border-radius:999px;
  background:linear-gradient(90deg,var(--accent),color-mix(in srgb,var(--accent) 70%,#fff));}
 .console-out{font-family:var(--font-mono),ui-monospace,Consolas,monospace;white-space:pre-wrap;background:var(--content);
- border:1px solid var(--line);border-radius:var(--r-lg);padding:18px;min-height:340px;max-height:64vh;overflow:auto;
+ border:1px solid var(--line);border-radius:var(--r-lg);padding:18px;flex:1 1 auto;min-height:260px;overflow:auto;
  font-size:12.5px;box-shadow:var(--sh-sm);}
 .console-inbar{display:flex;align-items:center;gap:10px;margin-top:12px;background:var(--content);border:1px solid var(--line-strong);
  border-radius:var(--r);padding:0 16px;box-shadow:var(--sh-sm);}
@@ -170,10 +172,10 @@ details.drive>summary:hover,details.folder>summary:hover{background:var(--line);
 .dot{width:10px;height:10px;border-radius:50%;flex:none;box-shadow:inset 0 0 0 1px #00000018;}
 .fico{font-size:18px!important;color:var(--mut);flex:none;}
 .searchbar{display:flex;align-items:center;gap:11px;background:var(--content);border:1px solid var(--line-strong);
- border-radius:999px;padding:11px 18px;box-shadow:var(--sh-sm);margin-bottom:14px;}
+ border-radius:var(--r);padding:11px 16px;box-shadow:var(--sh-sm);margin-bottom:14px;transition:border-color .12s,box-shadow .12s;}
+.searchbar:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-weak);}
 .searchbar .material-symbols-outlined{color:var(--mut);font-size:20px;}
-.searchbar input{flex:1;border:0;background:transparent;padding:0;font:inherit;font-size:14px;color:var(--fg);}
-.searchbar input:focus{outline:none;box-shadow:none;}
+.searchbar input{flex:1;font:inherit;font-size:14px;color:var(--fg);}
 .browsetools{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px;}
 .browsetools .count{margin-left:auto;font-size:13px;}
 .selpill{position:relative;display:inline-flex;align-items:center;}
@@ -221,18 +223,18 @@ details.drive>summary:hover,details.folder>summary:hover{background:var(--line);
 .recentrow{display:flex;align-items:center;gap:12px;padding:13px 0;border-top:1px solid var(--line);}
 .recentrow:first-child{border-top:0;}
 .folderbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap;}
-.folderin{flex:1;min-width:180px;display:flex;align-items:center;gap:10px;background:var(--sidebar-bg);border:1px solid var(--line);border-radius:var(--r);padding:11px 14px;}
-.folderin input{flex:1;border:0;background:transparent;padding:0;font:inherit;color:var(--fg);}
-.folderin input:focus{outline:none;box-shadow:none;}
-.drivecard{margin:0;display:flex;flex-direction:column;}
+.folderin{flex:1;min-width:180px;display:flex;align-items:center;gap:10px;background:var(--content);border:1px solid var(--line-strong);border-radius:var(--r);padding:11px 14px;box-shadow:var(--sh-sm);transition:border-color .12s,box-shadow .12s;}
+.folderin:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-weak);}
+.folderin input{flex:1;font:inherit;color:var(--fg);}
+.drivecard{margin:0;display:flex;flex-direction:column;padding:20px;}
 .drivecard.err{border-color:color-mix(in srgb,var(--red) 30%,var(--line));background:color-mix(in srgb,var(--red-bg) 60%,var(--content));}
-.drivecard .dhead{display:flex;gap:14px;align-items:flex-start;}
+.drivecard .dhead{display:flex;gap:14px;align-items:flex-start;margin-bottom:16px;}
 .drivecard .lastscan{margin-left:auto;font-size:12px;color:var(--mut);white-space:nowrap;padding-top:2px;}
 .status-line{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--mut);margin-top:4px;}
 .status-line .sdot{width:8px;height:8px;border-radius:50%;flex:none;}
-.cap-line{display:flex;justify-content:space-between;font-size:13px;margin:16px 0 8px;}
+.cap-line{display:flex;justify-content:space-between;font-size:13px;margin:0 0 8px;}
 .cap-line .pct{color:var(--mut);}
-.drivecard .actions{display:flex;gap:10px;margin-top:16px;padding-top:16px;border-top:1px solid var(--line);}
+.drivecard .actions{display:flex;gap:10px;margin-top:16px;padding-top:14px;border-top:1px solid var(--line);}
 .drivecard .actions .btn{flex:1;}
 .drivecard .actions .iconbtn{flex:0 0 auto;width:40px;padding:8px 0;}
 .drivecard .actions .iconbtn .material-symbols-outlined{font-size:19px;}
@@ -259,6 +261,9 @@ select,input[type=text],input[type=search],textarea{background:var(--content);co
  border:1px solid var(--line-strong);border-radius:var(--r-sm);padding:8px 10px;font:inherit;color-scheme:inherit;}
 select:focus,input:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-weak);}
 option{background:var(--content);color:var(--fg);}
+/* inputs that live inside a styled field container carry no border of their own (no double box) */
+.searchbar input,.folderin input,.console-in{border:0;background:transparent;padding:0;border-radius:0;box-shadow:none;}
+.searchbar input:focus,.folderin input:focus,.console-in:focus{outline:none;box-shadow:none;border:0;}
 .seg{display:inline-flex;background:var(--line);border-radius:999px;padding:2px;gap:2px;}
 .seg button{border:0;background:transparent;color:var(--mut);border-radius:999px;padding:4px 9px;
  cursor:pointer;display:flex;align-items:center;gap:5px;font:inherit;font-size:12px;}
@@ -460,7 +465,7 @@ pub fn browse_page(csrf: &str) -> String {
     <span class="mut count" id="count"></span>
   </div>
   <div class="mut" style="font-size:12px;margin:0 0 10px">Grouped by drive and folder. Files sharing identical content share a <span class="diamond" style="--dup:hsl(280,72%,52%)">◆</span> color — click one to highlight every copy.</div>
-  <div class="card" style="padding:8px"><div id="results" class="tree"></div></div>
+  <div class="card tree-card" style="padding:8px"><div id="results" class="tree"></div></div>
 </div>"##;
     let script = r##"
 let timer=null;
@@ -643,7 +648,7 @@ pub fn drives_page(csrf: &str) -> String {
   <div id="quarantine-alert"></div>
 </div>
 <div id="drives" class="drivegrid"><span class="mut">Loading drives…</span></div>
-<div class="sumgrid" id="summary" style="margin-top:4px"></div>
+<div class="sumgrid" id="summary" style="margin-top:20px"></div>
 <div class="mut" id="msg" style="margin-top:12px;min-height:1.4em"></div>"##;
     let script = r##"
 function bar(d){
@@ -743,15 +748,13 @@ pub fn scan_page(csrf: &str) -> String {
 <div class="sec-label" style="margin-top:6px">Detected drives</div>
 <div id="drives" class="drivegrid"><span class="mut">Looking for connected drives…</span></div>
 <div class="sec-label">Or choose a folder</div>
-<div class="card">
-  <div class="folderbar">
-    <label class="folderin"><span class="material-symbols-outlined" style="color:var(--mut);font-size:20px">folder_open</span>
-      <input id="path" type="text" placeholder="Type or browse to a folder to scan…"></label>
-    <button class="linkbtn" id="browse" style="font-size:13px"><span class="material-symbols-outlined">drive_folder_upload</span>Browse…</button>
-    <label class="row" style="font-size:13px;color:var(--mut)">
-      <span class="switch"><input id="force" type="checkbox"><span class="sl"></span></span> Force full rescan
-    </label>
-  </div>
+<div class="folderbar">
+  <label class="folderin"><span class="material-symbols-outlined" style="color:var(--mut);font-size:20px">folder_open</span>
+    <input id="path" type="text" placeholder="Type or browse to a folder to scan…"></label>
+  <button class="btn" id="browse"><span class="material-symbols-outlined">drive_folder_upload</span>Browse…</button>
+  <label class="row" style="font-size:13px;color:var(--mut);gap:10px">
+    <span class="switch"><input id="force" type="checkbox"><span class="sl"></span></span> Force full rescan
+  </label>
 </div>
 <div style="text-align:center;margin:22px 0 4px">
   <button class="btn btn-primary" id="scan" style="padding:11px 26px;font-size:14px"><span class="material-symbols-outlined">play_arrow</span>Scan Selected</button>
