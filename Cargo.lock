@@ -639,6 +639,7 @@ dependencies = [
  "clap",
  "directories",
  "image",
+ "raw-window-handle",
  "rfd",
  "rusqlite",
  "serde",
@@ -653,6 +654,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "walkdir",
+ "windows-sys 0.59.0",
  "zip",
 ]
 
