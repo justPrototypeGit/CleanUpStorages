@@ -44,6 +44,7 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/", get(overview))
         .route("/browse", get(browse))
         .route("/api/search", get(api_search))
+        .route("/api/status-counts", get(api_status_counts))
         .route("/api/volumes", get(api_volumes))
         .route("/api/stats", get(api_stats))
         .route("/api/activity", get(api_activity))
@@ -63,6 +64,7 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/scan", get(scan_page_h))
         .route("/drives", get(drives_page_h))
         .route("/console", get(console_page_h))
+        .route("/assets/:file", get(asset))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|req: &axum::http::Request<axum::body::Body>| {
@@ -102,11 +104,31 @@ async fn console_page_h(State(state): State<AppState>) -> Html<String> {
     Html(crate::web_ui::console_page(&state.csrf_token))
 }
 
+/// Vendored fonts, served same-origin (no external request) and cached hard. Everything is
+/// self-hosted so the UI stays 100% offline.
+async fn asset(AxPath(file): AxPath<String>) -> Response {
+    let bytes: &'static [u8] = match file.as_str() {
+        "InterVariable.woff2" => include_bytes!("../assets/InterVariable.woff2"),
+        "JetBrainsMono-Regular.woff2" => include_bytes!("../assets/JetBrainsMono-Regular.woff2"),
+        "JetBrainsMono-Medium.woff2" => include_bytes!("../assets/JetBrainsMono-Medium.woff2"),
+        "MaterialSymbolsOutlined.woff2" => include_bytes!("../assets/MaterialSymbolsOutlined.woff2"),
+        _ => return (StatusCode::NOT_FOUND, "no such asset").into_response(),
+    };
+    (
+        [(header::CONTENT_TYPE, "font/woff2"),
+         (header::CACHE_CONTROL, "public, max-age=31536000, immutable")],
+        axum::body::Bytes::from_static(bytes),
+    ).into_response()
+}
+
 /// Web-facing shape for a search hit; keeps serialization concerns out of `catalog::models`.
 #[derive(Serialize)]
 struct HitDto {
     location: String,
     relative_path: String,
+    /// Last valid on-disk location before quarantine (set only on quarantined/purged rows); the tree
+    /// places these here instead of under `_ToDelete`.
+    original_path: Option<String>,
     container_chain: Option<String>,
     filename: String,
     volume_id: String,
@@ -124,6 +146,7 @@ impl From<FileRecord> for HitDto {
         HitDto {
             location,
             relative_path: f.relative_path,
+            original_path: f.original_path,
             container_chain: f.container_chain,
             filename: f.filename,
             volume_id: f.volume_id,
@@ -143,6 +166,8 @@ struct DetectedDriveDto {
     volume_id: Option<String>,
     catalogued: bool,
     volume_label: Option<String>,
+    total_bytes: Option<u64>,
+    free_bytes: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -166,7 +191,8 @@ struct DriveDto {
     active_bytes: i64,
     total_bytes: Option<u64>,     // None if unmounted or undeterminable
     free_bytes: Option<u64>,
-    reclaimable_bytes: i64,
+    reclaimable_bytes: i64,       // potential: size of active duplicate copies not yet quarantined
+    quarantined_bytes: i64,       // actual: bytes sitting in `_ToDelete`, i.e. what "Purge" deletes
     last_seen_at: Option<i64>,
     has_errors: bool,
 }
@@ -240,13 +266,20 @@ fn snapshot_best_effort(state: &AppState, now: i64) {
     }
 }
 
+/// Split a comma-separated query param (e.g. `status=active,quarantined`) into a filter vec,
+/// dropping blanks. Multi-select filters send their chosen values this way.
+fn csv(v: Option<String>) -> Vec<String> {
+    v.map(|s| s.split(',').map(str::trim).filter(|t| !t.is_empty()).map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
 async fn api_search(State(state): State<AppState>, Query(p): Query<SearchParams>)
     -> Result<Json<Vec<HitDto>>, (axum::http::StatusCode, String)>
 {
     let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
     let filters = SearchFilters {
         query: p.q.unwrap_or_default(),
-        category: p.category, volume: p.volume, status: p.status,
+        category: csv(p.category), volume: csv(p.volume), status: csv(p.status),
         min_size: p.min_size, max_size: p.max_size,
         modified_after: p.modified_after, modified_before: p.modified_before,
     };
@@ -264,6 +297,18 @@ async fn api_search(State(state): State<AppState>, Query(p): Query<SearchParams>
         dto
     }).collect();
     Ok(Json(out))
+}
+
+/// Count of catalogued rows per status for the current text/category/volume context, so the Browse
+/// status filter can flag which kinds are present (including purged rows the tree hides by default).
+async fn api_status_counts(State(state): State<AppState>, Query(p): Query<SearchParams>)
+    -> Result<Json<std::collections::HashMap<String, i64>>, (axum::http::StatusCode, String)>
+{
+    let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
+    let counts = cat.status_counts(
+        &p.q.unwrap_or_default(), &csv(p.category), &csv(p.volume),
+    ).map_err(err500)?;
+    Ok(Json(counts))
 }
 
 /// Shared by /api/volumes and /api/stats so the two endpoints can't drift apart.
@@ -320,6 +365,7 @@ async fn api_drives(State(state): State<AppState>)
             connected: mount_path.is_some(),
             mount_path: mount_path.map(|p| p.display().to_string()),
             reclaimable_bytes: reclaim.get(&volume_id).copied().unwrap_or(0),
+            quarantined_bytes: cat.recoverable_bytes(&volume_id).map_err(err500)?,
             last_seen_at: cat.volume_last_seen(&volume_id).map_err(err500)?,
             has_errors: cat.volume_has_scan_errors(&volume_id).map_err(err500)?,
             volume_id, label, display_name, description, active_files, active_bytes, total_bytes, free_bytes,
@@ -341,8 +387,13 @@ async fn api_detected_drives(State(state): State<AppState>)
             Some(vid) => (labels.contains_key(vid), labels.get(vid).cloned()),
             None => (false, None),
         };
+        let (total_bytes, free_bytes) = match crate::mounts::disk_capacity(&root) {
+            Some((t, f)) => (Some(t), Some(f)),
+            None => (None, None),
+        };
         out.push(DetectedDriveDto {
             mount_path: root.display().to_string(), volume_id, catalogued, volume_label,
+            total_bytes, free_bytes,
         });
     }
     out.sort_by(|a, b| a.mount_path.cmp(&b.mount_path));
@@ -621,16 +672,114 @@ async fn api_scan_status(State(state): State<AppState>) -> Json<crate::scan_queu
 #[derive(Serialize)]
 struct PickFolderDto { path: Option<String> }
 
+/// A borrowed Win32 `HWND` we can hand to `rfd::FileDialog::set_parent`, so the folder dialog opens
+/// owned by (and on top of) the browser window instead of behind it. The raw handle value is just an
+/// `isize`, which is `Send`; we rebuild the window handle inside the blocking closure.
+#[cfg(windows)]
+struct HwndOwner(isize);
+#[cfg(windows)]
+impl raw_window_handle::HasWindowHandle for HwndOwner {
+    fn window_handle(&self)
+        -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError>
+    {
+        let hwnd = std::num::NonZeroIsize::new(self.0).ok_or(raw_window_handle::HandleError::Unavailable)?;
+        let handle = raw_window_handle::Win32WindowHandle::new(hwnd);
+        // SAFETY: the HWND is valid for the lifetime of the (blocking, synchronous) dialog call.
+        Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(raw_window_handle::RawWindowHandle::Win32(handle)) })
+    }
+}
+#[cfg(windows)]
+impl raw_window_handle::HasDisplayHandle for HwndOwner {
+    fn display_handle(&self)
+        -> Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError>
+    {
+        let raw = raw_window_handle::RawDisplayHandle::Windows(raw_window_handle::WindowsDisplayHandle::new());
+        // SAFETY: the Windows display handle carries no pointer; it is valid for any lifetime.
+        Ok(unsafe { raw_window_handle::DisplayHandle::borrow_raw(raw) })
+    }
+}
+
+/// Once the native folder dialog appears, move it to the centre of its monitor's work area.
+/// The dialog is parented to the browser (so it comes to the front), but that also centres it over
+/// the browser rather than the screen; this short-lived watcher repositions it to the monitor centre.
+/// It finds the one visible top-level window owned by our own process (the dialog) and moves it.
+#[cfg(windows)]
+fn center_dialog_when_shown() {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, SetWindowPos,
+        SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    };
+
+    unsafe extern "system" fn find_ours(hwnd: HWND, lparam: LPARAM) -> i32 {
+        let out = &mut *(lparam as *mut HWND);
+        if IsWindowVisible(hwnd) != 0 {
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid == GetCurrentProcessId() {
+                *out = hwnd;
+                return 0; // stop enumerating
+            }
+        }
+        1 // keep going
+    }
+
+    std::thread::spawn(|| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2500);
+        loop {
+            let mut found: HWND = std::ptr::null_mut();
+            unsafe { EnumWindows(Some(find_ours), &mut found as *mut HWND as LPARAM) };
+            if !found.is_null() {
+                unsafe {
+                    let mut wr: RECT = std::mem::zeroed();
+                    let mut mi: MONITORINFO = std::mem::zeroed();
+                    mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+                    let mon = MonitorFromWindow(found, MONITOR_DEFAULTTONEAREST);
+                    if GetWindowRect(found, &mut wr) != 0 && GetMonitorInfoW(mon, &mut mi) != 0 {
+                        let (w, h) = (wr.right - wr.left, wr.bottom - wr.top);
+                        let work = mi.rcWork;
+                        let x = work.left + ((work.right - work.left) - w) / 2;
+                        let y = work.top + ((work.bottom - work.top) - h) / 2;
+                        SetWindowPos(found, std::ptr::null_mut(), x, y, 0, 0,
+                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                    }
+                }
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+    });
+}
+
 /// Open the native OS folder-picker dialog and return the chosen path (or `null` on cancel).
 /// The dialog call is blocking, so it runs on a `spawn_blocking` thread rather than the async
-/// runtime. This handler is just the CSRF gate plus that thread hop.
+/// runtime. This handler is just the CSRF gate plus that thread hop. On Windows the dialog is
+/// parented to the current foreground window (the browser) so it opens on top, and a watcher
+/// re-centres it on the monitor once it appears.
 async fn api_pick_folder(State(state): State<AppState>, headers: HeaderMap)
     -> Result<Json<PickFolderDto>, (StatusCode, String)>
 {
     check_csrf(&headers, &state)?;
 
-    let picked = tokio::task::spawn_blocking(|| {
-        rfd::FileDialog::new().set_title("Choose a drive or folder to scan").pick_folder()
+    #[cfg(windows)]
+    let owner: isize = unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() as isize
+    };
+
+    let picked = tokio::task::spawn_blocking(move || {
+        let dialog = rfd::FileDialog::new().set_title("Choose a drive or folder to scan");
+        #[cfg(windows)]
+        let dialog = if owner != 0 { dialog.set_parent(&HwndOwner(owner)) } else { dialog };
+        #[cfg(windows)]
+        center_dialog_when_shown();
+        dialog.pick_folder()
     }).await.map_err(err500)?;
     Ok(Json(PickFolderDto { path: picked.map(|p| p.display().to_string()) }))
 }
@@ -840,6 +989,82 @@ mod tests {
         assert_eq!(arr[0]["label"], "Photos HDD");
         assert_eq!(arr[0]["connected"], true); // Fixed mount is present
         assert!(arr[0]["reclaimable_bytes"].as_i64().unwrap() >= 0);
+    }
+
+    /// End-to-end of the review flow's visibility rules (the scenario reported by the user):
+    /// quarantining a duplicate keeps the drive's "Purge" affordance alive (quarantined_bytes),
+    /// even though reclaimable-from-duplicates has dropped to 0; the quarantined row is browsable at
+    /// its original location; and once purged it is hidden by default but still reachable (at its
+    /// original location) via the Purged status filter. Status counts flag each kind's presence.
+    #[tokio::test]
+    async fn quarantine_then_purge_visibility_and_purge_affordance() {
+        let (_t, db, _state) = seed_dupes(); // two active copies of hash DUP: a.jpg + copy/a.jpg (10 B each)
+
+        // Quarantine copy/a.jpg -> moves under _ToDelete, remembers its original location.
+        {
+            let cat = crate::catalog::Catalog::open(&db).unwrap();
+            let id = cat.loose_file_id("vol-1", "copy/a.jpg").unwrap().unwrap();
+            cat.mark_quarantined(id, "_ToDelete/copy/a.jpg", "copy/a.jpg", 300).unwrap();
+        }
+
+        // Purge affordance: driven by quarantined_bytes (10), NOT reclaimable_bytes (now 0 — the
+        // duplicate group is gone). This is exactly the "purge button disappeared" regression.
+        let d = get_json(&db, "/api/drives").await;
+        let d0 = &d.as_array().unwrap()[0];
+        assert_eq!(d0["quarantined_bytes"], 10);
+        assert_eq!(d0["reclaimable_bytes"], 0);
+
+        // Status filter flags the kinds that are present.
+        let counts = get_json(&db, "/api/status-counts").await;
+        assert_eq!(counts["active"], 1);
+        assert_eq!(counts["quarantined"], 1);
+
+        // Default browse shows the quarantined row at its original location, never under _ToDelete.
+        let hits = get_json(&db, "/api/search").await;
+        let q = hits.as_array().unwrap().iter()
+            .find(|h| h["status"] == "quarantined").expect("quarantined row is browsable");
+        assert_eq!(q["original_path"], "copy/a.jpg");
+        assert_eq!(q["relative_path"], "_ToDelete/copy/a.jpg");
+
+        // Purge it.
+        {
+            let cat = crate::catalog::Catalog::open(&db).unwrap();
+            let id = cat.loose_file_id("vol-1", "_ToDelete/copy/a.jpg").unwrap().unwrap();
+            cat.mark_purged(id, 400).unwrap();
+        }
+
+        // Hidden by default, still surfaced (at its original location) by the Purged filter.
+        let after = get_json(&db, "/api/search").await;
+        assert!(after.as_array().unwrap().iter().all(|h| h["status"] != "purged"),
+            "purged rows are hidden from the default tree");
+        let purged = get_json(&db, "/api/search?status=purged").await;
+        let parr = purged.as_array().unwrap();
+        assert_eq!(parr.len(), 1);
+        assert_eq!(parr[0]["original_path"], "copy/a.jpg");
+
+        // Nothing left in quarantine; the Purged kind is now flagged.
+        let d2 = get_json(&db, "/api/drives").await;
+        assert_eq!(d2.as_array().unwrap()[0]["quarantined_bytes"], 0);
+        let counts2 = get_json(&db, "/api/status-counts").await;
+        assert_eq!(counts2["purged"], 1);
+    }
+
+    #[tokio::test]
+    async fn api_search_multi_status_filter_ors_values() {
+        let (_t, db, _state) = seed_dupes(); // a.jpg + copy/a.jpg, both active
+        {
+            let cat = crate::catalog::Catalog::open(&db).unwrap();
+            let id = cat.loose_file_id("vol-1", "copy/a.jpg").unwrap().unwrap();
+            cat.mark_quarantined(id, "_ToDelete/copy/a.jpg", "copy/a.jpg", 300).unwrap();
+        }
+        // single value
+        let a = get_json(&db, "/api/search?status=active").await;
+        assert_eq!(a.as_array().unwrap().len(), 1);
+        let qd = get_json(&db, "/api/search?status=quarantined").await;
+        assert_eq!(qd.as_array().unwrap().len(), 1);
+        // multi value: comma-joined statuses are OR-combined
+        let both = get_json(&db, "/api/search?status=active,quarantined").await;
+        assert_eq!(both.as_array().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -1263,6 +1488,19 @@ mod tests {
         assert!(body.contains("/api/activity"), "overview loads activity");
         assert!(body.contains("/api/drives"), "overview loads drives");
         assert!(body.contains("Recent activity"));
+        assert!(!body.contains("http://") && !body.contains("https://"), "self-contained");
+    }
+
+    #[tokio::test]
+    async fn shell_has_theme_toggle() {
+        use axum::body::Body; use axum::http::Request; use tower::ServiceExt;
+        let (_t, _db, state) = seed_dupes();
+        let app = build_router_with(state);
+        let res = app.oneshot(Request::builder().uri("/").body(Body::empty()).unwrap()).await.unwrap();
+        let bytes = axum::body::to_bytes(res.into_body(), 2_000_000).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(body.contains("data-theme=\"dark\"") && body.contains("themebar"), "theme toggle present");
+        assert!(body.contains("applyTheme"), "theme JS present");
         assert!(!body.contains("http://") && !body.contains("https://"), "self-contained");
     }
 
