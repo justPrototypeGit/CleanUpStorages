@@ -673,10 +673,70 @@ impl raw_window_handle::HasDisplayHandle for HwndOwner {
     }
 }
 
+/// Once the native folder dialog appears, move it to the centre of its monitor's work area.
+/// The dialog is parented to the browser (so it comes to the front), but that also centres it over
+/// the browser rather than the screen; this short-lived watcher repositions it to the monitor centre.
+/// It finds the one visible top-level window owned by our own process (the dialog) and moves it.
+#[cfg(windows)]
+fn center_dialog_when_shown() {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible, SetWindowPos,
+        SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+    };
+
+    unsafe extern "system" fn find_ours(hwnd: HWND, lparam: LPARAM) -> i32 {
+        let out = &mut *(lparam as *mut HWND);
+        if IsWindowVisible(hwnd) != 0 {
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid == GetCurrentProcessId() {
+                *out = hwnd;
+                return 0; // stop enumerating
+            }
+        }
+        1 // keep going
+    }
+
+    std::thread::spawn(|| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2500);
+        loop {
+            let mut found: HWND = std::ptr::null_mut();
+            unsafe { EnumWindows(Some(find_ours), &mut found as *mut HWND as LPARAM) };
+            if !found.is_null() {
+                unsafe {
+                    let mut wr: RECT = std::mem::zeroed();
+                    let mut mi: MONITORINFO = std::mem::zeroed();
+                    mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+                    let mon = MonitorFromWindow(found, MONITOR_DEFAULTTONEAREST);
+                    if GetWindowRect(found, &mut wr) != 0 && GetMonitorInfoW(mon, &mut mi) != 0 {
+                        let (w, h) = (wr.right - wr.left, wr.bottom - wr.top);
+                        let work = mi.rcWork;
+                        let x = work.left + ((work.right - work.left) - w) / 2;
+                        let y = work.top + ((work.bottom - work.top) - h) / 2;
+                        SetWindowPos(found, std::ptr::null_mut(), x, y, 0, 0,
+                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                    }
+                }
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+    });
+}
+
 /// Open the native OS folder-picker dialog and return the chosen path (or `null` on cancel).
 /// The dialog call is blocking, so it runs on a `spawn_blocking` thread rather than the async
 /// runtime. This handler is just the CSRF gate plus that thread hop. On Windows the dialog is
-/// parented to the current foreground window (the browser) so it opens on top, not behind it.
+/// parented to the current foreground window (the browser) so it opens on top, and a watcher
+/// re-centres it on the monitor once it appears.
 async fn api_pick_folder(State(state): State<AppState>, headers: HeaderMap)
     -> Result<Json<PickFolderDto>, (StatusCode, String)>
 {
@@ -691,6 +751,8 @@ async fn api_pick_folder(State(state): State<AppState>, headers: HeaderMap)
         let dialog = rfd::FileDialog::new().set_title("Choose a drive or folder to scan");
         #[cfg(windows)]
         let dialog = if owner != 0 { dialog.set_parent(&HwndOwner(owner)) } else { dialog };
+        #[cfg(windows)]
+        center_dialog_when_shown();
         dialog.pick_folder()
     }).await.map_err(err500)?;
     Ok(Json(PickFolderDto { path: picked.map(|p| p.display().to_string()) }))
