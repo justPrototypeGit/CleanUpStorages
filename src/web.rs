@@ -266,13 +266,20 @@ fn snapshot_best_effort(state: &AppState, now: i64) {
     }
 }
 
+/// Split a comma-separated query param (e.g. `status=active,quarantined`) into a filter vec,
+/// dropping blanks. Multi-select filters send their chosen values this way.
+fn csv(v: Option<String>) -> Vec<String> {
+    v.map(|s| s.split(',').map(str::trim).filter(|t| !t.is_empty()).map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
 async fn api_search(State(state): State<AppState>, Query(p): Query<SearchParams>)
     -> Result<Json<Vec<HitDto>>, (axum::http::StatusCode, String)>
 {
     let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
     let filters = SearchFilters {
         query: p.q.unwrap_or_default(),
-        category: p.category, volume: p.volume, status: p.status,
+        category: csv(p.category), volume: csv(p.volume), status: csv(p.status),
         min_size: p.min_size, max_size: p.max_size,
         modified_after: p.modified_after, modified_before: p.modified_before,
     };
@@ -299,7 +306,7 @@ async fn api_status_counts(State(state): State<AppState>, Query(p): Query<Search
 {
     let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
     let counts = cat.status_counts(
-        &p.q.unwrap_or_default(), p.category.as_deref(), p.volume.as_deref(),
+        &p.q.unwrap_or_default(), &csv(p.category), &csv(p.volume),
     ).map_err(err500)?;
     Ok(Json(counts))
 }
@@ -1040,6 +1047,24 @@ mod tests {
         assert_eq!(d2.as_array().unwrap()[0]["quarantined_bytes"], 0);
         let counts2 = get_json(&db, "/api/status-counts").await;
         assert_eq!(counts2["purged"], 1);
+    }
+
+    #[tokio::test]
+    async fn api_search_multi_status_filter_ors_values() {
+        let (_t, db, _state) = seed_dupes(); // a.jpg + copy/a.jpg, both active
+        {
+            let cat = crate::catalog::Catalog::open(&db).unwrap();
+            let id = cat.loose_file_id("vol-1", "copy/a.jpg").unwrap().unwrap();
+            cat.mark_quarantined(id, "_ToDelete/copy/a.jpg", "copy/a.jpg", 300).unwrap();
+        }
+        // single value
+        let a = get_json(&db, "/api/search?status=active").await;
+        assert_eq!(a.as_array().unwrap().len(), 1);
+        let qd = get_json(&db, "/api/search?status=quarantined").await;
+        assert_eq!(qd.as_array().unwrap().len(), 1);
+        // multi value: comma-joined statuses are OR-combined
+        let both = get_json(&db, "/api/search?status=active,quarantined").await;
+        assert_eq!(both.as_array().unwrap().len(), 2);
     }
 
     #[tokio::test]
