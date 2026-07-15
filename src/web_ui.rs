@@ -195,12 +195,17 @@ details.drive>summary:hover,details.folder>summary:hover{background:var(--line);
  transform-origin:top left;animation:ddin .13s ease;}
 .dd-menu[hidden]{display:none;}
 @keyframes ddin{from{opacity:0;transform:translateY(-4px) scale(.98);}to{opacity:1;transform:none;}}
-.dd-opt{display:flex;align-items:center;justify-content:space-between;gap:14px;text-align:left;white-space:nowrap;
+.dd-opt{display:flex;align-items:center;gap:10px;text-align:left;white-space:nowrap;
  background:none;border:0;border-radius:var(--r-sm);padding:8px 11px;font:inherit;font-size:13px;color:var(--fg);cursor:pointer;}
+.dd-opt .dd-t{flex:1;}
 .dd-opt:hover{background:var(--line);}
 .dd-opt.sel{color:var(--accent-text);font-weight:600;}
-.dd-opt .material-symbols-outlined{font-size:17px;visibility:hidden;}
-.dd-opt.sel .material-symbols-outlined{visibility:visible;}
+.dd-badge{font-size:11px;font-weight:600;color:var(--mut);font-family:var(--font-mono);min-width:12px;text-align:right;}
+.dd-opt.sel .dd-badge{color:var(--accent-text);}
+.dd-opt.zero{color:var(--mut2);}
+.dd-opt.zero .dd-badge{opacity:.55;}
+.dd-ck{font-size:17px!important;visibility:hidden;}
+.dd-opt.sel .dd-ck{visibility:visible;}
 .leaf{display:flex;align-items:center;gap:9px;padding:6px 10px 6px 22px;border-radius:var(--r-sm);cursor:default;}
 .leaf:hover{background:var(--line);}
 .leaf .fname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
@@ -572,8 +577,9 @@ $("#results").addEventListener("click",e=>{
 });
 function debounced(){ clearTimeout(timer); timer=setTimeout(run,180); }
 // Replace a native <select> with a styled dropdown; keeps the <select> as the value store
-// (so run()/change listeners work unchanged) and mirrors every pick back to it.
-function enhanceSelect(sel){
+// (so run()/change listeners work unchanged) and mirrors every pick back to it. `badge(value)` may
+// return a count string to flag on each option, refreshed every time the menu opens.
+function enhanceSelect(sel,badge){
   const dd=document.createElement("div"); dd.className="dd";
   const btn=document.createElement("button"); btn.type="button"; btn.className="dd-btn";
   btn.setAttribute("aria-haspopup","listbox");
@@ -583,13 +589,16 @@ function enhanceSelect(sel){
   const menu=document.createElement("div"); menu.className="dd-menu"; menu.hidden=true; menu.setAttribute("role","listbox");
   function sync(){ lab.textContent=sel.options[sel.selectedIndex].textContent;
     for(const o of menu.children) o.classList.toggle("sel", o.dataset.value===sel.value); }
+  function refreshBadges(){ if(!badge)return;
+    for(const o of menu.children){ const b=badge(o.dataset.value); const el=o.querySelector(".dd-badge");
+      el.textContent = b==null?"":String(b); o.classList.toggle("zero", b===0); } }
   for(const opt of sel.options){
     const b=document.createElement("button"); b.type="button"; b.className="dd-opt"; b.dataset.value=opt.value; b.setAttribute("role","option");
-    b.innerHTML='<span>'+esc(opt.textContent)+'</span><span class="material-symbols-outlined">check</span>';
+    b.innerHTML='<span class="dd-t">'+esc(opt.textContent)+'</span><span class="dd-badge"></span><span class="material-symbols-outlined dd-ck">check</span>';
     b.onclick=()=>{ sel.value=opt.value; sync(); close(); sel.dispatchEvent(new Event("change",{bubbles:true})); };
     menu.appendChild(b);
   }
-  function open(){ for(const m of document.querySelectorAll(".dd.open")) if(m!==dd){m.classList.remove("open");m.querySelector(".dd-menu").hidden=true;} menu.hidden=false; dd.classList.add("open"); btn.setAttribute("aria-expanded","true"); }
+  function open(){ for(const m of document.querySelectorAll(".dd.open")) if(m!==dd){m.classList.remove("open");m.querySelector(".dd-menu").hidden=true;} refreshBadges(); menu.hidden=false; dd.classList.add("open"); btn.setAttribute("aria-expanded","true"); }
   function close(){ menu.hidden=true; dd.classList.remove("open"); btn.setAttribute("aria-expanded","false"); }
   btn.onclick=e=>{ e.stopPropagation(); menu.hidden?open():close(); };
   document.addEventListener("click",e=>{ if(!dd.contains(e.target)) close(); });
@@ -597,13 +606,25 @@ function enhanceSelect(sel){
   sel.parentNode.insertBefore(dd,sel); dd.append(btn,menu,sel); sel.style.display="none";
   sync();
 }
+let statusCounts={};
+async function loadCounts(){
+  const p=new URLSearchParams(); const q=$("#q").value.trim(); if(q)p.set("q",q);
+  const v=$("#volume").value; if(v)p.set("volume",v); const c=$("#category").value; if(c)p.set("category",c);
+  try{ statusCounts=await apiGet("/api/status-counts?"+p.toString()); }catch(e){ statusCounts={}; }
+}
 async function init(){
   const vs=await apiGet("/api/volumes"); const sel=$("#volume");
   for(const v of vs){ const o=document.createElement("option"); o.value=v.volume_id; o.textContent=v.display_name||v.label; sel.appendChild(o); }
   const urlq=new URLSearchParams(location.search).get("q"); if(urlq)$("#q").value=urlq;
   $("#q").addEventListener("input",debounced);
   for(const k of ["volume","category","status"]) $("#"+k).addEventListener("change",run);
-  for(const k of ["volume","category","status"]) enhanceSelect($("#"+k));
+  for(const k of ["volume","category"]) $("#"+k).addEventListener("change",loadCounts);
+  $("#q").addEventListener("input",()=>{ clearTimeout(window.__ct); window.__ct=setTimeout(loadCounts,180); });
+  enhanceSelect($("#volume")); enhanceSelect($("#category"));
+  // Status filter flags how many rows carry each kind (active/missing/quarantined/purged), so
+  // hidden-by-default purged rows are still discoverable.
+  enhanceSelect($("#status"), val => val===""? null : (statusCounts[val]||0));
+  await loadCounts();
   run();
 }
 init();"##;
