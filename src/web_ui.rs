@@ -181,14 +181,26 @@ details.drive>summary:hover,details.folder>summary:hover{background:var(--line);
 .searchbar input{flex:1;font:inherit;font-size:14px;color:var(--fg);}
 .browsetools{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px;}
 .browsetools .count{margin-left:auto;font-size:13px;}
-.selpill{position:relative;display:inline-flex;align-items:center;}
-.selpill select{appearance:none;-webkit-appearance:none;-moz-appearance:none;background:var(--content);
- border:1px solid var(--line-strong);border-radius:999px;padding:8px 32px 8px 15px;font:inherit;font-size:13px;
- font-weight:500;color:var(--fg);cursor:pointer;box-shadow:var(--sh-sm);}
-.selpill::after{content:"";position:absolute;right:14px;top:calc(50% - 1px);width:6px;height:6px;
- border-right:1.6px solid var(--mut);border-bottom:1.6px solid var(--mut);transform:translateY(-50%) rotate(45deg);pointer-events:none;}
-.selpill select:hover{background:var(--line);}
-.selpill select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-weak);}
+.dd{position:relative;display:inline-block;}
+.dd-btn{display:inline-flex;align-items:center;gap:6px;background:var(--content);border:1px solid var(--line-strong);
+ border-radius:999px;padding:8px 10px 8px 15px;font:inherit;font-size:13px;font-weight:500;color:var(--fg);
+ cursor:pointer;box-shadow:var(--sh-sm);transition:background .12s,border-color .12s,box-shadow .12s;}
+.dd-btn:hover{background:var(--line);}
+.dd.open .dd-btn{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-weak);}
+.dd-caret{font-size:18px;color:var(--mut);transition:transform .16s;margin-left:-1px;}
+.dd.open .dd-caret{transform:rotate(180deg);}
+.dd-menu{position:absolute;top:calc(100% + 6px);left:0;min-width:190px;z-index:30;background:var(--elev);
+ border:1px solid var(--line-strong);border-radius:var(--r);box-shadow:var(--sh-lg);padding:6px;
+ display:flex;flex-direction:column;gap:1px;max-height:min(60vh,340px);overflow:auto;
+ transform-origin:top left;animation:ddin .13s ease;}
+.dd-menu[hidden]{display:none;}
+@keyframes ddin{from{opacity:0;transform:translateY(-4px) scale(.98);}to{opacity:1;transform:none;}}
+.dd-opt{display:flex;align-items:center;justify-content:space-between;gap:14px;text-align:left;white-space:nowrap;
+ background:none;border:0;border-radius:var(--r-sm);padding:8px 11px;font:inherit;font-size:13px;color:var(--fg);cursor:pointer;}
+.dd-opt:hover{background:var(--line);}
+.dd-opt.sel{color:var(--accent-text);font-weight:600;}
+.dd-opt .material-symbols-outlined{font-size:17px;visibility:hidden;}
+.dd-opt.sel .material-symbols-outlined{visibility:visible;}
 .leaf{display:flex;align-items:center;gap:9px;padding:6px 10px 6px 22px;border-radius:var(--r-sm);cursor:default;}
 .leaf:hover{background:var(--line);}
 .leaf .fname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
@@ -458,13 +470,13 @@ pub fn browse_page(csrf: &str) -> String {
   <div class="searchbar"><span class="material-symbols-outlined">search</span>
     <input id="q" type="search" placeholder="Search filename or path…" autofocus></div>
   <div class="browsetools">
-    <span class="selpill"><select id="volume"><option value="">All drives</option></select></span>
-    <span class="selpill"><select id="category"><option value="">All types</option>
+    <select id="volume"><option value="">All drives</option></select>
+    <select id="category"><option value="">All types</option>
       <option value="photo">Photos</option><option value="video">Videos</option>
-      <option value="document">Documents</option><option value="academic">Academic</option><option value="other">Other</option></select></span>
-    <span class="selpill"><select id="status"><option value="">Any status</option>
+      <option value="document">Documents</option><option value="academic">Academic</option><option value="other">Other</option></select>
+    <select id="status"><option value="">Any status</option>
       <option value="active">Active</option><option value="missing">Missing</option>
-      <option value="quarantined">Quarantined</option><option value="purged">Purged</option></select></span>
+      <option value="quarantined">Quarantined</option><option value="purged">Purged</option></select>
     <span class="mut count" id="count"></span>
   </div>
   <div class="mut" style="font-size:12px;margin:0 0 10px">Grouped by drive and folder. Files sharing identical content share a <span class="diamond" style="--dup:hsl(280,72%,52%)">◆</span> color — click one to highlight every copy.</div>
@@ -556,12 +568,39 @@ $("#results").addEventListener("click",e=>{
   if(!was) document.querySelectorAll('.leaf[data-hash="'+CSS.escape(hash)+'"]').forEach(el=>el.classList.add("hl"));
 });
 function debounced(){ clearTimeout(timer); timer=setTimeout(run,180); }
+// Replace a native <select> with a styled dropdown; keeps the <select> as the value store
+// (so run()/change listeners work unchanged) and mirrors every pick back to it.
+function enhanceSelect(sel){
+  const dd=document.createElement("div"); dd.className="dd";
+  const btn=document.createElement("button"); btn.type="button"; btn.className="dd-btn";
+  btn.setAttribute("aria-haspopup","listbox");
+  const lab=document.createElement("span"); lab.className="dd-label";
+  const car=document.createElement("span"); car.className="material-symbols-outlined dd-caret"; car.textContent="expand_more";
+  btn.append(lab,car);
+  const menu=document.createElement("div"); menu.className="dd-menu"; menu.hidden=true; menu.setAttribute("role","listbox");
+  function sync(){ lab.textContent=sel.options[sel.selectedIndex].textContent;
+    for(const o of menu.children) o.classList.toggle("sel", o.dataset.value===sel.value); }
+  for(const opt of sel.options){
+    const b=document.createElement("button"); b.type="button"; b.className="dd-opt"; b.dataset.value=opt.value; b.setAttribute("role","option");
+    b.innerHTML='<span>'+esc(opt.textContent)+'</span><span class="material-symbols-outlined">check</span>';
+    b.onclick=()=>{ sel.value=opt.value; sync(); close(); sel.dispatchEvent(new Event("change",{bubbles:true})); };
+    menu.appendChild(b);
+  }
+  function open(){ for(const m of document.querySelectorAll(".dd.open")) if(m!==dd){m.classList.remove("open");m.querySelector(".dd-menu").hidden=true;} menu.hidden=false; dd.classList.add("open"); btn.setAttribute("aria-expanded","true"); }
+  function close(){ menu.hidden=true; dd.classList.remove("open"); btn.setAttribute("aria-expanded","false"); }
+  btn.onclick=e=>{ e.stopPropagation(); menu.hidden?open():close(); };
+  document.addEventListener("click",e=>{ if(!dd.contains(e.target)) close(); });
+  document.addEventListener("keydown",e=>{ if(e.key==="Escape") close(); });
+  sel.parentNode.insertBefore(dd,sel); dd.append(btn,menu,sel); sel.style.display="none";
+  sync();
+}
 async function init(){
   const vs=await apiGet("/api/volumes"); const sel=$("#volume");
   for(const v of vs){ const o=document.createElement("option"); o.value=v.volume_id; o.textContent=v.display_name||v.label; sel.appendChild(o); }
   const urlq=new URLSearchParams(location.search).get("q"); if(urlq)$("#q").value=urlq;
   $("#q").addEventListener("input",debounced);
   for(const k of ["volume","category","status"]) $("#"+k).addEventListener("change",run);
+  for(const k of ["volume","category","status"]) enhanceSelect($("#"+k));
   run();
 }
 init();"##;
