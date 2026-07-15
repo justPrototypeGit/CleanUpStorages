@@ -29,9 +29,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower-http = { version = "0.6", features = ["trace"] }
 
-# Windows-only: crisp (DPI-aware) native folder dialog, owned by the foreground window.
+# Windows-only: crisp (DPI-aware) native folder dialog, owned by the foreground window and
+# re-centered on the monitor once it appears.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
 raw-window-handle = "0.6"
 
 [dev-dependencies]
