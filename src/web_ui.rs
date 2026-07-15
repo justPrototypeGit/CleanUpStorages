@@ -195,17 +195,25 @@ details.drive>summary:hover,details.folder>summary:hover{background:var(--line);
  transform-origin:top left;animation:ddin .13s ease;}
 .dd-menu[hidden]{display:none;}
 @keyframes ddin{from{opacity:0;transform:translateY(-4px) scale(.98);}to{opacity:1;transform:none;}}
-.dd-opt{display:flex;align-items:center;gap:10px;text-align:left;white-space:nowrap;
- background:none;border:0;border-radius:var(--r-sm);padding:8px 11px;font:inherit;font-size:13px;color:var(--fg);cursor:pointer;}
+.dd-opt{display:flex;align-items:center;gap:10px;text-align:left;white-space:nowrap;width:100%;
+ background:none;border:0;border-radius:var(--r-sm);padding:7px 10px;font:inherit;font-size:13px;color:var(--fg);cursor:pointer;}
 .dd-opt .dd-t{flex:1;}
 .dd-opt:hover{background:var(--line);}
+.dd-box{width:17px;height:17px;border:1.5px solid var(--line-strong);border-radius:5px;flex:none;
+ display:flex;align-items:center;justify-content:center;transition:background .1s,border-color .1s;}
+.dd-opt.sel .dd-box{background:var(--accent);border-color:var(--accent);}
+.dd-ck{font-size:13px!important;color:#fff;visibility:hidden;}
+.dd-opt.sel .dd-ck{visibility:visible;}
 .dd-opt.sel{color:var(--accent-text);font-weight:600;}
 .dd-badge{font-size:11px;font-weight:600;color:var(--mut);font-family:var(--font-mono);min-width:12px;text-align:right;}
 .dd-opt.sel .dd-badge{color:var(--accent-text);}
-.dd-opt.zero{color:var(--mut2);}
+.dd-opt.zero .dd-t{color:var(--mut2);}
 .dd-opt.zero .dd-badge{opacity:.55;}
-.dd-ck{font-size:17px!important;visibility:hidden;}
-.dd-opt.sel .dd-ck{visibility:visible;}
+.dd-clear{margin-top:4px;border:0;border-top:1px solid var(--line);border-radius:0;background:none;width:100%;
+ text-align:left;padding:8px 10px 4px;font:inherit;font-size:12px;color:var(--mut);cursor:pointer;}
+.dd-clear:hover{color:var(--accent);}
+.dd.multi.has-sel .dd-btn{border-color:var(--accent);color:var(--accent-text);background:var(--accent-weak);}
+.dd.multi.has-sel .dd-caret{color:var(--accent-text);}
 .leaf{display:flex;align-items:center;gap:9px;padding:6px 10px 6px 22px;border-radius:var(--r-sm);cursor:default;}
 .leaf:hover{background:var(--line);}
 .leaf .fname{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
@@ -489,6 +497,9 @@ pub fn browse_page(csrf: &str) -> String {
 </div>"##;
     let script = r##"
 let timer=null;
+// Multi-select filter state: each is an array of chosen values (empty = no filter). Sent to the API
+// comma-joined, OR-combined server-side.
+const F={volume:[],category:[],status:[]};
 // --- data -> tree model (pure) ---
 function buildTree(hits){
   const drives=new Map();
@@ -562,7 +573,7 @@ function renderTree(drives){
 }
 async function run(){ try{
   const p=new URLSearchParams(); const q=$("#q").value.trim(); if(q)p.set("q",q);
-  for(const k of ["volume","category","status"]){ const v=$("#"+k).value; if(v)p.set(k,v); }
+  for(const k of ["volume","category","status"]){ if(F[k].length) p.set(k,F[k].join(",")); }
   p.set("limit","3000");
   const hits=await apiGet("/api/search?"+p.toString());
   $("#count").textContent=hits.length+" result"+(hits.length===1?"":"s")+(hits.length>=3000?" (showing first 3000 — refine your search)":"");
@@ -576,28 +587,38 @@ $("#results").addEventListener("click",e=>{
   if(!was) document.querySelectorAll('.leaf[data-hash="'+CSS.escape(hash)+'"]').forEach(el=>el.classList.add("hl"));
 });
 function debounced(){ clearTimeout(timer); timer=setTimeout(run,180); }
-// Replace a native <select> with a styled dropdown; keeps the <select> as the value store
-// (so run()/change listeners work unchanged) and mirrors every pick back to it. `badge(value)` may
-// return a count string to flag on each option, refreshed every time the menu opens.
-function enhanceSelect(sel,badge){
-  const dd=document.createElement("div"); dd.className="dd";
-  const btn=document.createElement("button"); btn.type="button"; btn.className="dd-btn";
-  btn.setAttribute("aria-haspopup","listbox");
+// Turn a native <select> into a styled MULTI-select dropdown. The chosen values live in F[sel.id]
+// (an array; empty = no filter). `opts.badge(value)` may return a count to flag on each option,
+// refreshed whenever the menu opens. `opts.onChange()` fires after every toggle.
+function enhanceSelect(sel,opts){
+  opts=opts||{}; const key=sel.id, badge=opts.badge, onChange=opts.onChange||(()=>{});
+  const placeholder=(sel.options[0]&&sel.options[0].value==="")?sel.options[0].textContent:"All";
+  const choices=[...sel.options].filter(o=>o.value!=="");
+  const sel_=new Set(F[key]||[]);
+  const dd=document.createElement("div"); dd.className="dd multi";
+  const btn=document.createElement("button"); btn.type="button"; btn.className="dd-btn"; btn.setAttribute("aria-haspopup","listbox");
   const lab=document.createElement("span"); lab.className="dd-label";
   const car=document.createElement("span"); car.className="material-symbols-outlined dd-caret"; car.textContent="expand_more";
   btn.append(lab,car);
   const menu=document.createElement("div"); menu.className="dd-menu"; menu.hidden=true; menu.setAttribute("role","listbox");
-  function sync(){ lab.textContent=sel.options[sel.selectedIndex].textContent;
-    for(const o of menu.children) o.classList.toggle("sel", o.dataset.value===sel.value); }
+  function labelText(){ if(sel_.size===0) return placeholder;
+    if(sel_.size===1){ const v=[...sel_][0]; const o=choices.find(c=>c.value===v); return o?o.textContent:v; }
+    return sel_.size+" selected"; }
+  function sync(){ lab.textContent=labelText(); dd.classList.toggle("has-sel",sel_.size>0);
+    for(const o of menu.children) o.classList.toggle("sel", o.dataset.value!=null && sel_.has(o.dataset.value)); }
+  function commit(){ F[key]=[...sel_]; sync(); onChange(); }
   function refreshBadges(){ if(!badge)return;
-    for(const o of menu.children){ const b=badge(o.dataset.value); const el=o.querySelector(".dd-badge");
-      el.textContent = b==null?"":String(b); o.classList.toggle("zero", b===0); } }
-  for(const opt of sel.options){
+    for(const o of menu.children){ if(o.dataset.value==null)continue; const b=badge(o.dataset.value); const el=o.querySelector(".dd-badge");
+      if(el){ el.textContent=b==null?"":String(b); o.classList.toggle("zero", b===0); } } }
+  for(const opt of choices){
     const b=document.createElement("button"); b.type="button"; b.className="dd-opt"; b.dataset.value=opt.value; b.setAttribute("role","option");
-    b.innerHTML='<span class="dd-t">'+esc(opt.textContent)+'</span><span class="dd-badge"></span><span class="material-symbols-outlined dd-ck">check</span>';
-    b.onclick=()=>{ sel.value=opt.value; sync(); close(); sel.dispatchEvent(new Event("change",{bubbles:true})); };
+    b.innerHTML='<span class="dd-box"><span class="material-symbols-outlined dd-ck">check</span></span><span class="dd-t">'+esc(opt.textContent)+'</span><span class="dd-badge"></span>';
+    b.onclick=e=>{ e.stopPropagation(); if(sel_.has(opt.value))sel_.delete(opt.value); else sel_.add(opt.value); commit(); };
     menu.appendChild(b);
   }
+  const clear=document.createElement("button"); clear.type="button"; clear.className="dd-clear";
+  clear.textContent="Clear"; clear.onclick=e=>{ e.stopPropagation(); sel_.clear(); commit(); };
+  menu.appendChild(clear);
   function open(){ for(const m of document.querySelectorAll(".dd.open")) if(m!==dd){m.classList.remove("open");m.querySelector(".dd-menu").hidden=true;} refreshBadges(); menu.hidden=false; dd.classList.add("open"); btn.setAttribute("aria-expanded","true"); }
   function close(){ menu.hidden=true; dd.classList.remove("open"); btn.setAttribute("aria-expanded","false"); }
   btn.onclick=e=>{ e.stopPropagation(); menu.hidden?open():close(); };
@@ -609,21 +630,19 @@ function enhanceSelect(sel,badge){
 let statusCounts={};
 async function loadCounts(){
   const p=new URLSearchParams(); const q=$("#q").value.trim(); if(q)p.set("q",q);
-  const v=$("#volume").value; if(v)p.set("volume",v); const c=$("#category").value; if(c)p.set("category",c);
+  if(F.volume.length)p.set("volume",F.volume.join(",")); if(F.category.length)p.set("category",F.category.join(","));
   try{ statusCounts=await apiGet("/api/status-counts?"+p.toString()); }catch(e){ statusCounts={}; }
 }
 async function init(){
   const vs=await apiGet("/api/volumes"); const sel=$("#volume");
   for(const v of vs){ const o=document.createElement("option"); o.value=v.volume_id; o.textContent=v.display_name||v.label; sel.appendChild(o); }
   const urlq=new URLSearchParams(location.search).get("q"); if(urlq)$("#q").value=urlq;
-  $("#q").addEventListener("input",debounced);
-  for(const k of ["volume","category","status"]) $("#"+k).addEventListener("change",run);
-  for(const k of ["volume","category"]) $("#"+k).addEventListener("change",loadCounts);
-  $("#q").addEventListener("input",()=>{ clearTimeout(window.__ct); window.__ct=setTimeout(loadCounts,180); });
-  enhanceSelect($("#volume")); enhanceSelect($("#category"));
+  $("#q").addEventListener("input",()=>{ debounced(); clearTimeout(window.__ct); window.__ct=setTimeout(loadCounts,180); });
+  enhanceSelect($("#volume"),{onChange:()=>{ loadCounts(); run(); }});
+  enhanceSelect($("#category"),{onChange:()=>{ loadCounts(); run(); }});
   // Status filter flags how many rows carry each kind (active/missing/quarantined/purged), so
-  // hidden-by-default purged rows are still discoverable.
-  enhanceSelect($("#status"), val => val===""? null : (statusCounts[val]||0));
+  // hidden-by-default purged rows stay discoverable; toggling combines statuses (OR).
+  enhanceSelect($("#status"),{onChange:run, badge: val => (statusCounts[val]||0)});
   await loadCounts();
   run();
 }

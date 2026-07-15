@@ -2,13 +2,14 @@ use crate::catalog::Catalog;
 use crate::catalog::models::*;
 use rusqlite::params;
 
-/// Optional filters for a catalog search/browse. All `None`/empty = match everything.
+/// Optional filters for a catalog search/browse. Empty vec / `None` = match everything; each of the
+/// `category`/`volume`/`status` vecs is OR-combined (SQL `IN`), so the filters are multi-select.
 #[derive(Default, Debug, Clone)]
 pub struct SearchFilters {
     pub query: String,
-    pub category: Option<String>,
-    pub volume: Option<String>,
-    pub status: Option<String>,
+    pub category: Vec<String>,
+    pub volume: Vec<String>,
+    pub status: Vec<String>,
     pub min_size: Option<i64>,
     pub max_size: Option<i64>,
     pub modified_after: Option<i64>,
@@ -201,12 +202,22 @@ impl Catalog {
     {
         let f = SearchFilters {
             query: query.to_string(),
-            category: category.map(str::to_string),
-            volume: volume.map(str::to_string),
-            status: status.map(str::to_string),
+            category: category.map(str::to_string).into_iter().collect(),
+            volume: volume.map(str::to_string).into_iter().collect(),
+            status: status.map(str::to_string).into_iter().collect(),
             ..Default::default()
         };
         self.search_filtered(&f, 1000)
+    }
+
+    /// Build ` AND <col> IN (?,?,…)` for a multi-value filter, pushing each value as an arg.
+    fn push_in_clause(
+        sql: &mut String, args: &mut Vec<Box<dyn rusqlite::types::ToSql>>, col: &str, values: &[String],
+    ) {
+        if values.is_empty() { return; }
+        let holders = std::iter::repeat("?").take(values.len()).collect::<Vec<_>>().join(",");
+        sql.push_str(&format!(" AND {col} IN ({holders})"));
+        for v in values { args.push(Box::new(v.clone())); }
     }
 
     /// Full filtered search over the catalog.
@@ -223,14 +234,15 @@ impl Catalog {
                 .collect::<Vec<_>>().join(" ");
             args.push(Box::new(match_expr));
         }
-        if let Some(c) = &f.category { sql.push_str(" AND category = ?"); args.push(Box::new(c.clone())); }
-        if let Some(v) = &f.volume { sql.push_str(" AND volume_id = ?"); args.push(Box::new(v.clone())); }
+        Self::push_in_clause(&mut sql, &mut args, "category", &f.category);
+        Self::push_in_clause(&mut sql, &mut args, "volume_id", &f.volume);
         // Purged rows are a permanently-deleted audit record — the file (and its `_ToDelete` folder)
         // is gone from disk, so hide them from the default browse/search. They remain reachable only
-        // by explicitly filtering on status = 'purged'.
-        match &f.status {
-            Some(s) => { sql.push_str(" AND status = ?"); args.push(Box::new(s.clone())); }
-            None => { sql.push_str(" AND status != 'purged'"); }
+        // by explicitly including status = 'purged' in the filter.
+        if f.status.is_empty() {
+            sql.push_str(" AND status != 'purged'");
+        } else {
+            Self::push_in_clause(&mut sql, &mut args, "status", &f.status);
         }
         if let Some(n) = f.min_size { sql.push_str(" AND size_bytes >= ?"); args.push(Box::new(n)); }
         if let Some(n) = f.max_size { sql.push_str(" AND size_bytes <= ?"); args.push(Box::new(n)); }
@@ -248,7 +260,7 @@ impl Catalog {
     /// Count rows per status for the given text/category/volume context (status itself is not
     /// filtered). Lets the UI flag which kinds — active/missing/quarantined/purged — are present,
     /// including purged rows that the default search hides.
-    pub fn status_counts(&self, query: &str, category: Option<&str>, volume: Option<&str>)
+    pub fn status_counts(&self, query: &str, category: &[String], volume: &[String])
         -> anyhow::Result<std::collections::HashMap<String, i64>>
     {
         let mut sql = String::from("SELECT status, count(*) FROM files WHERE 1=1");
@@ -261,8 +273,8 @@ impl Catalog {
                 .collect::<Vec<_>>().join(" ");
             args.push(Box::new(match_expr));
         }
-        if let Some(c) = category { sql.push_str(" AND category = ?"); args.push(Box::new(c.to_string())); }
-        if let Some(v) = volume { sql.push_str(" AND volume_id = ?"); args.push(Box::new(v.to_string())); }
+        Self::push_in_clause(&mut sql, &mut args, "category", category);
+        Self::push_in_clause(&mut sql, &mut args, "volume_id", volume);
         sql.push_str(" GROUP BY status");
 
         let mut stmt = self.conn.prepare(&sql)?;
