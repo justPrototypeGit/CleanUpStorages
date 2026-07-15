@@ -44,6 +44,7 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/", get(overview))
         .route("/browse", get(browse))
         .route("/api/search", get(api_search))
+        .route("/api/status-counts", get(api_status_counts))
         .route("/api/volumes", get(api_volumes))
         .route("/api/stats", get(api_stats))
         .route("/api/activity", get(api_activity))
@@ -289,6 +290,18 @@ async fn api_search(State(state): State<AppState>, Query(p): Query<SearchParams>
         dto
     }).collect();
     Ok(Json(out))
+}
+
+/// Count of catalogued rows per status for the current text/category/volume context, so the Browse
+/// status filter can flag which kinds are present (including purged rows the tree hides by default).
+async fn api_status_counts(State(state): State<AppState>, Query(p): Query<SearchParams>)
+    -> Result<Json<std::collections::HashMap<String, i64>>, (axum::http::StatusCode, String)>
+{
+    let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
+    let counts = cat.status_counts(
+        &p.q.unwrap_or_default(), p.category.as_deref(), p.volume.as_deref(),
+    ).map_err(err500)?;
+    Ok(Json(counts))
 }
 
 /// Shared by /api/volumes and /api/stats so the two endpoints can't drift apart.
@@ -969,6 +982,64 @@ mod tests {
         assert_eq!(arr[0]["label"], "Photos HDD");
         assert_eq!(arr[0]["connected"], true); // Fixed mount is present
         assert!(arr[0]["reclaimable_bytes"].as_i64().unwrap() >= 0);
+    }
+
+    /// End-to-end of the review flow's visibility rules (the scenario reported by the user):
+    /// quarantining a duplicate keeps the drive's "Purge" affordance alive (quarantined_bytes),
+    /// even though reclaimable-from-duplicates has dropped to 0; the quarantined row is browsable at
+    /// its original location; and once purged it is hidden by default but still reachable (at its
+    /// original location) via the Purged status filter. Status counts flag each kind's presence.
+    #[tokio::test]
+    async fn quarantine_then_purge_visibility_and_purge_affordance() {
+        let (_t, db, _state) = seed_dupes(); // two active copies of hash DUP: a.jpg + copy/a.jpg (10 B each)
+
+        // Quarantine copy/a.jpg -> moves under _ToDelete, remembers its original location.
+        {
+            let cat = crate::catalog::Catalog::open(&db).unwrap();
+            let id = cat.loose_file_id("vol-1", "copy/a.jpg").unwrap().unwrap();
+            cat.mark_quarantined(id, "_ToDelete/copy/a.jpg", "copy/a.jpg", 300).unwrap();
+        }
+
+        // Purge affordance: driven by quarantined_bytes (10), NOT reclaimable_bytes (now 0 — the
+        // duplicate group is gone). This is exactly the "purge button disappeared" regression.
+        let d = get_json(&db, "/api/drives").await;
+        let d0 = &d.as_array().unwrap()[0];
+        assert_eq!(d0["quarantined_bytes"], 10);
+        assert_eq!(d0["reclaimable_bytes"], 0);
+
+        // Status filter flags the kinds that are present.
+        let counts = get_json(&db, "/api/status-counts").await;
+        assert_eq!(counts["active"], 1);
+        assert_eq!(counts["quarantined"], 1);
+
+        // Default browse shows the quarantined row at its original location, never under _ToDelete.
+        let hits = get_json(&db, "/api/search").await;
+        let q = hits.as_array().unwrap().iter()
+            .find(|h| h["status"] == "quarantined").expect("quarantined row is browsable");
+        assert_eq!(q["original_path"], "copy/a.jpg");
+        assert_eq!(q["relative_path"], "_ToDelete/copy/a.jpg");
+
+        // Purge it.
+        {
+            let cat = crate::catalog::Catalog::open(&db).unwrap();
+            let id = cat.loose_file_id("vol-1", "_ToDelete/copy/a.jpg").unwrap().unwrap();
+            cat.mark_purged(id, 400).unwrap();
+        }
+
+        // Hidden by default, still surfaced (at its original location) by the Purged filter.
+        let after = get_json(&db, "/api/search").await;
+        assert!(after.as_array().unwrap().iter().all(|h| h["status"] != "purged"),
+            "purged rows are hidden from the default tree");
+        let purged = get_json(&db, "/api/search?status=purged").await;
+        let parr = purged.as_array().unwrap();
+        assert_eq!(parr.len(), 1);
+        assert_eq!(parr[0]["original_path"], "copy/a.jpg");
+
+        // Nothing left in quarantine; the Purged kind is now flagged.
+        let d2 = get_json(&db, "/api/drives").await;
+        assert_eq!(d2.as_array().unwrap()[0]["quarantined_bytes"], 0);
+        let counts2 = get_json(&db, "/api/status-counts").await;
+        assert_eq!(counts2["purged"], 1);
     }
 
     #[tokio::test]

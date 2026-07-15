@@ -245,6 +245,34 @@ impl Catalog {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Count rows per status for the given text/category/volume context (status itself is not
+    /// filtered). Lets the UI flag which kinds — active/missing/quarantined/purged — are present,
+    /// including purged rows that the default search hides.
+    pub fn status_counts(&self, query: &str, category: Option<&str>, volume: Option<&str>)
+        -> anyhow::Result<std::collections::HashMap<String, i64>>
+    {
+        let mut sql = String::from("SELECT status, count(*) FROM files WHERE 1=1");
+        let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        let q = query.trim();
+        if !q.is_empty() {
+            sql.push_str(" AND id IN (SELECT rowid FROM files_fts WHERE files_fts MATCH ?)");
+            let match_expr = q.split_whitespace()
+                .map(|t| format!("\"{}\"*", t.replace('"', "\"\"")))
+                .collect::<Vec<_>>().join(" ");
+            args.push(Box::new(match_expr));
+        }
+        if let Some(c) = category { sql.push_str(" AND category = ?"); args.push(Box::new(c.to_string())); }
+        if let Some(v) = volume { sql.push_str(" AND volume_id = ?"); args.push(Box::new(v.to_string())); }
+        sql.push_str(" GROUP BY status");
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let arg_refs: Vec<&dyn rusqlite::types::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+        let rows = stmt.query_map(arg_refs.as_slice(), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        Ok(rows.collect::<Result<std::collections::HashMap<_, _>, _>>()?)
+    }
+
     /// Id of the loose file (container_chain IS NULL) at this path, if catalogued, regardless of
     /// status. Exactly one such row can exist per (volume, path) — the loose-identity partial
     /// unique index guarantees it.
