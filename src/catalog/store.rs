@@ -225,7 +225,13 @@ impl Catalog {
         }
         if let Some(c) = &f.category { sql.push_str(" AND category = ?"); args.push(Box::new(c.clone())); }
         if let Some(v) = &f.volume { sql.push_str(" AND volume_id = ?"); args.push(Box::new(v.clone())); }
-        if let Some(s) = &f.status { sql.push_str(" AND status = ?"); args.push(Box::new(s.clone())); }
+        // Purged rows are a permanently-deleted audit record — the file (and its `_ToDelete` folder)
+        // is gone from disk, so hide them from the default browse/search. They remain reachable only
+        // by explicitly filtering on status = 'purged'.
+        match &f.status {
+            Some(s) => { sql.push_str(" AND status = ?"); args.push(Box::new(s.clone())); }
+            None => { sql.push_str(" AND status != 'purged'"); }
+        }
         if let Some(n) = f.min_size { sql.push_str(" AND size_bytes >= ?"); args.push(Box::new(n)); }
         if let Some(n) = f.max_size { sql.push_str(" AND size_bytes <= ?"); args.push(Box::new(n)); }
         if let Some(n) = f.modified_after { sql.push_str(" AND modified_time >= ?"); args.push(Box::new(n)); }
@@ -875,6 +881,33 @@ mod tests {
         assert_eq!(rec.container_chain, None); // now a loose quarantined row
         assert_eq!(rec.relative_path, "_ToDelete/a.zip/x.jpg");
         assert_eq!(rec.original_path.as_deref(), Some("a.zip › x.jpg"));
+    }
+
+    #[test]
+    fn default_search_hides_purged_rows_but_status_filter_shows_them() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_volume(&crate::catalog::models::Volume {
+            volume_id: "v".into(), label: "D".into(), identified_by: "marker".into(),
+            first_seen_at: 1, last_seen_at: 1 }).unwrap();
+        let mk = |name: &str| crate::catalog::models::NewFile {
+            volume_id: "v".into(), relative_path: name.into(), filename: name.into(),
+            extension: "txt".into(), size_bytes: 1, content_hash: format!("h-{name}"),
+            created_time: None, modified_time: None, accessed_time: None,
+            category: crate::category::Category::Other, container_chain: None };
+        cat.upsert_file(&mk("keep.txt"), 1).unwrap();
+        cat.upsert_file(&mk("_ToDelete/gone.txt"), 1).unwrap();
+        let gone = cat.loose_file_id("v", "_ToDelete/gone.txt").unwrap().unwrap();
+        cat.mark_purged(gone, 200).unwrap();
+
+        // Default browse (no status filter) must not show the purged `_ToDelete` row.
+        let def = cat.search("", None, None, None).unwrap();
+        assert_eq!(def.len(), 1);
+        assert_eq!(def[0].relative_path, "keep.txt");
+
+        // Explicitly asking for purged still surfaces them (audit view).
+        let purged = cat.search("", None, None, Some("purged")).unwrap();
+        assert_eq!(purged.len(), 1);
+        assert_eq!(purged[0].relative_path, "_ToDelete/gone.txt");
     }
 
     #[test]
