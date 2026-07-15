@@ -125,6 +125,9 @@ async fn asset(AxPath(file): AxPath<String>) -> Response {
 struct HitDto {
     location: String,
     relative_path: String,
+    /// Last valid on-disk location before quarantine (set only on quarantined/purged rows); the tree
+    /// places these here instead of under `_ToDelete`.
+    original_path: Option<String>,
     container_chain: Option<String>,
     filename: String,
     volume_id: String,
@@ -142,6 +145,7 @@ impl From<FileRecord> for HitDto {
         HitDto {
             location,
             relative_path: f.relative_path,
+            original_path: f.original_path,
             container_chain: f.container_chain,
             filename: f.filename,
             volume_id: f.volume_id,
@@ -186,7 +190,8 @@ struct DriveDto {
     active_bytes: i64,
     total_bytes: Option<u64>,     // None if unmounted or undeterminable
     free_bytes: Option<u64>,
-    reclaimable_bytes: i64,
+    reclaimable_bytes: i64,       // potential: size of active duplicate copies not yet quarantined
+    quarantined_bytes: i64,       // actual: bytes sitting in `_ToDelete`, i.e. what "Purge" deletes
     last_seen_at: Option<i64>,
     has_errors: bool,
 }
@@ -340,6 +345,7 @@ async fn api_drives(State(state): State<AppState>)
             connected: mount_path.is_some(),
             mount_path: mount_path.map(|p| p.display().to_string()),
             reclaimable_bytes: reclaim.get(&volume_id).copied().unwrap_or(0),
+            quarantined_bytes: cat.recoverable_bytes(&volume_id).map_err(err500)?,
             last_seen_at: cat.volume_last_seen(&volume_id).map_err(err500)?,
             has_errors: cat.volume_has_scan_errors(&volume_id).map_err(err500)?,
             volume_id, label, display_name, description, active_files, active_bytes, total_bytes, free_bytes,

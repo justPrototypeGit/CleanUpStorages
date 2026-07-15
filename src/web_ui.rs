@@ -490,7 +490,10 @@ function buildTree(hits){
   for(const h of hits){
     if(!drives.has(h.volume_id)) drives.set(h.volume_id,{id:h.volume_id,label:h.volume_label||h.volume_id,size:0,children:new Map(),files:[]});
     const drive=drives.get(h.volume_id); drive.size+=(h.size_bytes||0);
-    const segs=String(h.relative_path||"").split('/').filter(Boolean);
+    // Quarantined/purged rows live under _ToDelete on disk, but we show them at their last valid
+    // location (original_path) so the tree never grows a _ToDelete branch.
+    const loc = (h.original_path && !h.container_chain) ? h.original_path : h.relative_path;
+    const segs=String(loc||"").split('/').filter(Boolean);
     const last=segs.pop()||h.filename||"(file)";
     let node=drive;
     for(const seg of segs){ if(!node.children.has(seg)) node.children.set(seg,{name:seg,children:new Map(),files:[]}); node=node.children.get(seg); }
@@ -730,21 +733,24 @@ async function load(){
     </div></div>`).join("")
     : '<div class="mut" style="grid-column:1 / -1">No drives catalogued yet. Scan one from the Scan page.</div>';
 
-  const totReclaim=drives.reduce((a,d)=>a+(d.reclaimable_bytes||0),0);
-  const withQ=drives.filter(d=>(d.reclaimable_bytes||0)>0).length;
-  $("#quarantine-alert").innerHTML = totReclaim>0 ? `<div class="q-alert">
+  // "Purge all" acts on files already in _ToDelete (quarantined_bytes) — not the forward-looking
+  // reclaimable-from-duplicates figure, which drops to 0 the moment you quarantine a copy.
+  const totQuar=drives.reduce((a,d)=>a+(d.quarantined_bytes||0),0);
+  const withQ=drives.filter(d=>(d.quarantined_bytes||0)>0).length;
+  $("#quarantine-alert").innerHTML = totQuar>0 ? `<div class="q-alert">
     <div class="q-ico"><span class="material-symbols-outlined">delete_sweep</span></div>
-    <div class="qtxt"><strong>Quarantined files</strong><span>${fmtSize(totReclaim)} across ${withQ} drive${withQ===1?'':'s'}</span></div>
+    <div class="qtxt"><strong>Quarantined files</strong><span>${fmtSize(totQuar)} across ${withQ} drive${withQ===1?'':'s'}</span></div>
     <button class="btn btn-danger" id="purge-all" style="margin-left:6px">Purge all</button></div>` : "";
   const q=$("#purge-all"); if(q) q.onclick=purgeAll;
 
+  const totReclaim=drives.reduce((a,d)=>a+(d.reclaimable_bytes||0),0);
   const totBytes=drives.reduce((a,d)=>a+(d.active_bytes||0),0);
   const totFiles=drives.reduce((a,d)=>a+(d.active_files||0),0);
   const groups=st?st.duplicate_groups:0;
   $("#summary").innerHTML = drives.length ? `
     <div class="card sumcard"><div class="k">Total catalogued</div><div class="v">${fmtSize(totBytes)}</div><div class="s">Across ${drives.length} volume${drives.length===1?'':'s'}</div></div>
     <div class="card sumcard"><div class="k">Files indexed</div><div class="v">${totFiles.toLocaleString()}</div><div class="s">Active entries in the catalog</div></div>
-    <div class="card sumcard"><div class="k">Reclaimable</div><div class="v accent">${fmtSize(totReclaim)}</div><div class="s">${groups} duplicate group${groups===1?'':'s'} pending</div></div>` : "";
+    <div class="card sumcard"><div class="k">Reclaimable</div><div class="v accent">${fmtSize(totReclaim)}</div><div class="s">${groups} duplicate group${groups===1?'':'s'} to review${totQuar>0?` · ${fmtSize(totQuar)} in quarantine`:''}</div></div>` : "";
 
   for(const c of document.querySelectorAll(".drivecard[data-vid]")){
     c.querySelector(".forget").onclick=async()=>{
