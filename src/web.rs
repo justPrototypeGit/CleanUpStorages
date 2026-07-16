@@ -239,7 +239,7 @@ fn activity_summary(action: &str, details: &str) -> String {
         "quarantine" => {
             let from = s("from");
             let name = from.rsplit('/').next().unwrap_or(&from);
-            format!("Quarantined {}", name)
+            format!("Quarantined {name}")
         }
         "quarantine_skip" => "Skipped a file to protect the last copy".to_string(),
         "quarantine_error" => "A file could not be quarantined".to_string(),
@@ -1126,11 +1126,11 @@ mod tests {
         (tmp, db)
     }
 
-    async fn get_json(db: &PathBuf, uri: &str) -> serde_json::Value {
+    async fn get_json(db: &std::path::Path, uri: &str) -> serde_json::Value {
         use axum::body::Body;
         use axum::http::Request;
         use tower::ServiceExt;
-        let app = build_router(db.clone());
+        let app = build_router(db.to_path_buf());
         let res = app
             .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
             .await
@@ -2187,6 +2187,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "the lock is a test-only serialization guard (unit-value Mutex), not a \
+            resource read across the await; holding it for the whole async test body is the point"
+    )]
     async fn request_is_traced_with_method_status_and_id() {
         use axum::body::Body;
         use axum::http::Request;
@@ -2221,6 +2226,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "the lock is a test-only serialization guard (unit-value Mutex), not a \
+            resource read across the await; holding it for the whole async test body is the point"
+    )]
     async fn csrf_rejection_is_logged() {
         use axum::body::Body;
         use axum::http::Request;

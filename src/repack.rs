@@ -61,7 +61,7 @@ pub fn repack_entry(
     let archive_rel = entry.relative_path.clone();
     let archive_path = mount_root.join(&archive_rel);
     if !archive_path.is_file() {
-        anyhow::bail!("archive {} not found on disk", archive_rel);
+        anyhow::bail!("archive {archive_rel} not found on disk");
     }
     let archive_size = std::fs::metadata(&archive_path)?.len();
 

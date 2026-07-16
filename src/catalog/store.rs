@@ -230,8 +230,7 @@ impl Catalog {
         }
         // Deduplicate the input so the IN-list stays small.
         let uniq: std::collections::HashSet<&String> = hashes.iter().collect();
-        let placeholders = std::iter::repeat("?")
-            .take(uniq.len())
+        let placeholders = std::iter::repeat_n("?", uniq.len())
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
@@ -301,8 +300,7 @@ impl Catalog {
         if values.is_empty() {
             return;
         }
-        let holders = std::iter::repeat("?")
-            .take(values.len())
+        let holders = std::iter::repeat_n("?", values.len())
             .collect::<Vec<_>>()
             .join(",");
         sql.push_str(&format!(" AND {col} IN ({holders})"));
@@ -816,10 +814,10 @@ mod tests {
         .unwrap();
         assert_eq!(cat.volume_last_seen("v").unwrap(), Some(42));
         assert_eq!(cat.volume_last_seen("nope").unwrap(), None);
-        assert_eq!(cat.volume_has_scan_errors("v").unwrap(), false);
+        assert!(!cat.volume_has_scan_errors("v").unwrap());
         cat.log_scan_error(Some("v"), "some/path", "permission denied", 9)
             .unwrap();
-        assert_eq!(cat.volume_has_scan_errors("v").unwrap(), true);
+        assert!(cat.volume_has_scan_errors("v").unwrap());
     }
 
     #[test]

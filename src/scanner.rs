@@ -266,6 +266,11 @@ pub fn run_scan(
 }
 
 /// Open an on-disk archive file, catalog each entry, and log each non-fatal error.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each parameter is an independent scan input; grouping them into a struct would add \
+        indirection without reducing real complexity"
+)]
 fn descend_archive(
     cat: &Catalog,
     path: &Path,

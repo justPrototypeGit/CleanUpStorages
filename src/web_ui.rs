@@ -426,21 +426,13 @@ pub fn shell(active: &str, csrf: &str, title: &str, main_html: &str, page_script
 <script>(function(){{var q=new URLSearchParams(location.search);var u=q.get('theme');var t=u||localStorage.getItem('theme');if(t&&t!=='auto')document.documentElement.dataset.theme=t;var r=q.get('rail');var rr=r!=null?r:localStorage.getItem('rail');if(rr==='1')document.documentElement.dataset.rail='1';}})();</script>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="csrf" content="{csrf}"><title>CleanUpStorages — {title}</title>
-<style>{style}</style></head><body>
+<style>{STYLE}</style></head><body>
 <aside class="side"><div class="side-head"><div class="brand"><h1>CleanUpStorages</h1><p class="tagline">Storage cleanup</p></div>
 <button class="rail-toggle" id="railToggle" title="Collapse menu" aria-label="Collapse menu"><span class="material-symbols-outlined">chevron_left</span></button></div>
 <nav>{nav}</nav>{themebar}</aside>
 <main>{main_html}</main>
-<script>{shared}</script><script>{page_script}</script>
-</body></html>"##,
-        csrf = csrf,
-        title = title,
-        style = STYLE,
-        nav = nav,
-        themebar = themebar,
-        main_html = main_html,
-        shared = SHARED_JS,
-        page_script = page_script
+<script>{SHARED_JS}</script><script>{page_script}</script>
+</body></html>"##
     )
 }
 
