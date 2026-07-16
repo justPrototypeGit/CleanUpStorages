@@ -15,15 +15,24 @@ fn scan_then_search_finds_file() {
     let data = tmp.path().join("appdata");
     let scan = bin()
         .env("CLEANUPSTORAGES_DATA_DIR", &data)
-        .arg("scan").arg(&drive)
-        .arg("--readonly-fallback").arg("fingerprint")
-        .output().unwrap();
-    assert!(scan.status.success(), "scan failed: {}", String::from_utf8_lossy(&scan.stderr));
+        .arg("scan")
+        .arg(&drive)
+        .arg("--readonly-fallback")
+        .arg("fingerprint")
+        .output()
+        .unwrap();
+    assert!(
+        scan.status.success(),
+        "scan failed: {}",
+        String::from_utf8_lossy(&scan.stderr)
+    );
 
     let search = bin()
         .env("CLEANUPSTORAGES_DATA_DIR", &data)
-        .arg("search").arg("thesis")
-        .output().unwrap();
+        .arg("search")
+        .arg("thesis")
+        .output()
+        .unwrap();
     assert!(search.status.success());
     let out = String::from_utf8_lossy(&search.stdout);
     assert!(out.contains("thesis_final.pdf"), "search output was: {out}");

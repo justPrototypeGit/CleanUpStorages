@@ -1,7 +1,7 @@
 //! The one user-initiated hard delete: empty a drive's `_ToDelete` and mark rows purged.
 
-use std::path::Path;
 use crate::catalog::Catalog;
+use std::path::Path;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct PurgeOutcome {
@@ -16,16 +16,21 @@ pub struct PurgeOutcome {
 /// on disk means the file is already gone (e.g. the user emptied the folder manually), so the
 /// catalog is brought in line with reality rather than left stale.
 pub fn purge_volume(
-    cat: &Catalog, mount_root: &Path, expected_volume_id: &str, now: i64,
+    cat: &Catalog,
+    mount_root: &Path,
+    expected_volume_id: &str,
+    now: i64,
 ) -> anyhow::Result<PurgeOutcome> {
     match crate::volume::read_volume_id(mount_root) {
         Some(vid) if vid == expected_volume_id => {}
         Some(vid) => anyhow::bail!(
             "drive at {} is volume {vid}, not the expected {expected_volume_id}; aborting",
-            mount_root.display()),
+            mount_root.display()
+        ),
         None => anyhow::bail!(
             "no identity marker at {}; refusing to purge an unidentified drive",
-            mount_root.display()),
+            mount_root.display()
+        ),
     }
 
     let bytes_reclaimed = cat.recoverable_bytes(expected_volume_id)?;
@@ -46,13 +51,21 @@ pub fn purge_volume(
         cat.mark_purged(rec.id, now)?;
         files_purged += 1;
     }
-    cat.log_action("purge", &serde_json::json!({
-        "volume_id": expected_volume_id, "files_purged": files_purged,
-        "bytes_reclaimed": bytes_reclaimed,
-    }).to_string(), now)?;
+    cat.log_action(
+        "purge",
+        &serde_json::json!({
+            "volume_id": expected_volume_id, "files_purged": files_purged,
+            "bytes_reclaimed": bytes_reclaimed,
+        })
+        .to_string(),
+        now,
+    )?;
     tx.commit()?;
 
-    Ok(PurgeOutcome { files_purged, bytes_reclaimed })
+    Ok(PurgeOutcome {
+        files_purged,
+        bytes_reclaimed,
+    })
 }
 
 #[derive(Debug, Default)]
@@ -73,10 +86,14 @@ pub fn purge_all(
     let mut out = PurgeAllOutcome::default();
     for (volume_id, _label, _files, _bytes) in cat.volume_stats()? {
         let reclaimable = cat.recoverable_bytes(&volume_id)?;
-        if reclaimable == 0 { continue; }
+        if reclaimable == 0 {
+            continue;
+        }
         match mounts.get(&volume_id) {
             Some(root) => match purge_volume(cat, root, &volume_id, now) {
-                Ok(o) => out.purged.push((volume_id, o.files_purged, o.bytes_reclaimed)),
+                Ok(o) => out
+                    .purged
+                    .push((volume_id, o.files_purged, o.bytes_reclaimed)),
                 Err(e) => out.errors.push(format!("{volume_id}: {e}")),
             },
             None => out.skipped_unmounted.push(volume_id),
@@ -88,7 +105,7 @@ pub fn purge_all(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::models::{Volume, FileStatus};
+    use crate::catalog::models::{FileStatus, Volume};
     use std::fs;
 
     #[test]
@@ -100,22 +117,49 @@ mod tests {
         fs::write(root.join("_ToDelete/Photos/a.jpg"), b"DEADBEEF").unwrap();
 
         let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
-        cat.upsert_volume(&Volume { volume_id: "vol-1".into(), label: "D".into(),
-            identified_by: "marker".into(), first_seen_at: 1, last_seen_at: 1 }).unwrap();
+        cat.upsert_volume(&Volume {
+            volume_id: "vol-1".into(),
+            label: "D".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
         // a quarantined row pointing into _ToDelete
         let f = crate::catalog::models::NewFile {
-            volume_id: "vol-1".into(), relative_path: "_ToDelete/Photos/a.jpg".into(),
-            filename: "a.jpg".into(), extension: "jpg".into(), size_bytes: 8,
-            content_hash: "h".into(), created_time: None, modified_time: None, accessed_time: None,
-            category: crate::category::Category::Photo, container_chain: None };
+            volume_id: "vol-1".into(),
+            relative_path: "_ToDelete/Photos/a.jpg".into(),
+            filename: "a.jpg".into(),
+            extension: "jpg".into(),
+            size_bytes: 8,
+            content_hash: "h".into(),
+            created_time: None,
+            modified_time: None,
+            accessed_time: None,
+            category: crate::category::Category::Photo,
+            container_chain: None,
+        };
         cat.upsert_file(&f, 100).unwrap();
-        let id = cat.loose_file_id("vol-1", "_ToDelete/Photos/a.jpg").unwrap().unwrap();
-        cat.mark_quarantined(id, "_ToDelete/Photos/a.jpg", "Photos/a.jpg", 150).unwrap();
+        let id = cat
+            .loose_file_id("vol-1", "_ToDelete/Photos/a.jpg")
+            .unwrap()
+            .unwrap();
+        cat.mark_quarantined(id, "_ToDelete/Photos/a.jpg", "Photos/a.jpg", 150)
+            .unwrap();
 
         let out = purge_volume(&cat, &root, "vol-1", 200).unwrap();
-        assert_eq!(out, PurgeOutcome { files_purged: 1, bytes_reclaimed: 8 });
+        assert_eq!(
+            out,
+            PurgeOutcome {
+                files_purged: 1,
+                bytes_reclaimed: 8
+            }
+        );
         assert!(!root.join("_ToDelete").exists());
-        assert_eq!(cat.get_file(id).unwrap().unwrap().status, FileStatus::Purged);
+        assert_eq!(
+            cat.get_file(id).unwrap().unwrap().status,
+            FileStatus::Purged
+        );
     }
 
     #[test]
@@ -125,8 +169,14 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join(".cleanupstorages_id"), "vol-1").unwrap();
         let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
-        cat.upsert_volume(&Volume { volume_id: "vol-1".into(), label: "D".into(),
-            identified_by: "marker".into(), first_seen_at: 1, last_seen_at: 1 }).unwrap();
+        cat.upsert_volume(&Volume {
+            volume_id: "vol-1".into(),
+            label: "D".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
         let out = purge_volume(&cat, &root, "vol-1", 200).unwrap();
         assert_eq!(out, PurgeOutcome::default());
     }
@@ -139,8 +189,14 @@ mod tests {
         fs::write(root.join(".cleanupstorages_id"), "vol-1").unwrap();
         fs::write(root.join("_ToDelete/Photos/a.jpg"), b"DATA").unwrap();
         let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
-        cat.upsert_volume(&Volume { volume_id: "vol-1".into(), label: "D".into(),
-            identified_by: "marker".into(), first_seen_at: 1, last_seen_at: 1 }).unwrap();
+        cat.upsert_volume(&Volume {
+            volume_id: "vol-1".into(),
+            label: "D".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
 
         // expected volume id does NOT match the marker -> must bail, delete nothing
         let res = purge_volume(&cat, &root, "vol-DIFFERENT", 200);
@@ -156,8 +212,14 @@ mod tests {
         fs::write(root.join("_ToDelete/x"), b"DATA").unwrap();
         // NO marker file written
         let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
-        cat.upsert_volume(&Volume { volume_id: "vol-1".into(), label: "D".into(),
-            identified_by: "marker".into(), first_seen_at: 1, last_seen_at: 1 }).unwrap();
+        cat.upsert_volume(&Volume {
+            volume_id: "vol-1".into(),
+            label: "D".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
 
         let res = purge_volume(&cat, &root, "vol-1", 200);
         assert!(res.is_err());
@@ -176,16 +238,34 @@ mod tests {
         fs::write(root.join("_ToDelete/Photos/a.jpg"), b"DEADBEEF").unwrap();
 
         let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
-        cat.upsert_volume(&Volume { volume_id: "vol-1".into(), label: "D".into(),
-            identified_by: "marker".into(), first_seen_at: 1, last_seen_at: 1 }).unwrap();
+        cat.upsert_volume(&Volume {
+            volume_id: "vol-1".into(),
+            label: "D".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
         let f = crate::catalog::models::NewFile {
-            volume_id: "vol-1".into(), relative_path: "_ToDelete/Photos/a.jpg".into(),
-            filename: "a.jpg".into(), extension: "jpg".into(), size_bytes: 8,
-            content_hash: "h".into(), created_time: None, modified_time: None, accessed_time: None,
-            category: crate::category::Category::Photo, container_chain: None };
+            volume_id: "vol-1".into(),
+            relative_path: "_ToDelete/Photos/a.jpg".into(),
+            filename: "a.jpg".into(),
+            extension: "jpg".into(),
+            size_bytes: 8,
+            content_hash: "h".into(),
+            created_time: None,
+            modified_time: None,
+            accessed_time: None,
+            category: crate::category::Category::Photo,
+            container_chain: None,
+        };
         cat.upsert_file(&f, 100).unwrap();
-        let id = cat.loose_file_id("vol-1", "_ToDelete/Photos/a.jpg").unwrap().unwrap();
-        cat.mark_quarantined(id, "_ToDelete/Photos/a.jpg", "Photos/a.jpg", 150).unwrap();
+        let id = cat
+            .loose_file_id("vol-1", "_ToDelete/Photos/a.jpg")
+            .unwrap()
+            .unwrap();
+        cat.mark_quarantined(id, "_ToDelete/Photos/a.jpg", "Photos/a.jpg", 150)
+            .unwrap();
 
         let vid = "vol-1".to_string();
         (tmp, root, vid, cat)
@@ -216,16 +296,34 @@ mod tests {
         fs::create_dir_all(root2.join("_ToDelete")).unwrap();
         fs::write(root2.join(".cleanupstorages_id"), "vol-2").unwrap();
         fs::write(root2.join("_ToDelete/b.jpg"), b"DATA").unwrap();
-        cat.upsert_volume(&Volume { volume_id: "vol-2".into(), label: "E".into(),
-            identified_by: "marker".into(), first_seen_at: 1, last_seen_at: 1 }).unwrap();
+        cat.upsert_volume(&Volume {
+            volume_id: "vol-2".into(),
+            label: "E".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
         let f2 = crate::catalog::models::NewFile {
-            volume_id: "vol-2".into(), relative_path: "_ToDelete/b.jpg".into(),
-            filename: "b.jpg".into(), extension: "jpg".into(), size_bytes: 4,
-            content_hash: "h2".into(), created_time: None, modified_time: None, accessed_time: None,
-            category: crate::category::Category::Photo, container_chain: None };
+            volume_id: "vol-2".into(),
+            relative_path: "_ToDelete/b.jpg".into(),
+            filename: "b.jpg".into(),
+            extension: "jpg".into(),
+            size_bytes: 4,
+            content_hash: "h2".into(),
+            created_time: None,
+            modified_time: None,
+            accessed_time: None,
+            category: crate::category::Category::Photo,
+            container_chain: None,
+        };
         cat.upsert_file(&f2, 100).unwrap();
-        let id2 = cat.loose_file_id("vol-2", "_ToDelete/b.jpg").unwrap().unwrap();
-        cat.mark_quarantined(id2, "_ToDelete/b.jpg", "b.jpg", 150).unwrap();
+        let id2 = cat
+            .loose_file_id("vol-2", "_ToDelete/b.jpg")
+            .unwrap()
+            .unwrap();
+        cat.mark_quarantined(id2, "_ToDelete/b.jpg", "b.jpg", 150)
+            .unwrap();
 
         // Only vol-1 is mounted; vol-2 is not.
         let mut mounts = std::collections::HashMap::new();
@@ -248,20 +346,41 @@ mod tests {
         fs::write(root.join(".cleanupstorages_id"), "vol-1").unwrap();
         // NO _ToDelete directory on disk, but a quarantined row exists in the catalog
         let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
-        cat.upsert_volume(&Volume { volume_id: "vol-1".into(), label: "D".into(),
-            identified_by: "marker".into(), first_seen_at: 1, last_seen_at: 1 }).unwrap();
+        cat.upsert_volume(&Volume {
+            volume_id: "vol-1".into(),
+            label: "D".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
         let f = crate::catalog::models::NewFile {
-            volume_id: "vol-1".into(), relative_path: "_ToDelete/gone.jpg".into(),
-            filename: "gone.jpg".into(), extension: "jpg".into(), size_bytes: 4,
-            content_hash: "h".into(), created_time: None, modified_time: None, accessed_time: None,
-            category: crate::category::Category::Photo, container_chain: None };
+            volume_id: "vol-1".into(),
+            relative_path: "_ToDelete/gone.jpg".into(),
+            filename: "gone.jpg".into(),
+            extension: "jpg".into(),
+            size_bytes: 4,
+            content_hash: "h".into(),
+            created_time: None,
+            modified_time: None,
+            accessed_time: None,
+            category: crate::category::Category::Photo,
+            container_chain: None,
+        };
         cat.upsert_file(&f, 100).unwrap();
-        let id = cat.loose_file_id("vol-1", "_ToDelete/gone.jpg").unwrap().unwrap();
-        cat.mark_quarantined(id, "_ToDelete/gone.jpg", "gone.jpg", 150).unwrap();
+        let id = cat
+            .loose_file_id("vol-1", "_ToDelete/gone.jpg")
+            .unwrap()
+            .unwrap();
+        cat.mark_quarantined(id, "_ToDelete/gone.jpg", "gone.jpg", 150)
+            .unwrap();
 
         // _ToDelete absent -> delete is a no-op, but the quarantined row reconciles to purged
         let out = purge_volume(&cat, &root, "vol-1", 200).unwrap();
         assert_eq!(out.files_purged, 1);
-        assert_eq!(cat.get_file(id).unwrap().unwrap().status, FileStatus::Purged);
+        assert_eq!(
+            cat.get_file(id).unwrap().unwrap().status,
+            FileStatus::Purged
+        );
     }
 }

@@ -1,7 +1,12 @@
 pub use crate::category::Category;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileStatus { Active, Missing, Quarantined, Purged }
+pub enum FileStatus {
+    Active,
+    Missing,
+    Quarantined,
+    Purged,
+}
 
 impl FileStatus {
     pub fn as_str(&self) -> &'static str {
@@ -88,7 +93,12 @@ mod tests {
 
     #[test]
     fn status_roundtrip() {
-        for s in [FileStatus::Active, FileStatus::Missing, FileStatus::Quarantined, FileStatus::Purged] {
+        for s in [
+            FileStatus::Active,
+            FileStatus::Missing,
+            FileStatus::Quarantined,
+            FileStatus::Purged,
+        ] {
             assert_eq!(FileStatus::from_db(s.as_str()), s);
         }
         // unknown falls back to Active defensively but is logged elsewhere

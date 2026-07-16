@@ -5,8 +5,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::catalog::Catalog;
 use crate::catalog::models::FileStatus;
+use crate::catalog::Catalog;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct RepackOutcome {
@@ -38,7 +38,11 @@ pub fn available_space(path: &Path) -> Option<u64> {
 /// original archive completely untouched; only after `verify_rebuilt` passes (step 7) does the
 /// function extract a recovery copy, swap the files, and update the catalog.
 pub fn repack_entry(
-    cat: &Catalog, mount_root: &Path, expected_volume_id: &str, entry_id: i64, now: i64,
+    cat: &Catalog,
+    mount_root: &Path,
+    expected_volume_id: &str,
+    entry_id: i64,
+    now: i64,
 ) -> anyhow::Result<RepackOutcome> {
     let entry = load_repackable_entry(cat, expected_volume_id, entry_id)?;
     let chain = entry.container_chain.clone().expect("validated above");
@@ -76,18 +80,32 @@ pub fn repack_entry(
     // 6+7. Build the rebuilt archive in a temp file and verify it before anything else happens.
     // Any error here — including a mid-copy IO failure in `rebuild_without` itself, not just a
     // verify mismatch — must leave the original archive untouched and the temp file cleaned up.
-    let tmp = rebuild_dir(mount_root).join(format!("{}.rebuilding.tmp", archive_filename(&archive_rel)));
-    if let Err(e) = rebuild_and_verify(cat, expected_volume_id, &archive_rel, &archive_path, &tmp, &chain) {
+    let tmp =
+        rebuild_dir(mount_root).join(format!("{}.rebuilding.tmp", archive_filename(&archive_rel)));
+    if let Err(e) = rebuild_and_verify(
+        cat,
+        expected_volume_id,
+        &archive_rel,
+        &archive_path,
+        &tmp,
+        &chain,
+    ) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    let retained = cat.archive_entries(expected_volume_id, &archive_rel)?
+    let retained = cat
+        .archive_entries(expected_volume_id, &archive_rel)?
         .into_iter()
         .filter(|e| e.container_chain.as_deref() != Some(chain.as_str()))
         .count();
 
     // 8. Extract the removed entry into _ToDelete (safety net 1) before the swap.
-    let extract_rel = crate::quarantine::quarantine_dest(cat, mount_root, expected_volume_id, &format!("{archive_rel}/{chain}"))?;
+    let extract_rel = crate::quarantine::quarantine_dest(
+        cat,
+        mount_root,
+        expected_volume_id,
+        &format!("{archive_rel}/{chain}"),
+    )?;
     let extract_path = mount_root.join(&extract_rel);
     if let Some(p) = extract_path.parent() {
         std::fs::create_dir_all(p)?;
@@ -95,7 +113,12 @@ pub fn repack_entry(
     std::fs::write(&extract_path, extract_entry(&archive_path, &chain)?)?;
 
     // 9. Swap: original -> _ToDelete/<name>.original.zip (safety net 2); temp -> archive path.
-    let original_rel = crate::quarantine::quarantine_dest(cat, mount_root, expected_volume_id, &format!("{archive_rel}.original.zip"))?;
+    let original_rel = crate::quarantine::quarantine_dest(
+        cat,
+        mount_root,
+        expected_volume_id,
+        &format!("{archive_rel}.original.zip"),
+    )?;
     let original_dest = mount_root.join(&original_rel);
     if let Some(p) = original_dest.parent() {
         std::fs::create_dir_all(p)?;
@@ -104,7 +127,9 @@ pub fn repack_entry(
     if let Err(e) = std::fs::rename(&archive_path, &original_dest) {
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(&extract_path); // the net-1 copy extracted in step 8
-        anyhow::bail!("repack aborted: could not move the original archive aside ({e}); nothing changed");
+        anyhow::bail!(
+            "repack aborted: could not move the original archive aside ({e}); nothing changed"
+        );
     }
     // Move the verified rebuild into place. If this fails, ROLL BACK: restore the original so the
     // archive path is never left empty, and remove the temp + the extracted copy.
@@ -112,7 +137,9 @@ pub fn repack_entry(
         let _ = std::fs::rename(&original_dest, &archive_path); // put the original back
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(&extract_path);
-        anyhow::bail!("repack aborted: swap failed ({e}); the original archive was restored, nothing changed");
+        anyhow::bail!(
+            "repack aborted: swap failed ({e}); the original archive was restored, nothing changed"
+        );
     }
 
     // 10. Catalog + audit.
@@ -142,22 +169,33 @@ pub fn repack_entry(
         now,
     )?;
 
-    Ok(RepackOutcome { removed_entry: chain, retained_entries: retained })
+    Ok(RepackOutcome {
+        removed_entry: chain,
+        retained_entries: retained,
+    })
 }
 
 /// Step 1: load + validate the entry is a top-level (non-nested) active archive entry on the
 /// expected volume. Bails with a specific "nested not supported" message for nested chains.
 fn load_repackable_entry(
-    cat: &Catalog, expected_volume_id: &str, entry_id: i64,
+    cat: &Catalog,
+    expected_volume_id: &str,
+    entry_id: i64,
 ) -> anyhow::Result<crate::catalog::models::FileRecord> {
-    let entry = cat.get_file(entry_id)?.ok_or_else(|| anyhow::anyhow!("no such file id {entry_id}"))?;
+    let entry = cat
+        .get_file(entry_id)?
+        .ok_or_else(|| anyhow::anyhow!("no such file id {entry_id}"))?;
     if entry.volume_id != expected_volume_id || entry.status != FileStatus::Active {
         anyhow::bail!("entry {entry_id} is not an active file on volume {expected_volume_id}");
     }
-    let chain = entry.container_chain.as_deref()
+    let chain = entry
+        .container_chain
+        .as_deref()
         .ok_or_else(|| anyhow::anyhow!("file {entry_id} is not an archive entry"))?;
     if chain.contains(" › ") {
-        anyhow::bail!("entry is inside a nested archive; nested repack is not supported — remove it manually");
+        anyhow::bail!(
+            "entry is inside a nested archive; nested repack is not supported — remove it manually"
+        );
     }
     Ok(entry)
 }
@@ -165,13 +203,19 @@ fn load_repackable_entry(
 /// Step 3: a survivor counts if it's a different catalog row AND (on a different volume, or its
 /// relative_path still exists on this mount) — mirrors the disk-aware guard from Phase 2a.
 fn require_surviving_copy(
-    cat: &Catalog, mount_root: &Path, expected_volume_id: &str, entry: &crate::catalog::models::FileRecord,
+    cat: &Catalog,
+    mount_root: &Path,
+    expected_volume_id: &str,
+    entry: &crate::catalog::models::FileRecord,
 ) -> anyhow::Result<()> {
     let survivor_ok = cat.active_copies(&entry.content_hash)?.iter().any(|s| {
-        s.id != entry.id && (s.volume_id != expected_volume_id || mount_root.join(&s.relative_path).exists())
+        s.id != entry.id
+            && (s.volume_id != expected_volume_id || mount_root.join(&s.relative_path).exists())
     });
     if !survivor_ok {
-        anyhow::bail!("no surviving copy verified — refusing to remove the last copy of this content");
+        anyhow::bail!(
+            "no surviving copy verified — refusing to remove the last copy of this content"
+        );
     }
     Ok(())
 }
@@ -179,10 +223,16 @@ fn require_surviving_copy(
 /// Steps 6-7: rebuild into `tmp` and verify every retained catalogued entry matches by hash and
 /// that the removed entry is gone. Does not touch `archive_path`; the caller deletes `tmp` on error.
 fn rebuild_and_verify(
-    cat: &Catalog, expected_volume_id: &str, archive_rel: &str, archive_path: &Path, tmp: &Path, chain: &str,
+    cat: &Catalog,
+    expected_volume_id: &str,
+    archive_rel: &str,
+    archive_path: &Path,
+    tmp: &Path,
+    chain: &str,
 ) -> anyhow::Result<()> {
     rebuild_without(archive_path, tmp, chain)?;
-    let expected: HashMap<String, String> = cat.archive_entries(expected_volume_id, archive_rel)?
+    let expected: HashMap<String, String> = cat
+        .archive_entries(expected_volume_id, archive_rel)?
         .into_iter()
         .filter(|e| e.container_chain.as_deref() != Some(chain))
         .filter_map(|e| e.container_chain.map(|c| (c, e.content_hash)))
@@ -192,7 +242,9 @@ fn rebuild_and_verify(
 
 /// `mount_root/_ToDelete/.rebuild`, created if absent.
 fn rebuild_dir(mount_root: &Path) -> std::path::PathBuf {
-    let dir = mount_root.join(crate::volume::QUARANTINE_DIR).join(REBUILD_DIR);
+    let dir = mount_root
+        .join(crate::volume::QUARANTINE_DIR)
+        .join(REBUILD_DIR);
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
@@ -215,7 +267,11 @@ pub fn extract_entry(archive_path: &Path, entry_name: &str) -> anyhow::Result<Ve
 }
 
 /// Build `dest_tmp` = every entry of `src_archive` except `exclude_entry`, raw-copied (no recompress).
-pub fn rebuild_without(src_archive: &Path, dest_tmp: &Path, exclude_entry: &str) -> anyhow::Result<()> {
+pub fn rebuild_without(
+    src_archive: &Path,
+    dest_tmp: &Path,
+    exclude_entry: &str,
+) -> anyhow::Result<()> {
     let src_file = std::fs::File::open(src_archive)?;
     let mut src = zip::ZipArchive::new(src_file)?;
     if let Some(parent) = dest_tmp.parent() {
@@ -236,7 +292,10 @@ pub fn rebuild_without(src_archive: &Path, dest_tmp: &Path, exclude_entry: &str)
     writer.finish()?;
     if !found {
         let _ = std::fs::remove_file(dest_tmp);
-        anyhow::bail!("entry '{exclude_entry}' not found in {}", src_archive.display());
+        anyhow::bail!(
+            "entry '{exclude_entry}' not found in {}",
+            src_archive.display()
+        );
     }
     Ok(())
 }
@@ -294,7 +353,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("a.zip");
         let out = tmp.path().join("a.tmp");
-        make_zip(&src, &[("keep.txt", b"KEEP"), ("drop.jpg", b"DROP"), ("also/keep2.txt", b"K2")]);
+        make_zip(
+            &src,
+            &[
+                ("keep.txt", b"KEEP"),
+                ("drop.jpg", b"DROP"),
+                ("also/keep2.txt", b"K2"),
+            ],
+        );
         rebuild_without(&src, &out, "drop.jpg").unwrap();
         assert!(extract_entry(&out, "keep.txt").is_ok());
         assert!(extract_entry(&out, "also/keep2.txt").is_ok());
@@ -329,8 +395,8 @@ mod tests {
         assert!(rebuild_without(&src, &out, "not-there.jpg").is_err());
     }
 
+    use crate::catalog::models::{FileStatus, Volume};
     use crate::catalog::Catalog;
-    use crate::catalog::models::{Volume, FileStatus};
 
     fn fake_drive_with_archive() -> (tempfile::TempDir, Catalog, std::path::PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
@@ -338,14 +404,26 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join(".cleanupstorages_id"), "vol-1").unwrap();
         // archive with two entries; "dup.txt" also exists as a loose file (the surviving copy)
-        make_zip(&root.join("bundle.zip"), &[("keep.txt", b"KEEPDATA"), ("dup.txt", b"SHARED")]);
+        make_zip(
+            &root.join("bundle.zip"),
+            &[("keep.txt", b"KEEPDATA"), ("dup.txt", b"SHARED")],
+        );
         std::fs::write(root.join("loose_dup.txt"), b"SHARED").unwrap();
 
         let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
-        cat.upsert_volume(&Volume { volume_id: "vol-1".into(), label: "D".into(),
-            identified_by: "marker".into(), first_seen_at: 1, last_seen_at: 1 }).unwrap();
-        let ident = crate::volume::VolumeIdentity { volume_id: "vol-1".into(), label: "D".into(),
-            identified_by: "marker".into() };
+        cat.upsert_volume(&Volume {
+            volume_id: "vol-1".into(),
+            label: "D".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
+        let ident = crate::volume::VolumeIdentity {
+            volume_id: "vol-1".into(),
+            label: "D".into(),
+            identified_by: "marker".into(),
+        };
         crate::scanner::scan_volume(&cat, &root, &ident, false, 100).unwrap();
         (tmp, cat, root)
     }
@@ -354,8 +432,12 @@ mod tests {
     fn repack_removes_entry_keeps_rest_and_preserves_recovery() {
         let (tmp, cat, root) = fake_drive_with_archive();
         // id of the archived entry bundle.zip › dup.txt
-        let entry = cat.archive_entries("vol-1", "bundle.zip").unwrap()
-            .into_iter().find(|e| e.container_chain.as_deref() == Some("dup.txt")).unwrap();
+        let entry = cat
+            .archive_entries("vol-1", "bundle.zip")
+            .unwrap()
+            .into_iter()
+            .find(|e| e.container_chain.as_deref() == Some("dup.txt"))
+            .unwrap();
 
         let out = repack_entry(&cat, &root, "vol-1", entry.id, 200).unwrap();
         assert_eq!(out.removed_entry, "dup.txt");
@@ -378,8 +460,12 @@ mod tests {
         let (tmp, cat, root) = fake_drive_with_archive();
         // delete the loose survivor off disk so dup.txt inside the zip is the last copy
         std::fs::remove_file(root.join("loose_dup.txt")).unwrap();
-        let entry = cat.archive_entries("vol-1", "bundle.zip").unwrap()
-            .into_iter().find(|e| e.container_chain.as_deref() == Some("dup.txt")).unwrap();
+        let entry = cat
+            .archive_entries("vol-1", "bundle.zip")
+            .unwrap()
+            .into_iter()
+            .find(|e| e.container_chain.as_deref() == Some("dup.txt"))
+            .unwrap();
         let res = repack_entry(&cat, &root, "vol-1", entry.id, 200);
         assert!(res.is_err());
         // the archive is untouched — dup.txt still inside
@@ -391,12 +477,25 @@ mod tests {
     fn repack_refuses_nested_entry() {
         let (tmp, cat, root) = fake_drive_with_archive();
         // fabricate a nested-chain entry row (container_chain with ' › ')
-        cat.upsert_archive_entry("vol-1", "bundle.zip",
-            &crate::archive::ArchiveEntry { container_chain: "inner.zip › deep.txt".into(),
-                filename: "deep.txt".into(), extension: "txt".into(), size_bytes: 3,
-                content_hash: "SHARED_H".into() }, 100).unwrap();
-        let entry = cat.archive_entries("vol-1", "bundle.zip").unwrap()
-            .into_iter().find(|e| e.container_chain.as_deref() == Some("inner.zip › deep.txt")).unwrap();
+        cat.upsert_archive_entry(
+            "vol-1",
+            "bundle.zip",
+            &crate::archive::ArchiveEntry {
+                container_chain: "inner.zip › deep.txt".into(),
+                filename: "deep.txt".into(),
+                extension: "txt".into(),
+                size_bytes: 3,
+                content_hash: "SHARED_H".into(),
+            },
+            100,
+        )
+        .unwrap();
+        let entry = cat
+            .archive_entries("vol-1", "bundle.zip")
+            .unwrap()
+            .into_iter()
+            .find(|e| e.container_chain.as_deref() == Some("inner.zip › deep.txt"))
+            .unwrap();
         let res = repack_entry(&cat, &root, "vol-1", entry.id, 200);
         assert!(res.is_err()); // nested not supported
         let _ = tmp;

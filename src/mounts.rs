@@ -21,8 +21,9 @@ impl MountResolver {
     /// Snapshot the current volume_id → mount map once.
     pub fn snapshot(&self) -> HashMap<String, PathBuf> {
         match self {
-            MountResolver::Live { catalog_path } =>
-                resolve_live(live_mounts(), &remembered_paths(catalog_path)),
+            MountResolver::Live { catalog_path } => {
+                resolve_live(live_mounts(), &remembered_paths(catalog_path))
+            }
             MountResolver::Fixed(m) => m.clone(),
         }
     }
@@ -31,12 +32,15 @@ impl MountResolver {
 /// Merge the disk-root marker scan with remembered volume paths: a remembered path is included only
 /// when its marker still equals the volume_id (so a moved/renamed folder is correctly absent), and
 /// never overrides a disk-root hit for the same volume.
-pub fn resolve_live(disk_roots: HashMap<String, PathBuf>, remembered: &[(String, PathBuf)])
-    -> HashMap<String, PathBuf>
-{
+pub fn resolve_live(
+    disk_roots: HashMap<String, PathBuf>,
+    remembered: &[(String, PathBuf)],
+) -> HashMap<String, PathBuf> {
     let mut map = disk_roots;
     for (vid, path) in remembered {
-        if map.contains_key(vid) { continue; }
+        if map.contains_key(vid) {
+            continue;
+        }
         if crate::volume::read_volume_id(path).as_deref() == Some(vid.as_str()) {
             map.insert(vid.clone(), path.clone());
         }
@@ -47,8 +51,12 @@ pub fn resolve_live(disk_roots: HashMap<String, PathBuf>, remembered: &[(String,
 /// The catalog's remembered (volume_id, last_scanned_path) pairs; empty if the catalog can't be read.
 fn remembered_paths(catalog_path: &std::path::Path) -> Vec<(String, PathBuf)> {
     match crate::catalog::Catalog::open_readonly(catalog_path) {
-        Ok(cat) => cat.volume_paths().unwrap_or_default().into_iter()
-            .map(|(id, p)| (id, PathBuf::from(p))).collect(),
+        Ok(cat) => cat
+            .volume_paths()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(id, p)| (id, PathBuf::from(p)))
+            .collect(),
         Err(_) => Vec::new(),
     }
 }
@@ -99,7 +107,9 @@ mod tests {
         let a = tmp.path().join("driveA");
         let b = tmp.path().join("driveB");
         let c = tmp.path().join("driveC_nomark");
-        for d in [&a, &b, &c] { std::fs::create_dir_all(d).unwrap(); }
+        for d in [&a, &b, &c] {
+            std::fs::create_dir_all(d).unwrap();
+        }
         std::fs::write(a.join(".cleanupstorages_id"), "vol-A").unwrap();
         std::fs::write(b.join(".cleanupstorages_id"), "vol-B").unwrap();
         // c has no marker
@@ -122,8 +132,8 @@ mod tests {
         std::fs::write(folder.join(".cleanupstorages_id"), "vol-A").unwrap();
         let gone = tmp.path().join("Gone"); // never created / no marker
         let remembered = vec![
-            ("vol-A".to_string(), folder.clone()),   // marker present + matches -> included
-            ("vol-gone".to_string(), gone),          // no marker -> excluded
+            ("vol-A".to_string(), folder.clone()), // marker present + matches -> included
+            ("vol-gone".to_string(), gone),        // no marker -> excluded
         ];
         let map = resolve_live(HashMap::new(), &remembered);
         assert_eq!(map.get("vol-A"), Some(&folder));

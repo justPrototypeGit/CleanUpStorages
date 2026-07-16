@@ -2,8 +2,8 @@ use std::path::Path;
 use walkdir::WalkDir;
 
 use crate::archive::{self, ArchiveLimits};
-use crate::catalog::Catalog;
 use crate::catalog::models::{NewFile, Volume};
+use crate::catalog::Catalog;
 use crate::category::Category;
 use crate::config::Config;
 use crate::hashing;
@@ -39,7 +39,9 @@ fn unix_secs(t: std::io::Result<std::time::SystemTime>) -> Option<i64> {
 /// True if `path` is the identity marker file or lives under a `_ToDelete` quarantine dir.
 fn should_skip(path: &Path, file_name: &std::ffi::OsStr) -> bool {
     file_name == crate::volume::MARKER
-        || path.components().any(|c| c.as_os_str() == crate::volume::QUARANTINE_DIR)
+        || path
+            .components()
+            .any(|c| c.as_os_str() == crate::volume::QUARANTINE_DIR)
 }
 
 /// Path of `path` relative to `root`, normalized to forward slashes; `None` if not under `root`.
@@ -66,7 +68,11 @@ fn rotate_batch(cat: &Catalog, in_batch: &mut usize) -> anyhow::Result<()> {
 /// file touched this scan gets `last_seen_at == now`, `mark_missing_scanned` (which flags rows
 /// with `last_seen_at < scan_started_at`) only ever catches files genuinely absent this pass.
 pub fn scan_volume_with_progress(
-    cat: &Catalog, root: &Path, identity: &VolumeIdentity, force: bool, now: i64,
+    cat: &Catalog,
+    root: &Path,
+    identity: &VolumeIdentity,
+    force: bool,
+    now: i64,
     progress: Option<&dyn Progress>,
 ) -> anyhow::Result<ScanSummary> {
     let scan_started_at = now;
@@ -81,11 +87,18 @@ pub fn scan_volume_with_progress(
             Err(err) => {
                 let p = err
                     .path()
-                    .map(|p| p.strip_prefix(root).unwrap_or(p).to_string_lossy().replace('\\', "/"))
+                    .map(|p| {
+                        p.strip_prefix(root)
+                            .unwrap_or(p)
+                            .to_string_lossy()
+                            .replace('\\', "/")
+                    })
                     .unwrap_or_else(|| "<unknown>".to_string());
                 cat.log_scan_error(Some(&identity.volume_id), &p, &format!("walk: {err}"), now)?;
                 summary.errors += 1;
-                if let Some(p) = progress { p.on_error(); }
+                if let Some(p) = progress {
+                    p.on_error();
+                }
                 continue;
             }
         };
@@ -97,14 +110,23 @@ pub fn scan_volume_with_progress(
         if should_skip(path, name) {
             continue;
         }
-        let Some(rel) = relative_path(path, root) else { continue };
+        let Some(rel) = relative_path(path, root) else {
+            continue;
+        };
 
         let meta = match entry.metadata() {
             Ok(m) => m,
             Err(e) => {
-                cat.log_scan_error(Some(&identity.volume_id), &rel, &format!("metadata: {e}"), now)?;
+                cat.log_scan_error(
+                    Some(&identity.volume_id),
+                    &rel,
+                    &format!("metadata: {e}"),
+                    now,
+                )?;
                 summary.errors += 1;
-                if let Some(p) = progress { p.on_error(); }
+                if let Some(p) = progress {
+                    p.on_error();
+                }
                 let _ = cat.touch_seen(&identity.volume_id, &rel, now);
                 continue;
             }
@@ -121,7 +143,9 @@ pub fn scan_volume_with_progress(
                         cat.touch_archive_entries(&identity.volume_id, &rel, now)?;
                     }
                     summary.skipped += 1;
-                    if let Some(p) = progress { p.on_skipped(); }
+                    if let Some(p) = progress {
+                        p.on_skipped();
+                    }
                     in_batch += 1;
                     rotate_batch(cat, &mut in_batch)?;
                     continue;
@@ -134,13 +158,18 @@ pub fn scan_volume_with_progress(
             Err(e) => {
                 cat.log_scan_error(Some(&identity.volume_id), &rel, &format!("read: {e}"), now)?;
                 summary.errors += 1;
-                if let Some(p) = progress { p.on_error(); }
+                if let Some(p) = progress {
+                    p.on_error();
+                }
                 let _ = cat.touch_seen(&identity.volume_id, &rel, now);
                 continue;
             }
         };
 
-        let ext = path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
+        let ext = path
+            .extension()
+            .map(|e| e.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let nf = NewFile {
             volume_id: identity.volume_id.clone(),
             relative_path: rel.clone(),
@@ -156,12 +185,24 @@ pub fn scan_volume_with_progress(
         };
         cat.upsert_file(&nf, now)?;
         summary.hashed += 1;
-        if let Some(p) = progress { p.on_hashed(); }
+        if let Some(p) = progress {
+            p.on_hashed();
+        }
         in_batch += 1;
         rotate_batch(cat, &mut in_batch)?;
 
         if archive::is_archive_name(&rel) {
-            descend_archive(cat, path, &rel, identity, &limits, now, &mut summary, &mut in_batch, progress)?;
+            descend_archive(
+                cat,
+                path,
+                &rel,
+                identity,
+                &limits,
+                now,
+                &mut summary,
+                &mut in_batch,
+                progress,
+            )?;
         }
     }
 
@@ -171,9 +212,13 @@ pub fn scan_volume_with_progress(
 }
 
 /// Scan without progress reporting (CLI and tests). Delegates with `None`.
-pub fn scan_volume(cat: &Catalog, root: &Path, identity: &VolumeIdentity, force: bool, now: i64)
-    -> anyhow::Result<ScanSummary>
-{
+pub fn scan_volume(
+    cat: &Catalog,
+    root: &Path,
+    identity: &VolumeIdentity,
+    force: bool,
+    now: i64,
+) -> anyhow::Result<ScanSummary> {
     scan_volume_with_progress(cat, root, identity, force, now, None)
 }
 
@@ -182,8 +227,12 @@ pub fn scan_volume(cat: &Catalog, root: &Path, identity: &VolumeIdentity, force:
 /// The single shared definition of "how a scan works" — used by both the CLI's `cmd_scan` and
 /// the web worker, so the two callers can never drift apart on volume-identity/upsert semantics.
 pub fn run_scan(
-    cat: &Catalog, mount_root: &Path, force: bool, fallback: crate::volume::ReadonlyMode,
-    now: i64, progress: Option<&dyn Progress>,
+    cat: &Catalog,
+    mount_root: &Path,
+    force: bool,
+    fallback: crate::volume::ReadonlyMode,
+    now: i64,
+    progress: Option<&dyn Progress>,
 ) -> anyhow::Result<Option<(VolumeIdentity, ScanSummary)>> {
     let identity = match crate::volume::resolve(mount_root, fallback)? {
         Some(id) => id,
@@ -195,33 +244,52 @@ pub fn run_scan(
         volume_id: identity.volume_id.clone(),
         label: identity.label.clone(),
         identified_by: identity.identified_by.clone(),
-        first_seen_at: now, last_seen_at: now,
+        first_seen_at: now,
+        last_seen_at: now,
     })?;
     // Remember where this volume was scanned so a folder-drive (not a disk root) can be recognized
     // as connected later. Best-effort: a bookkeeping failure must not fail the scan.
     let _ = cat.set_volume_path(&identity.volume_id, &mount_root.display().to_string(), now);
     let summary = scan_volume_with_progress(cat, mount_root, &identity, force, now, progress)?;
     // Audit trail: one row per completed scan so the Overview "recent activity" feed can show it.
-    let _ = cat.log_action("scan", &serde_json::json!({
-        "volume_id": identity.volume_id, "label": identity.label,
-        "hashed": summary.hashed, "skipped": summary.skipped, "errors": summary.errors,
-        "marked_missing": summary.marked_missing, "archive_entries": summary.archive_entries,
-    }).to_string(), now);
+    let _ = cat.log_action(
+        "scan",
+        &serde_json::json!({
+            "volume_id": identity.volume_id, "label": identity.label,
+            "hashed": summary.hashed, "skipped": summary.skipped, "errors": summary.errors,
+            "marked_missing": summary.marked_missing, "archive_entries": summary.archive_entries,
+        })
+        .to_string(),
+        now,
+    );
     Ok(Some((identity, summary)))
 }
 
 /// Open an on-disk archive file, catalog each entry, and log each non-fatal error.
 fn descend_archive(
-    cat: &Catalog, path: &Path, rel: &str, identity: &VolumeIdentity,
-    limits: &ArchiveLimits, now: i64, summary: &mut ScanSummary, in_batch: &mut usize,
+    cat: &Catalog,
+    path: &Path,
+    rel: &str,
+    identity: &VolumeIdentity,
+    limits: &ArchiveLimits,
+    now: i64,
+    summary: &mut ScanSummary,
+    in_batch: &mut usize,
     progress: Option<&dyn Progress>,
 ) -> anyhow::Result<()> {
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(e) => {
-            cat.log_scan_error(Some(&identity.volume_id), rel, &format!("archive open: {e}"), now)?;
+            cat.log_scan_error(
+                Some(&identity.volume_id),
+                rel,
+                &format!("archive open: {e}"),
+                now,
+            )?;
             summary.errors += 1;
-            if let Some(p) = progress { p.on_error(); }
+            if let Some(p) = progress {
+                p.on_error();
+            }
             return Ok(());
         }
     };
@@ -229,15 +297,23 @@ fn descend_archive(
     for entry in &res.entries {
         cat.upsert_archive_entry(&identity.volume_id, rel, entry, now)?;
         summary.archive_entries += 1;
-        if let Some(p) = progress { p.on_archive_entry(); }
+        if let Some(p) = progress {
+            p.on_archive_entry();
+        }
         *in_batch += 1;
         rotate_batch(cat, in_batch)?;
     }
     for (ctx, reason) in &res.errors {
-        let where_ = if ctx.is_empty() { rel.to_string() } else { format!("{rel} › {ctx}") };
+        let where_ = if ctx.is_empty() {
+            rel.to_string()
+        } else {
+            format!("{rel} › {ctx}")
+        };
         cat.log_scan_error(Some(&identity.volume_id), &where_, reason, now)?;
         summary.errors += 1;
-        if let Some(p) = progress { p.on_error(); }
+        if let Some(p) = progress {
+            p.on_error();
+        }
     }
     Ok(())
 }
@@ -245,22 +321,30 @@ fn descend_archive(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::Catalog;
     use crate::catalog::models::Volume;
+    use crate::catalog::Catalog;
     use crate::volume::VolumeIdentity;
     use std::fs;
 
     fn ident() -> VolumeIdentity {
-        VolumeIdentity { volume_id: "vol-1".into(), label: "T".into(), identified_by: "marker".into() }
+        VolumeIdentity {
+            volume_id: "vol-1".into(),
+            label: "T".into(),
+            identified_by: "marker".into(),
+        }
     }
 
     fn setup() -> (tempfile::TempDir, Catalog) {
         let tmp = tempfile::tempdir().unwrap();
         let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
         cat.upsert_volume(&Volume {
-            volume_id: "vol-1".into(), label: "T".into(), identified_by: "marker".into(),
-            first_seen_at: 1, last_seen_at: 1,
-        }).unwrap();
+            volume_id: "vol-1".into(),
+            label: "T".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
         (tmp, cat)
     }
 
@@ -297,8 +381,18 @@ mod tests {
         fs::remove_file(root.join("gone.txt")).unwrap();
         let s = scan_volume(&cat, &root, &ident(), false, 200).unwrap();
         assert_eq!(s.marked_missing, 1);
-        assert_eq!(cat.search("gone", None, None, Some("missing")).unwrap().len(), 1);
-        assert_eq!(cat.search("keep", None, None, Some("active")).unwrap().len(), 1);
+        assert_eq!(
+            cat.search("gone", None, None, Some("missing"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            cat.search("keep", None, None, Some("active"))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     use std::io::Write as _;
@@ -320,7 +414,10 @@ mod tests {
         let (tmp, cat) = setup();
         let root = tmp.path().join("drive");
         fs::create_dir_all(&root).unwrap();
-        write_zip_file(&root.join("photos.zip"), &[("trip/beach.jpg", b"sand"), ("note.txt", b"hi")]);
+        write_zip_file(
+            &root.join("photos.zip"),
+            &[("trip/beach.jpg", b"sand"), ("note.txt", b"hi")],
+        );
 
         let s = scan_volume(&cat, &root, &ident(), false, 100).unwrap();
         // the zip file itself is a loose hashed file
@@ -345,7 +442,10 @@ mod tests {
         // rescan unchanged: archive is skipped, but its entry must NOT be swept to missing
         let s = scan_volume(&cat, &root, &ident(), false, 200).unwrap();
         assert_eq!(s.marked_missing, 0);
-        assert_eq!(cat.search("x", None, None, Some("active")).unwrap().len(), 1);
+        assert_eq!(
+            cat.search("x", None, None, Some("active")).unwrap().len(),
+            1
+        );
     }
 
     struct CountingProgress {
@@ -354,13 +454,32 @@ mod tests {
         errors: std::sync::atomic::AtomicUsize,
         arch: std::sync::atomic::AtomicUsize,
     }
-    impl CountingProgress { fn new() -> Self { Self {
-        hashed: 0.into(), skipped: 0.into(), errors: 0.into(), arch: 0.into() } } }
+    impl CountingProgress {
+        fn new() -> Self {
+            Self {
+                hashed: 0.into(),
+                skipped: 0.into(),
+                errors: 0.into(),
+                arch: 0.into(),
+            }
+        }
+    }
     impl Progress for CountingProgress {
-        fn on_hashed(&self) { self.hashed.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
-        fn on_skipped(&self) { self.skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
-        fn on_error(&self) { self.errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
-        fn on_archive_entry(&self) { self.arch.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+        fn on_hashed(&self) {
+            self.hashed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn on_skipped(&self) {
+            self.skipped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn on_error(&self) {
+            self.errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        fn on_archive_entry(&self) {
+            self.arch.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     #[test]
@@ -371,8 +490,15 @@ mod tests {
         fs::write(root.join("x.txt"), b"hello").unwrap();
         let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
 
-        let out = run_scan(&cat, &root, false, crate::volume::ReadonlyMode::Fingerprint, 100, None)
-            .unwrap();
+        let out = run_scan(
+            &cat,
+            &root,
+            false,
+            crate::volume::ReadonlyMode::Fingerprint,
+            100,
+            None,
+        )
+        .unwrap();
         let (identity, summary) = out.expect("not skipped");
         assert_eq!(summary.hashed, 1);
         // the volume row exists after run_scan upserted it
@@ -383,12 +509,19 @@ mod tests {
     #[derive(Clone)]
     struct CaptureW(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
     impl std::io::Write for CaptureW {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().extend_from_slice(b); Ok(b.len()) }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
     impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureW {
         type Writer = CaptureW;
-        fn make_writer(&'a self) -> Self::Writer { self.clone() }
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
     }
 
     #[test]
@@ -404,12 +537,25 @@ mod tests {
         let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sub = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
-            .with_writer(CaptureW(buf.clone())).with_ansi(false).finish();
+            .with_writer(CaptureW(buf.clone()))
+            .with_ansi(false)
+            .finish();
         let _guard = tracing::subscriber::set_default(sub);
 
-        run_scan(&cat, &root, false, crate::volume::ReadonlyMode::Fingerprint, 100, None).unwrap();
+        run_scan(
+            &cat,
+            &root,
+            false,
+            crate::volume::ReadonlyMode::Fingerprint,
+            100,
+            None,
+        )
+        .unwrap();
         let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        assert!(logged.to_lowercase().contains("volume"), "expected a volume info line: {logged}");
+        assert!(
+            logged.to_lowercase().contains("volume"),
+            "expected a volume info line: {logged}"
+        );
     }
 
     #[test]
@@ -420,11 +566,20 @@ mod tests {
         fs::write(root.join("x.txt"), b"hello").unwrap();
         let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
 
-        let n = run_scan(&cat, &root, false, crate::volume::ReadonlyMode::Fingerprint, 1234, None)
-            .unwrap();
+        let n = run_scan(
+            &cat,
+            &root,
+            false,
+            crate::volume::ReadonlyMode::Fingerprint,
+            1234,
+            None,
+        )
+        .unwrap();
         assert!(n.is_some());
         let acts = cat.recent_actions(10).unwrap();
-        assert!(acts.iter().any(|(a, d, t)| a == "scan" && *t == 1234 && d.contains("\"hashed\"")));
+        assert!(acts
+            .iter()
+            .any(|(a, d, t)| a == "scan" && *t == 1234 && d.contains("\"hashed\"")));
     }
 
     #[test]
