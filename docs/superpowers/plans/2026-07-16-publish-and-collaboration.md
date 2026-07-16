@@ -307,9 +307,13 @@ keywords = ["deduplication", "catalog", "backup", "storage", "blake3"]
 categories = ["command-line-utilities", "filesystem"]
 ```
 
-- [ ] **Step 7: Add the non-shipping dirs to `.gitignore`**
+- [x] **Step 7: Add the non-shipping dirs to `.gitignore`** — **ALREADY DONE** (commit `4160558`)
 
-Append:
+Pulled forward during execution: Task 1's `git add -A` swept the then-untracked `StitchExport/` and
+`.user/` into a commit, which had to be undone. The ignore rules landed early so that every later
+`git add -A` is safe. Nothing to do here; verify with Step 8.
+
+For reference, the appended rules were:
 
 ```gitignore
 # Design reference input (Google Stitch export) — not part of the build
