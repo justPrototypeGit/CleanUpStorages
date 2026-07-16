@@ -632,6 +632,11 @@ Expected: `no placeholder left`.
 
 - [ ] **Step 7: Append a "Building, testing, CI" section to `CONTRIBUTING.md`**
 
+> **CORRECTION (applied during execution, commit `0e0adc5`):** the text below was factually wrong
+> about CI and has been superseded. CI runs `--release --locked` for build/test/clippy, and
+> `fmt --check` runs in a *separate* job on `ubuntu-latest` — not across Windows+macOS as claimed.
+> See `CONTRIBUTING.md` for the corrected wording. Kept here to record the error.
+
 ```markdown
 ## Building, testing, CI
 
