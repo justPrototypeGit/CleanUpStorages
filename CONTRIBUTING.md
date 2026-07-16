@@ -40,15 +40,29 @@ docs: record CleanUpStorages design spec
 
 ## Building, testing, CI
 
+For day-to-day iteration, plain debug builds are fine and faster:
+
 ```bash
-cargo build --release      # -> target/release/cleanupstorages(.exe)
+cargo build                # -> target/debug/cleanupstorages(.exe)
 cargo test                 # full suite
-cargo clippy --all-targets -- -D warnings
+```
+
+Before opening a PR, run the same commands CI runs, so nothing surprises you:
+
+```bash
+cargo build --release --locked
+cargo test --release --locked
+cargo clippy --all-targets --locked -- -D warnings
 cargo fmt --check
 ```
 
-CI runs exactly these on every push to `main` and every PR, across **Windows** and **macOS**.
-Run them locally before opening a PR and CI will not surprise you.
+CI is split across two jobs:
+
+- A **build/test/clippy** job runs the `--release --locked` build, test, and clippy commands
+  above on a matrix of **Windows** and **macOS** (`windows-latest`, `macos-latest`).
+- A separate **`rustfmt`** job runs only `cargo fmt --check`, on **Linux** (`ubuntu-latest`).
+
+Both jobs run on every push to `main` and every PR; all of them must pass.
 
 ## How this project is designed
 
