@@ -134,10 +134,14 @@ mod tests {
     #[test]
     fn writes_marker_and_reuses_it() {
         let tmp = tempfile::tempdir().unwrap();
-        let id1 = resolve(tmp.path(), ReadonlyMode::Fingerprint).unwrap().unwrap();
+        let id1 = resolve(tmp.path(), ReadonlyMode::Fingerprint)
+            .unwrap()
+            .unwrap();
         assert_eq!(id1.identified_by, "marker");
         // marker file now exists and second resolve returns the same id
-        let id2 = resolve(tmp.path(), ReadonlyMode::Fingerprint).unwrap().unwrap();
+        let id2 = resolve(tmp.path(), ReadonlyMode::Fingerprint)
+            .unwrap()
+            .unwrap();
         assert_eq!(id1.volume_id, id2.volume_id);
         assert_eq!(id2.identified_by, "marker");
     }

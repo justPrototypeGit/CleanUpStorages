@@ -1,8 +1,8 @@
 //! Move confirmed-duplicate loose files to a same-drive `_ToDelete` quarantine (reversible).
 
-use std::path::Path;
-use crate::catalog::Catalog;
 use crate::catalog::models::FileStatus;
+use crate::catalog::Catalog;
+use std::path::Path;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct QuarantineOutcome {
@@ -13,34 +13,52 @@ pub struct QuarantineOutcome {
 /// Move each given file to the drive's `_ToDelete` quarantine, transactionally recording each.
 /// Verifies the mount's marker equals `expected_volume_id` before touching anything.
 pub fn quarantine_files(
-    cat: &Catalog, mount_root: &Path, expected_volume_id: &str, ids: &[i64], now: i64,
+    cat: &Catalog,
+    mount_root: &Path,
+    expected_volume_id: &str,
+    ids: &[i64],
+    now: i64,
 ) -> anyhow::Result<QuarantineOutcome> {
     match crate::volume::read_volume_id(mount_root) {
         Some(vid) if vid == expected_volume_id => {}
         Some(vid) => anyhow::bail!(
             "drive at {} is volume {vid}, not the expected {expected_volume_id}; aborting",
-            mount_root.display()),
+            mount_root.display()
+        ),
         None => anyhow::bail!(
             "no identity marker at {}; refusing to quarantine on an unidentified drive",
-            mount_root.display()),
+            mount_root.display()
+        ),
     }
 
     let mut out = QuarantineOutcome::default();
 
     for &id in ids {
-        let skip = |cat: &Catalog, reason: String, out: &mut QuarantineOutcome| -> anyhow::Result<()> {
-            cat.log_action("quarantine_skip",
-                &serde_json::json!({"file_id": id, "reason": reason}).to_string(), now)?;
-            out.skipped += 1;
-            Ok(())
-        };
+        let skip =
+            |cat: &Catalog, reason: String, out: &mut QuarantineOutcome| -> anyhow::Result<()> {
+                cat.log_action(
+                    "quarantine_skip",
+                    &serde_json::json!({"file_id": id, "reason": reason}).to_string(),
+                    now,
+                )?;
+                out.skipped += 1;
+                Ok(())
+            };
 
-        let Some(rec) = cat.get_file(id)? else { skip(cat, "no such file id".into(), &mut out)?; continue; };
+        let Some(rec) = cat.get_file(id)? else {
+            skip(cat, "no such file id".into(), &mut out)?;
+            continue;
+        };
         if rec.volume_id != expected_volume_id
             || rec.container_chain.is_some()
             || rec.status != FileStatus::Active
         {
-            skip(cat, "not a loose active file on this volume".into(), &mut out)?; continue;
+            skip(
+                cat,
+                "not a loose active file on this volume".into(),
+                &mut out,
+            )?;
+            continue;
         }
         // Disk-aware "never remove the last copy" guard. Exclude only this id (not the whole
         // batch): each successful quarantine commits immediately, so a doomed sibling processed
@@ -50,38 +68,59 @@ pub fn quarantine_files(
         // trust it) OR lives on THIS volume and its file physically exists on disk.
         let survivor_ok = cat.active_copies(&rec.content_hash)?.iter().any(|s| {
             s.id != id
-                && (s.volume_id != expected_volume_id
-                    || mount_root.join(&s.relative_path).exists())
+                && (s.volume_id != expected_volume_id || mount_root.join(&s.relative_path).exists())
         });
         if !survivor_ok {
-            skip(cat, "no surviving copy verified on disk (a same-drive duplicate may have been \
-                       deleted outside the tool — rescan the drive and retry)".into(), &mut out)?;
+            skip(
+                cat,
+                "no surviving copy verified on disk (a same-drive duplicate may have been \
+                       deleted outside the tool — rescan the drive and retry)"
+                    .into(),
+                &mut out,
+            )?;
             continue;
         }
 
         let src = mount_root.join(&rec.relative_path);
         if !src.is_file() {
-            skip(cat, format!("file not found on disk at {}", rec.relative_path), &mut out)?; continue;
+            skip(
+                cat,
+                format!("file not found on disk at {}", rec.relative_path),
+                &mut out,
+            )?;
+            continue;
         }
         let dest_rel = quarantine_dest(cat, mount_root, expected_volume_id, &rec.relative_path)?;
         let dest = mount_root.join(&dest_rel);
-        if let Some(parent) = dest.parent() { std::fs::create_dir_all(parent)?; }
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
 
         match std::fs::rename(&src, &dest) {
             Ok(()) => {
                 cat.mark_quarantined(id, &dest_rel.replace('\\', "/"), &rec.relative_path, now)?;
-                cat.log_action("quarantine", &serde_json::json!({
-                    "file_id": id, "volume_id": rec.volume_id,
-                    "from": rec.relative_path, "to": dest_rel.replace('\\', "/"),
-                    "hash": rec.content_hash,
-                }).to_string(), now)?;
+                cat.log_action(
+                    "quarantine",
+                    &serde_json::json!({
+                        "file_id": id, "volume_id": rec.volume_id,
+                        "from": rec.relative_path, "to": dest_rel.replace('\\', "/"),
+                        "hash": rec.content_hash,
+                    })
+                    .to_string(),
+                    now,
+                )?;
                 out.quarantined += 1;
             }
             Err(e) => {
                 // Cross-device or permission error: DO NOT copy+delete. Leave original in place.
-                cat.log_action("quarantine_error", &serde_json::json!({
-                    "file_id": id, "from": rec.relative_path, "error": e.to_string()
-                }).to_string(), now)?;
+                cat.log_action(
+                    "quarantine_error",
+                    &serde_json::json!({
+                        "file_id": id, "from": rec.relative_path, "error": e.to_string()
+                    })
+                    .to_string(),
+                    now,
+                )?;
                 out.skipped += 1;
             }
         }
@@ -93,14 +132,19 @@ pub fn quarantine_files(
 /// extension of the LAST path segment only, preserving the directory). A candidate is only
 /// acceptable when NEITHER the file exists on disk NOR a loose catalog row already claims it
 /// (e.g. a purged row still occupying the loose unique index) — avoiding a post-rename orphan.
-pub(crate) fn quarantine_dest(cat: &Catalog, mount_root: &Path, volume_id: &str, origin_rel: &str)
-    -> anyhow::Result<String>
-{
+pub(crate) fn quarantine_dest(
+    cat: &Catalog,
+    mount_root: &Path,
+    volume_id: &str,
+    origin_rel: &str,
+) -> anyhow::Result<String> {
     let base = format!("{}/{origin_rel}", crate::volume::QUARANTINE_DIR);
     let taken = |cat: &Catalog, cand: &str| -> anyhow::Result<bool> {
         Ok(mount_root.join(cand).exists() || cat.loose_path_taken(volume_id, cand)?)
     };
-    if !taken(cat, &base)? { return Ok(base); }
+    if !taken(cat, &base)? {
+        return Ok(base);
+    }
     let (dir, seg) = match base.rsplit_once('/') {
         Some((d, s)) => (format!("{d}/"), s.to_string()),
         None => (String::new(), base.clone()),
@@ -111,7 +155,9 @@ pub(crate) fn quarantine_dest(cat: &Catalog, mount_root: &Path, volume_id: &str,
     };
     for n in 1.. {
         let cand = format!("{dir}{stem} ({n}){ext}");
-        if !taken(cat, &cand)? { return Ok(cand); }
+        if !taken(cat, &cand)? {
+            return Ok(cand);
+        }
     }
     unreachable!()
 }
@@ -132,10 +178,19 @@ mod tests {
         fs::write(root.join("copy_a.jpg"), b"IDENTICAL").unwrap();
 
         let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
-        cat.upsert_volume(&Volume { volume_id: "vol-1".into(), label: "D".into(),
-            identified_by: "marker".into(), first_seen_at: 1, last_seen_at: 1 }).unwrap();
+        cat.upsert_volume(&Volume {
+            volume_id: "vol-1".into(),
+            label: "D".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
         let ident = crate::volume::VolumeIdentity {
-            volume_id: "vol-1".into(), label: "D".into(), identified_by: "marker".into() };
+            volume_id: "vol-1".into(),
+            label: "D".into(),
+            identified_by: "marker".into(),
+        };
         crate::scanner::scan_volume(&cat, &root, &ident, false, 100).unwrap();
         (tmp, cat, root.to_string_lossy().into_owned())
     }
@@ -147,7 +202,13 @@ mod tests {
         // pick the id of Photos/a.jpg
         let id = cat.loose_file_id("vol-1", "Photos/a.jpg").unwrap().unwrap();
         let out = quarantine_files(&cat, &root, "vol-1", &[id], 200).unwrap();
-        assert_eq!(out, QuarantineOutcome { quarantined: 1, skipped: 0 });
+        assert_eq!(
+            out,
+            QuarantineOutcome {
+                quarantined: 1,
+                skipped: 0
+            }
+        );
         // file moved
         assert!(!root.join("Photos/a.jpg").exists());
         assert!(root.join("_ToDelete/Photos/a.jpg").exists());
@@ -171,8 +232,13 @@ mod tests {
         assert_eq!(out.quarantined, 1);
         assert_eq!(out.skipped, 1);
         // exactly one of the two files remains on disk
-        let remaining = [root.join("Photos/a.jpg").exists(), root.join("copy_a.jpg").exists()]
-            .iter().filter(|x| **x).count();
+        let remaining = [
+            root.join("Photos/a.jpg").exists(),
+            root.join("copy_a.jpg").exists(),
+        ]
+        .iter()
+        .filter(|x| **x)
+        .count();
         assert_eq!(remaining, 1);
         let _ = tmp;
     }
@@ -193,8 +259,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let cat = Catalog::open(&root.join("c.db")).unwrap();
-        cat.upsert_volume(&Volume { volume_id: "vol-1".into(), label: "D".into(),
-            identified_by: "marker".into(), first_seen_at: 1, last_seen_at: 1 }).unwrap();
+        cat.upsert_volume(&Volume {
+            volume_id: "vol-1".into(),
+            label: "D".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
         // dotted ANCESTOR dir, final segment has no extension
         std::fs::create_dir_all(root.join("_ToDelete/my.backup")).unwrap();
         std::fs::write(root.join("_ToDelete/my.backup/README"), b"x").unwrap();
@@ -227,13 +299,25 @@ mod tests {
         let root = std::path::PathBuf::from(root);
         // Simulate a prior purge: a purged row already holds _ToDelete/Photos/a.jpg
         let mut ghost = crate::catalog::models::NewFile {
-            volume_id: "vol-1".into(), relative_path: "_ToDelete/Photos/a.jpg".into(),
-            filename: "a.jpg".into(), extension: "jpg".into(), size_bytes: 9,
-            content_hash: "old".into(), created_time: None, modified_time: None, accessed_time: None,
-            category: crate::category::Category::Photo, container_chain: None };
+            volume_id: "vol-1".into(),
+            relative_path: "_ToDelete/Photos/a.jpg".into(),
+            filename: "a.jpg".into(),
+            extension: "jpg".into(),
+            size_bytes: 9,
+            content_hash: "old".into(),
+            created_time: None,
+            modified_time: None,
+            accessed_time: None,
+            category: crate::category::Category::Photo,
+            container_chain: None,
+        };
         cat.upsert_file(&ghost, 50).unwrap();
-        let ghost_id = cat.loose_file_id("vol-1", "_ToDelete/Photos/a.jpg").unwrap().unwrap();
-        cat.mark_quarantined(ghost_id, "_ToDelete/Photos/a.jpg", "Photos/a.jpg", 60).unwrap();
+        let ghost_id = cat
+            .loose_file_id("vol-1", "_ToDelete/Photos/a.jpg")
+            .unwrap()
+            .unwrap();
+        cat.mark_quarantined(ghost_id, "_ToDelete/Photos/a.jpg", "Photos/a.jpg", 60)
+            .unwrap();
         cat.mark_purged(ghost_id, 70).unwrap();
         let _ = &mut ghost;
 
