@@ -37,3 +37,25 @@ docs: record CleanUpStorages design spec
 
 - Prefer small, reviewable branches merged into `main`.
 - Keep history readable; squash noisy work-in-progress commits when merging.
+
+## Building, testing, CI
+
+```bash
+cargo build --release      # -> target/release/cleanupstorages(.exe)
+cargo test                 # full suite
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+```
+
+CI runs exactly these on every push to `main` and every PR, across **Windows** and **macOS**.
+Run them locally before opening a PR and CI will not surprise you.
+
+## How this project is designed
+
+Every feature starts as a **design spec** in `docs/superpowers/specs/`, becomes an
+**implementation plan** in `docs/superpowers/plans/`, and only then gets written. Both are
+committed alongside the code, so you can read *why* a thing looks the way it does before
+proposing a change. See [docs/ai-sdlc.md](docs/ai-sdlc.md) for how that loop works.
+
+If you're proposing something substantial, open an issue first — a short spec beats a large
+surprise PR.
