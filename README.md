@@ -58,14 +58,15 @@ Other verbs:
 | Command | What it does |
 | --- | --- |
 | `scan <path> [--force]` | Crawl a drive/folder, hash files, update the catalog |
-| `search <query>` | Search the catalog (works for unplugged drives) |
+| `search <query> [--category] [--volume] [--status]` | Search the catalog (works for unplugged drives) |
 | `status` | Catalog summary |
-| `duplicates` | List duplicate groups |
-| `quarantine <id>…` | Move duplicates to `_ToDelete` |
-| `purge [--all]` | **The only real delete** — empty `_ToDelete` |
-| `repack <id>` | Remove a duplicate from inside an archive, safely |
-| `forget <volumeId>` | Drop a drive from the catalog (files untouched) |
-| `browse` | Local web UI |
+| `duplicates` | List duplicate groups, with ids to act on |
+| `quarantine <mount> <id>…` | Move duplicates (ids from `duplicates`) to `_ToDelete` on that drive |
+| `purge [mount] [--all]` | **The only real delete** — empty `_ToDelete` on one drive, or every connected drive with `--all` |
+| `repack <mount> <entry_id>` | Remove a duplicate from inside an archive, safely |
+| `forget <mount>` | Drop a drive from the catalog by its mount path (files untouched) |
+| `rename <mount> [--name] [--description]` | Set a drive's custom name/description (shown in the UI) |
+| `browse [--no-open]` | Local web UI |
 
 Add `-v` for verbose logs; `RUST_LOG` overrides.
 
