@@ -369,7 +369,12 @@ jobs:
         shell: bash
         run: |
           version="${{ needs.guard.outputs.version }}"
-          gh release create "${GITHUB_REF_NAME}" \
+          tag="${GITHUB_REF_NAME}"
+          # Idempotent re-runs: replace an existing *draft* for this tag; never touch a published one.
+          if [ "$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null)" = "true" ]; then
+            gh release delete "$tag" --yes
+          fi
+          gh release create "$tag" \
             --draft \
             --title "v${version}" \
             --notes-file notes.md \
