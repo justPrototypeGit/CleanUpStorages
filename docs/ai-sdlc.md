@@ -59,10 +59,13 @@ The parts that AI did **not** get right on its own:
 
 ## What's next
 
-The loop above is real but still human-driven at the edges: issues are triaged by hand and
-there is no release automation yet. Closing that gap — issue → spec → plan → implementation →
-review → **released binary**, with the human on the gates rather than the mechanics — is the
-next phase.
+The release end of the loop is now automated: pushing a version tag builds the Windows and macOS
+binaries, checksums them, and opens a **draft** GitHub Release with notes drawn from the changelog —
+a human reviews and publishes. So the loop reaches an actual downloadable artifact, with the human on
+the gate rather than the mechanics.
+
+What's still hand-driven is the *front* of the loop: turning an incoming issue into a spec and a plan.
+Automating that — safely, on a public repo where anyone can open an issue — is the next phase.
 
 ## Read the artefacts
 
