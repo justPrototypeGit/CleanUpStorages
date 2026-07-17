@@ -43,10 +43,10 @@ jobs:
             exit 1
           fi
 
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Tests
-        run: cargo test --release --locked
+      # NOTE: the guard does NOT compile. It runs on ubuntu-latest for the cheap metadata checks
+      # above, and the project does not build on Linux without system libraries (rfd pulls
+      # wayland-sys, whose build script needs libwayland/GTK dev packages). We ship only Windows and
+      # macOS, so tests are re-proven in the build jobs below, on the platforms we actually release.
 
   build:
     name: build (${{ matrix.target }})
@@ -64,6 +64,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
+      # Re-prove the tests on the exact tagged commit, on a platform we actually ship, before
+      # building the release artifact. A failure here fails the job, so `release` (needs: build) is
+      # skipped and nothing is published.
+      - name: Tests
+        run: cargo test --release --locked
 
       - name: Build
         run: cargo build --release --locked

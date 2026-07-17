@@ -58,14 +58,19 @@ leaves nothing half-published.
     naming both. Kills "tagged v0.2.0, shipped 0.1.0".
   - **Changelog present:** `CHANGELOG.md` must contain a section header for `VERSION` (format fixed
     below). If absent, fail — never ship empty notes.
-  - **Tests:** `cargo test --release --locked`. CI already ran on merge, but a *release* is worth
-    re-proving on the exact tagged commit rather than assuming.
   - Export `VERSION` as a job output for downstream jobs.
+  - **The guard does NOT compile.** It stays on ubuntu-latest for the cheap metadata checks only.
+    (Superseded during execution: the guard originally ran `cargo test` here, but the project does
+    not build on Linux without system libs — `rfd` pulls `wayland-sys`, whose build script needs
+    libwayland/GTK — which is exactly why A+B's CI excluded Linux. The first live `v0.2.0` run caught
+    this; test re-proving moved to the `build` jobs, on the platforms we actually ship.)
 
 - **`build`** (matrix: `windows-latest`, `macos-latest`; `needs: guard`):
-  - `cargo build --release --locked` — `--locked` so the release binary is built from the exact
-    committed `Cargo.lock`, identical to what CI verified; a lockfile drift fails the build rather
-    than silently resolving new dependency versions into a release artifact.
+  - `cargo test --release --locked`, then `cargo build --release --locked` — re-prove the tests on
+    the exact tagged commit on a platform we actually ship, then build. `--locked` so the binary is
+    built from the exact committed `Cargo.lock`; a lockfile drift fails the build rather than silently
+    resolving new dependency versions into a release artifact. A test failure fails the job, so
+    `release` (needs: build) is skipped and nothing is published.
   - Package:
     - Windows → `cleanupstorages-<VERSION>-x86_64-pc-windows-msvc.zip` containing
       `cleanupstorages.exe`, `README.md`, `LICENSE`, `assets/LICENSES.md`.

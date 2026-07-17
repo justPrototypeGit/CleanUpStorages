@@ -253,10 +253,9 @@ jobs:
             exit 1
           fi
 
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Tests
-        run: cargo test --release --locked
+      # The guard does NOT compile: it runs on ubuntu-latest for cheap metadata checks only. The
+      # project can't build on Linux without system libs (rfd -> wayland-sys needs libwayland/GTK),
+      # which is why CI excludes Linux. Tests are re-proven in the build jobs, on shipping platforms.
 
   build:
     name: build (${{ matrix.target }})
@@ -274,6 +273,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
+      - name: Tests
+        run: cargo test --release --locked
 
       - name: Build
         run: cargo build --release --locked
