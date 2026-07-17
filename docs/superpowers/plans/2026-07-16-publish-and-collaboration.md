@@ -970,9 +970,14 @@ Confirm all four:
 1. The GitHub owner/username (the plan assumes `justPrototypeGit` — if wrong, every URL written in Tasks 3–6 must be corrected first).
 2. Repo name `CleanUpStorages`.
 3. Public visibility.
-4. That the commit author email `justprototypeemail@gmail.com` becoming permanently public is accepted.
+4. ~~That the commit author email `justprototypeemail@gmail.com` becoming permanently public is accepted.~~
+   **RESOLVED during execution:** rather than accept it, all 190 commits were rewritten to the
+   GitHub noreply identity `217975680+justPrototypeGit@users.noreply.github.com` before the first
+   push (trees and messages verified byte-identical; pre-rewrite objects purged). The gmail remains
+   only in `CODE_OF_CONDUCT.md`, deliberately — a CoC contact must be a reachable inbox.
 
-**Do not proceed until all four are confirmed.**
+**Confirmed by the user:** owner `justPrototypeGit`, repo `CleanUpStorages`, remote
+`https://github.com/justPrototypeGit/CleanUpStorages.git`.
 
 - [ ] **Step 2: Verify the tree is clean and green one final time**
 
