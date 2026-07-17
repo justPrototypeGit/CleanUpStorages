@@ -1,0 +1,65 @@
+name: Bug report
+description: Something behaved incorrectly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. If this involves **actual or potential data loss**, please say so
+        clearly below — that is this project's highest-severity category.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. cleanupstorages scan D:\
+        2. Open Duplicates
+        3. ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: data-risk
+    attributes:
+      label: Was any data lost, moved, or put at risk?
+      options:
+        - "No — cosmetic or read-only issue"
+        - "Unsure"
+        - "Yes — files were moved/deleted unexpectedly"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      placeholder: "v0.1.0 or a commit SHA"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: "Output of the command, ideally with -v. Please redact personal paths."
+      render: shell

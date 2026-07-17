@@ -366,14 +366,42 @@ fn glyph(key: &str) -> &'static str {
     }
 }
 
-struct NavItem { key: &'static str, href: &'static str, label: &'static str }
+struct NavItem {
+    key: &'static str,
+    href: &'static str,
+    label: &'static str,
+}
 const NAV: &[NavItem] = &[
-    NavItem{key:"overview",href:"/",label:"Overview"},
-    NavItem{key:"browse",href:"/browse",label:"Browse"},
-    NavItem{key:"duplicates",href:"/review",label:"Duplicates"},
-    NavItem{key:"drives",href:"/drives",label:"Drives"},
-    NavItem{key:"scan",href:"/scan",label:"Scan"},
-    NavItem{key:"console",href:"/console",label:"Console"},
+    NavItem {
+        key: "overview",
+        href: "/",
+        label: "Overview",
+    },
+    NavItem {
+        key: "browse",
+        href: "/browse",
+        label: "Browse",
+    },
+    NavItem {
+        key: "duplicates",
+        href: "/review",
+        label: "Duplicates",
+    },
+    NavItem {
+        key: "drives",
+        href: "/drives",
+        label: "Drives",
+    },
+    NavItem {
+        key: "scan",
+        href: "/scan",
+        label: "Scan",
+    },
+    NavItem {
+        key: "console",
+        href: "/console",
+        label: "Console",
+    },
 ];
 
 /// Render a full self-contained page. `active` is a NAV key.
@@ -383,25 +411,29 @@ pub fn shell(active: &str, csrf: &str, title: &str, main_html: &str, page_script
         let current = if n.key == active { r#" aria-current="page""# } else { "" };
         format!(r#"<a class="{cls}"{current} href="{}" title="{}"><span class="material-symbols-outlined">{}</span><span class="lb">{}</span></a>"#, n.href, n.label, glyph(n.key), n.label)
     }).collect::<String>();
-    let themebar = format!(r##"<div class="themebar"><span class="lbl">Theme</span>
+    let themebar = format!(
+        r##"<div class="themebar"><span class="lbl">Theme</span>
 <div class="seg" role="group" aria-label="Theme">
 <button data-theme="auto" title="Follow system"><span class="material-symbols-outlined">{}</span><span class="lb">Auto</span></button>
 <button data-theme="light" title="Light"><span class="material-symbols-outlined">{}</span><span class="lb">Light</span></button>
 <button data-theme="dark" title="Dark"><span class="material-symbols-outlined">{}</span><span class="lb">Dark</span></button></div></div>"##,
-        glyph("auto"), glyph("light"), glyph("dark"));
-    format!(r##"<!doctype html><html lang="en"><head>
+        glyph("auto"),
+        glyph("light"),
+        glyph("dark")
+    );
+    format!(
+        r##"<!doctype html><html lang="en"><head>
 <script>(function(){{var q=new URLSearchParams(location.search);var u=q.get('theme');var t=u||localStorage.getItem('theme');if(t&&t!=='auto')document.documentElement.dataset.theme=t;var r=q.get('rail');var rr=r!=null?r:localStorage.getItem('rail');if(rr==='1')document.documentElement.dataset.rail='1';}})();</script>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="csrf" content="{csrf}"><title>CleanUpStorages — {title}</title>
-<style>{style}</style></head><body>
+<style>{STYLE}</style></head><body>
 <aside class="side"><div class="side-head"><div class="brand"><h1>CleanUpStorages</h1><p class="tagline">Storage cleanup</p></div>
 <button class="rail-toggle" id="railToggle" title="Collapse menu" aria-label="Collapse menu"><span class="material-symbols-outlined">chevron_left</span></button></div>
 <nav>{nav}</nav>{themebar}</aside>
 <main>{main_html}</main>
-<script>{shared}</script><script>{page_script}</script>
-</body></html>"##,
-        csrf = csrf, title = title, style = STYLE, nav = nav, themebar = themebar, main_html = main_html,
-        shared = SHARED_JS, page_script = page_script)
+<script>{SHARED_JS}</script><script>{page_script}</script>
+</body></html>"##
+    )
 }
 
 pub fn overview_page(csrf: &str) -> String {

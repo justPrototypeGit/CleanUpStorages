@@ -307,9 +307,13 @@ keywords = ["deduplication", "catalog", "backup", "storage", "blake3"]
 categories = ["command-line-utilities", "filesystem"]
 ```
 
-- [ ] **Step 7: Add the non-shipping dirs to `.gitignore`**
+- [x] **Step 7: Add the non-shipping dirs to `.gitignore`** — **ALREADY DONE** (commit `4160558`)
 
-Append:
+Pulled forward during execution: Task 1's `git add -A` swept the then-untracked `StitchExport/` and
+`.user/` into a commit, which had to be undone. The ignore rules landed early so that every later
+`git add -A` is safe. Nothing to do here; verify with Step 8.
+
+For reference, the appended rules were:
 
 ```gitignore
 # Design reference input (Google Stitch export) — not part of the build
@@ -627,6 +631,11 @@ grep -n "INSERT CONTACT METHOD" CODE_OF_CONDUCT.md || echo "no placeholder left"
 Expected: `no placeholder left`.
 
 - [ ] **Step 7: Append a "Building, testing, CI" section to `CONTRIBUTING.md`**
+
+> **CORRECTION (applied during execution, commit `0e0adc5`):** the text below was factually wrong
+> about CI and has been superseded. CI runs `--release --locked` for build/test/clippy, and
+> `fmt --check` runs in a *separate* job on `ubuntu-latest` — not across Windows+macOS as claimed.
+> See `CONTRIBUTING.md` for the corrected wording. Kept here to record the error.
 
 ```markdown
 ## Building, testing, CI
@@ -961,9 +970,14 @@ Confirm all four:
 1. The GitHub owner/username (the plan assumes `justPrototypeGit` — if wrong, every URL written in Tasks 3–6 must be corrected first).
 2. Repo name `CleanUpStorages`.
 3. Public visibility.
-4. That the commit author email `justprototypeemail@gmail.com` becoming permanently public is accepted.
+4. ~~That the commit author email `justprototypeemail@gmail.com` becoming permanently public is accepted.~~
+   **RESOLVED during execution:** rather than accept it, all 190 commits were rewritten to the
+   GitHub noreply identity `217975680+justPrototypeGit@users.noreply.github.com` before the first
+   push (trees and messages verified byte-identical; pre-rewrite objects purged). The gmail remains
+   only in `CODE_OF_CONDUCT.md`, deliberately — a CoC contact must be a reachable inbox.
 
-**Do not proceed until all four are confirmed.**
+**Confirmed by the user:** owner `justPrototypeGit`, repo `CleanUpStorages`, remote
+`https://github.com/justPrototypeGit/CleanUpStorages.git`.
 
 - [ ] **Step 2: Verify the tree is clean and green one final time**
 

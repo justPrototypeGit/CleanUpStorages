@@ -147,8 +147,15 @@ reports **13 warnings**. Both gates would fail today.
 - The LinkedIn post (phase D).
 - Publishing to crates.io.
 - Font subsetting (deferred, see above).
-- Rewriting commit-author history. The author email `justprototypeemail@gmail.com` is a deliberate
-  project alias matching the `justPrototype` handle and will become public. Flagged and accepted.
+
+**Superseded during execution — commit-author history WAS rewritten.** This spec originally listed
+the rewrite as a non-goal and accepted the gmail becoming public. Before the first push, that call
+was reversed: all 190 commits were rewritten from `justprototypeemail@gmail.com` to the GitHub
+noreply identity `217975680+justPrototypeGit@users.noreply.github.com`, which keeps the address
+private while still attributing every commit to the account. Trees and commit messages were verified
+byte-identical before and after; the two already-merged feature branches were dropped so no
+pre-rewrite objects survive. The address remains in `CODE_OF_CONDUCT.md` by choice — a Code of
+Conduct contact has to be an inbox that actually receives mail, which a noreply address does not.
 
 ## Success criteria
 

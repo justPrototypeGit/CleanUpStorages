@@ -27,3 +27,9 @@ desktop.ini
 # including the repo root during manual smoke tests)
 .cleanupstorages_id
 UI/
+
+# Design reference input (Google Stitch export) — not part of the build
+StitchExport/
+# Local agent/session scratch
+.user/
+.superpowers/

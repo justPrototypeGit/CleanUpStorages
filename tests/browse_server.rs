@@ -9,25 +9,45 @@ fn start_server() -> std::net::SocketAddr {
     {
         let cat = cleanupstorages::catalog::Catalog::open(&db).unwrap();
         cat.upsert_volume(&cleanupstorages::catalog::models::Volume {
-            volume_id: "vol-1".into(), label: "Test HDD".into(), identified_by: "marker".into(),
-            first_seen_at: 1, last_seen_at: 1,
-        }).unwrap();
-        cat.upsert_file(&cleanupstorages::catalog::models::NewFile {
-            volume_id: "vol-1".into(), relative_path: "docs/thesis.pdf".into(),
-            filename: "thesis.pdf".into(), extension: "pdf".into(), size_bytes: 5,
-            content_hash: "h1".into(), created_time: None, modified_time: None, accessed_time: None,
-            category: cleanupstorages::category::Category::Document, container_chain: None,
-        }, 100).unwrap();
+            volume_id: "vol-1".into(),
+            label: "Test HDD".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
+        cat.upsert_file(
+            &cleanupstorages::catalog::models::NewFile {
+                volume_id: "vol-1".into(),
+                relative_path: "docs/thesis.pdf".into(),
+                filename: "thesis.pdf".into(),
+                extension: "pdf".into(),
+                size_bytes: 5,
+                content_hash: "h1".into(),
+                created_time: None,
+                modified_time: None,
+                accessed_time: None,
+                category: cleanupstorages::category::Category::Document,
+                container_chain: None,
+            },
+            100,
+        )
+        .unwrap();
     }
     // keep tmp alive for the whole test process
     std::mem::forget(tmp);
 
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async move {
             let app = cleanupstorages::web::build_router(db);
-            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
             tx.send(listener.local_addr().unwrap()).unwrap();
             axum::serve(listener, app).await.unwrap();
         });

@@ -37,3 +37,39 @@ docs: record CleanUpStorages design spec
 
 - Prefer small, reviewable branches merged into `main`.
 - Keep history readable; squash noisy work-in-progress commits when merging.
+
+## Building, testing, CI
+
+For day-to-day iteration, plain debug builds are fine and faster:
+
+```bash
+cargo build                # -> target/debug/cleanupstorages(.exe)
+cargo test                 # full suite
+```
+
+Before opening a PR, run the same commands CI runs, so nothing surprises you:
+
+```bash
+cargo build --release --locked
+cargo test --release --locked
+cargo clippy --all-targets --locked -- -D warnings
+cargo fmt --check
+```
+
+CI is split across two jobs:
+
+- A **build/test/clippy** job runs the `--release --locked` build, test, and clippy commands
+  above on a matrix of **Windows** and **macOS** (`windows-latest`, `macos-latest`).
+- A separate **`rustfmt`** job runs only `cargo fmt --check`, on **Linux** (`ubuntu-latest`).
+
+Both jobs run on every push to `main` and every PR; all of them must pass.
+
+## How this project is designed
+
+Every feature starts as a **design spec** in `docs/superpowers/specs/`, becomes an
+**implementation plan** in `docs/superpowers/plans/`, and only then gets written. Both are
+committed alongside the code, so you can read *why* a thing looks the way it does before
+proposing a change. See [docs/ai-sdlc.md](docs/ai-sdlc.md) for how that loop works.
+
+If you're proposing something substantial, open an issue first — a short spec beats a large
+surprise PR.
