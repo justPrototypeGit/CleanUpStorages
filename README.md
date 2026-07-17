@@ -76,6 +76,11 @@ Drives, Scan and Console — in light and dark themes.
 
 ![Browse](docs/screenshots/browse-dark.png)
 
+Drives you've catalogued stay listed whether or not they're plugged in, with their capacity, scan
+state and anything still sitting in quarantine:
+
+![Drives](docs/screenshots/drives.png)
+
 ## How this was built
 
 Every feature in this repo started as a **design spec**, became an **implementation plan**, and
