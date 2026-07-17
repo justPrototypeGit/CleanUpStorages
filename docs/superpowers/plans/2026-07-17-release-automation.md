@@ -336,9 +336,12 @@ jobs:
         shell: bash
         run: |
           version="${{ needs.guard.outputs.version }}"
+          # index()/substr() instead of a dynamic regex: escaping [ and ] inside an awk regex string
+          # is implementation-dependent (gawk warns and mis-parses "\[" as a bracket expression,
+          # yielding EMPTY output). Literal string matching is robust across gawk/mawk.
           awk -v ver="$version" '
-            $0 ~ "^## \\[" ver "\\]" {grab=1; next}
-            grab && (/^## \[/ || /^\[[^]]+\]: /) {grab=0}
+            index($0, "## [" ver "]") == 1 {grab=1; next}
+            grab && (index($0, "## [") == 1 || substr($0,1,1) == "[") {grab=0}
             grab {print}
           ' CHANGELOG.md > notes.md
           if [ ! -s notes.md ]; then
@@ -366,7 +369,12 @@ jobs:
         shell: bash
         run: |
           version="${{ needs.guard.outputs.version }}"
-          gh release create "${GITHUB_REF_NAME}" \
+          tag="${GITHUB_REF_NAME}"
+          # Idempotent re-runs: replace an existing *draft* for this tag; never touch a published one.
+          if [ "$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null)" = "true" ]; then
+            gh release delete "$tag" --yes
+          fi
+          gh release create "$tag" \
             --draft \
             --title "v${version}" \
             --notes-file notes.md \
@@ -392,7 +400,7 @@ cargo_version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "([^"]+
 echo "version=$version cargo=$cargo_version"
 test "$version" = "$cargo_version" && echo "GUARD version: PASS" || echo "GUARD version: FAIL"
 grep -qE "^## \[${version}\]" CHANGELOG.md && echo "GUARD changelog: PASS" || echo "GUARD changelog: FAIL"
-awk -v ver="$version" '$0 ~ "^## \\[" ver "\\]" {grab=1; next} grab && (/^## \[/ || /^\[[^]]+\]: /) {grab=0} grab {print}' CHANGELOG.md > /tmp/notes.md
+awk -v ver="$version" 'index($0,"## ["ver"]")==1{grab=1;next} grab&&(index($0,"## [")==1||substr($0,1,1)=="["){grab=0} grab{print}' CHANGELOG.md > /tmp/notes.md
 test -s /tmp/notes.md && echo "NOTES non-empty: PASS" || echo "NOTES: FAIL"
 echo "----- extracted notes -----"; cat /tmp/notes.md
 ```
