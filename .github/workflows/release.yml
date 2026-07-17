@@ -159,7 +159,16 @@ jobs:
         shell: bash
         run: |
           version="${{ needs.guard.outputs.version }}"
-          gh release create "${GITHUB_REF_NAME}" \
+          tag="${GITHUB_REF_NAME}"
+          # Idempotent re-runs: if a *draft* for this tag already exists (e.g. a previous run failed
+          # part-way), delete it and recreate cleanly. A *published* release is never touched — the
+          # create below will then fail loudly, which is the correct behaviour (don't silently
+          # replace something users may already have downloaded).
+          if [ "$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null)" = "true" ]; then
+            echo "removing existing draft for $tag before recreating"
+            gh release delete "$tag" --yes
+          fi
+          gh release create "$tag" \
             --draft \
             --title "v${version}" \
             --notes-file notes.md \
