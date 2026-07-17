@@ -1,17 +1,21 @@
-use std::path::Path;
 use clap::ValueEnum;
+use std::path::Path;
 
-use crate::config::Config;
-use crate::catalog::Catalog;
-use crate::catalog::models::FileStatus;
-use crate::volume::ReadonlyMode;
-use crate::scanner;
 use crate::catalog::backup;
+use crate::catalog::models::FileStatus;
+use crate::catalog::Catalog;
+use crate::config::Config;
+use crate::scanner;
+use crate::volume::ReadonlyMode;
 use crate::web;
-use crate::{quarantine, purge, repack};
+use crate::{purge, quarantine, repack};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
-pub enum ReadonlyFallback { Ask, Fingerprint, Skip }
+pub enum ReadonlyFallback {
+    Ask,
+    Fingerprint,
+    Skip,
+}
 
 impl From<ReadonlyFallback> for ReadonlyMode {
     fn from(f: ReadonlyFallback) -> Self {
@@ -24,7 +28,10 @@ impl From<ReadonlyFallback> for ReadonlyMode {
 }
 
 fn now_secs() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 /// Open the config and catalog — the prologue every command shares.
@@ -39,26 +46,43 @@ fn open_catalog() -> anyhow::Result<(Config, Catalog)> {
 fn open_catalog_checked() -> anyhow::Result<(Config, Catalog)> {
     let (cfg, cat) = open_catalog()?;
     if !cat.integrity_ok()? {
-        anyhow::bail!("catalog failed integrity check; restore the latest snapshot from {}",
-            cfg.backups_dir().display());
+        anyhow::bail!(
+            "catalog failed integrity check; restore the latest snapshot from {}",
+            cfg.backups_dir().display()
+        );
     }
     Ok((cfg, cat))
 }
 
 /// Timestamped catalog snapshot (the CLI's audit/rollback point).
 fn snapshot(cfg: &Config, now: i64) -> anyhow::Result<std::path::PathBuf> {
-    backup::snapshot(&cfg.catalog_path, &cfg.backups_dir(), cfg.snapshot_retention, now)
+    backup::snapshot(
+        &cfg.catalog_path,
+        &cfg.backups_dir(),
+        cfg.snapshot_retention,
+        now,
+    )
 }
 
 pub fn cmd_scan(path: &Path, force: bool, fallback: ReadonlyFallback) -> anyhow::Result<()> {
     let (cfg, cat) = open_catalog_checked()?;
     let now = now_secs();
     match scanner::run_scan(&cat, path, force, fallback.into(), now, None)? {
-        None => { println!("Skipped read-only drive at {}", path.display()); return Ok(()); }
+        None => {
+            println!("Skipped read-only drive at {}", path.display());
+            return Ok(());
+        }
         Some((identity, s)) => {
-            println!("Scanned {} (volume {}, id by {})", path.display(), identity.label, identity.identified_by);
-            println!("Done: {} hashed, {} unchanged, {} errors, {} newly missing, {} archive entries.",
-                s.hashed, s.skipped, s.errors, s.marked_missing, s.archive_entries);
+            println!(
+                "Scanned {} (volume {}, id by {})",
+                path.display(),
+                identity.label,
+                identity.identified_by
+            );
+            println!(
+                "Done: {} hashed, {} unchanged, {} errors, {} newly missing, {} archive entries.",
+                s.hashed, s.skipped, s.errors, s.marked_missing, s.archive_entries
+            );
         }
     }
     let snap = snapshot(&cfg, now)?;
@@ -66,9 +90,12 @@ pub fn cmd_scan(path: &Path, force: bool, fallback: ReadonlyFallback) -> anyhow:
     Ok(())
 }
 
-pub fn cmd_search(query: &str, category: Option<&str>, volume: Option<&str>, status: Option<&str>)
-    -> anyhow::Result<()>
-{
+pub fn cmd_search(
+    query: &str,
+    category: Option<&str>,
+    volume: Option<&str>,
+    status: Option<&str>,
+) -> anyhow::Result<()> {
     let (_cfg, cat) = open_catalog()?;
     let hits = cat.search(query, category, volume, status)?;
     if hits.is_empty() {
@@ -86,8 +113,14 @@ pub fn cmd_search(query: &str, category: Option<&str>, volume: Option<&str>, sta
             Some(chain) => format!("{} › {}", f.relative_path, chain),
             None => f.relative_path.clone(),
         };
-        println!("{}  [{}]  {}  ({} bytes){}",
-            location, f.volume_id, f.category.as_str(), f.size_bytes, flag);
+        println!(
+            "{}  [{}]  {}  ({} bytes){}",
+            location,
+            f.volume_id,
+            f.category.as_str(),
+            f.size_bytes,
+            flag
+        );
     }
     println!("{} match(es).", hits.len());
     Ok(())
@@ -100,8 +133,11 @@ pub fn cmd_status() -> anyhow::Result<()> {
     println!("Per-volume (active files):");
     for (id, label, count, bytes) in cat.volume_stats()? {
         let recoverable = cat.recoverable_bytes(&id)?;
-        println!("  {label} [{id}]: {count} files, {} MiB (recoverable: {} MiB in _ToDelete)",
-            bytes / (1024 * 1024), recoverable / (1024 * 1024));
+        println!(
+            "  {label} [{id}]: {count} files, {} MiB (recoverable: {} MiB in _ToDelete)",
+            bytes / (1024 * 1024),
+            recoverable / (1024 * 1024)
+        );
     }
     Ok(())
 }
@@ -109,13 +145,26 @@ pub fn cmd_status() -> anyhow::Result<()> {
 pub fn cmd_duplicates() -> anyhow::Result<()> {
     let (_cfg, cat) = open_catalog()?;
     let groups = cat.duplicate_groups()?;
-    if groups.is_empty() { println!("No duplicate groups."); return Ok(()); }
+    if groups.is_empty() {
+        println!("No duplicate groups.");
+        return Ok(());
+    }
     for group in &groups {
-        println!("hash {} — {} copies:", &group[0].content_hash[..16.min(group[0].content_hash.len())], group.len());
+        println!(
+            "hash {} — {} copies:",
+            &group[0].content_hash[..16.min(group[0].content_hash.len())],
+            group.len()
+        );
         for f in group {
             let loc = f.display_location();
-            println!("  #{}  {}  [{}]  {} bytes  {}",
-                f.id, loc, f.volume_id, f.size_bytes, f.status.as_str());
+            println!(
+                "  #{}  {}  [{}]  {} bytes  {}",
+                f.id,
+                loc,
+                f.volume_id,
+                f.size_bytes,
+                f.status.as_str()
+            );
         }
     }
     Ok(())
@@ -123,11 +172,18 @@ pub fn cmd_duplicates() -> anyhow::Result<()> {
 
 pub fn cmd_quarantine(mount: &Path, ids: &[i64]) -> anyhow::Result<()> {
     let (cfg, cat) = open_catalog()?;
-    let vid = crate::volume::read_volume_id(mount)
-        .ok_or_else(|| anyhow::anyhow!("no identity marker at {}; scan the drive first", mount.display()))?;
+    let vid = crate::volume::read_volume_id(mount).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no identity marker at {}; scan the drive first",
+            mount.display()
+        )
+    })?;
     let now = now_secs();
     let out = quarantine::quarantine_files(&cat, mount, &vid, ids, now)?;
-    println!("Quarantined {} file(s), skipped {}.", out.quarantined, out.skipped);
+    println!(
+        "Quarantined {} file(s), skipped {}.",
+        out.quarantined, out.skipped
+    );
     let snap = snapshot(&cfg, now)?;
     println!("Catalog snapshot: {}", snap.display());
     Ok(())
@@ -143,23 +199,40 @@ pub fn cmd_purge(mount: Option<&Path>, all: bool) -> anyhow::Result<()> {
         let mounts = crate::mounts::live_mounts();
         let out = purge::purge_all(&cat, &mounts, now)?;
         let total: i64 = out.purged.iter().map(|(_, _, b)| *b).sum();
-        println!("Purged {} volume(s), reclaimed {} MiB total.", out.purged.len(), total / (1024*1024));
-        for v in &out.skipped_unmounted { println!("  skipped (not connected): {v}"); }
-        for e in &out.errors { println!("  error: {e}"); }
+        println!(
+            "Purged {} volume(s), reclaimed {} MiB total.",
+            out.purged.len(),
+            total / (1024 * 1024)
+        );
+        for v in &out.skipped_unmounted {
+            println!("  skipped (not connected): {v}");
+        }
+        for e in &out.errors {
+            println!("  error: {e}");
+        }
         return Ok(());
     }
-    let mount = mount.ok_or_else(|| anyhow::anyhow!("a mount path is required unless --all is given"))?;
+    let mount =
+        mount.ok_or_else(|| anyhow::anyhow!("a mount path is required unless --all is given"))?;
     let vid = crate::volume::read_volume_id(mount)
         .ok_or_else(|| anyhow::anyhow!("no identity marker at {}", mount.display()))?;
     let out = purge::purge_volume(&cat, mount, &vid, now)?;
-    println!("Purged {} file(s), reclaimed {} MiB.", out.files_purged, out.bytes_reclaimed / (1024*1024));
+    println!(
+        "Purged {} file(s), reclaimed {} MiB.",
+        out.files_purged,
+        out.bytes_reclaimed / (1024 * 1024)
+    );
     Ok(())
 }
 
 pub fn cmd_forget(mount: &Path) -> anyhow::Result<()> {
     let (cfg, cat) = open_catalog()?;
-    let vid = crate::volume::read_volume_id(mount)
-        .ok_or_else(|| anyhow::anyhow!("no identity marker at {}; nothing to forget", mount.display()))?;
+    let vid = crate::volume::read_volume_id(mount).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no identity marker at {}; nothing to forget",
+            mount.display()
+        )
+    })?;
     let now = now_secs();
     let snap = snapshot(&cfg, now)?;
     println!("Catalog snapshot (pre-forget): {}", snap.display());
@@ -168,10 +241,18 @@ pub fn cmd_forget(mount: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn cmd_rename(mount: &Path, name: Option<&str>, description: Option<&str>) -> anyhow::Result<()> {
+pub fn cmd_rename(
+    mount: &Path,
+    name: Option<&str>,
+    description: Option<&str>,
+) -> anyhow::Result<()> {
     let (cfg, cat) = open_catalog()?;
-    let vid = crate::volume::read_volume_id(mount)
-        .ok_or_else(|| anyhow::anyhow!("no identity marker at {}; scan the drive first", mount.display()))?;
+    let vid = crate::volume::read_volume_id(mount).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no identity marker at {}; scan the drive first",
+            mount.display()
+        )
+    })?;
     let now = now_secs();
     cat.set_volume_meta(&vid, name, description, now)?;
     let _ = snapshot(&cfg, now);
@@ -181,8 +262,12 @@ pub fn cmd_rename(mount: &Path, name: Option<&str>, description: Option<&str>) -
 
 pub fn cmd_repack(mount: &Path, entry_id: i64) -> anyhow::Result<()> {
     let (cfg, cat) = open_catalog()?;
-    let vid = crate::volume::read_volume_id(mount)
-        .ok_or_else(|| anyhow::anyhow!("no identity marker at {}; scan the drive first", mount.display()))?;
+    let vid = crate::volume::read_volume_id(mount).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no identity marker at {}; scan the drive first",
+            mount.display()
+        )
+    })?;
     let now = now_secs();
     // snapshot BEFORE modifying an archive
     let snap = snapshot(&cfg, now)?;
@@ -196,6 +281,8 @@ pub fn cmd_repack(mount: &Path, entry_id: i64) -> anyhow::Result<()> {
 pub fn cmd_browse(open: bool) -> anyhow::Result<()> {
     let (cfg, cat) = open_catalog_checked()?;
     drop(cat); // handlers open their own short-lived connections
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     rt.block_on(web::serve(cfg.catalog_path.clone(), open))
 }

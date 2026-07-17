@@ -31,7 +31,9 @@ mod tests {
         // a 100x40 image thumbnails to <=32px longest side, and the output decodes as JPEG.
         let img = image::RgbImage::from_pixel(100, 40, image::Rgb([0, 128, 255]));
         let mut src = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgb8(img).write_to(&mut src, image::ImageFormat::Png).unwrap();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut src, image::ImageFormat::Png)
+            .unwrap();
         let thumb = thumbnail_jpeg(&src.into_inner(), 32).unwrap();
         let decoded = image::load_from_memory(&thumb).unwrap();
         assert!(decoded.width() <= 32 && decoded.height() <= 32);

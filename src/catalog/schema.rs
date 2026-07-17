@@ -103,8 +103,10 @@ mod tests {
         let cat = Catalog::open(&db).unwrap();
         assert!(cat.integrity_ok().unwrap());
         // WAL mode is active
-        let mode: String = cat.conn
-            .query_row("PRAGMA journal_mode", [], |r| r.get(0)).unwrap();
+        let mode: String = cat
+            .conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(mode.to_lowercase(), "wal");
         // core tables exist
         let count: i64 = cat.conn.query_row(
@@ -127,13 +129,19 @@ mod tests {
                     modified_time INTEGER, accessed_time INTEGER, category TEXT NOT NULL,
                     container_chain TEXT, status TEXT NOT NULL, first_seen_at INTEGER NOT NULL,
                     last_seen_at INTEGER NOT NULL);",
-            ).unwrap();
+            )
+            .unwrap();
         }
         // Opening through Catalog must migrate it in, not fail.
         let cat = crate::catalog::Catalog::open(&db).unwrap();
-        let has_col: i64 = cat.conn.query_row(
-            "SELECT count(*) FROM pragma_table_info('files') WHERE name='original_path'",
-            [], |r| r.get(0)).unwrap();
+        let has_col: i64 = cat
+            .conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('files') WHERE name='original_path'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(has_col, 1);
         assert!(cat.integrity_ok().unwrap());
     }

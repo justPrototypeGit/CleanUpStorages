@@ -1,8 +1,13 @@
-use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OpenFlags};
+use std::path::{Path, PathBuf};
 
 /// Copy the live catalog to a timestamped snapshot, then keep only the newest `retention`.
-pub fn snapshot(catalog_path: &Path, backups_dir: &Path, retention: usize, now: i64) -> anyhow::Result<PathBuf> {
+pub fn snapshot(
+    catalog_path: &Path,
+    backups_dir: &Path,
+    retention: usize,
+    now: i64,
+) -> anyhow::Result<PathBuf> {
     std::fs::create_dir_all(backups_dir)?;
     let dest = backups_dir.join(format!("catalog-{now}.db"));
 
@@ -42,15 +47,20 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let db = tmp.path().join("catalog.db");
         let backups = tmp.path().join("catalog.backups");
-        { Catalog::open(&db).unwrap(); } // create a real DB
+        {
+            Catalog::open(&db).unwrap();
+        } // create a real DB
 
         let mut made = Vec::new();
         for t in 1..=3 {
             made.push(snapshot(&db, &backups, 2, t).unwrap());
         }
         // retention=2 keeps only the two newest
-        let kept: Vec<_> = std::fs::read_dir(&backups).unwrap()
-            .filter_map(|e| e.ok()).map(|e| e.path()).collect();
+        let kept: Vec<_> = std::fs::read_dir(&backups)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .collect();
         assert_eq!(kept.len(), 2);
         assert!(kept.iter().any(|p| p == made.last().unwrap()));
         assert!(!kept.iter().any(|p| p == &made[0])); // oldest pruned

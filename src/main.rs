@@ -1,5 +1,5 @@
-use cleanupstorages::commands;
 use clap::{Parser, Subcommand};
+use cleanupstorages::commands;
 
 /// Reliable catalog + deduplication tool for messy external drives.
 #[derive(Parser)]
@@ -116,12 +116,22 @@ fn main() -> anyhow::Result<()> {
     // spans run on separate tokio worker tasks and appear as their own top-level spans.
     let _span = tracing::info_span!("command", name).entered();
     match cli.command {
-        Command::Scan { path, force, readonly_fallback } => {
-            commands::cmd_scan(&path, force, readonly_fallback)
-        }
-        Command::Search { query, category, volume, status } => {
-            commands::cmd_search(&query, category.as_deref(), volume.as_deref(), status.as_deref())
-        }
+        Command::Scan {
+            path,
+            force,
+            readonly_fallback,
+        } => commands::cmd_scan(&path, force, readonly_fallback),
+        Command::Search {
+            query,
+            category,
+            volume,
+            status,
+        } => commands::cmd_search(
+            &query,
+            category.as_deref(),
+            volume.as_deref(),
+            status.as_deref(),
+        ),
         Command::Status => commands::cmd_status(),
         Command::Browse { no_open } => commands::cmd_browse(!no_open),
         Command::Duplicates => commands::cmd_duplicates(),
@@ -129,7 +139,10 @@ fn main() -> anyhow::Result<()> {
         Command::Purge { mount, all } => commands::cmd_purge(mount.as_deref(), all),
         Command::Repack { mount, entry_id } => commands::cmd_repack(&mount, entry_id),
         Command::Forget { mount } => commands::cmd_forget(&mount),
-        Command::Rename { mount, name, description } =>
-            commands::cmd_rename(&mount, name.as_deref(), description.as_deref()),
+        Command::Rename {
+            mount,
+            name,
+            description,
+        } => commands::cmd_rename(&mount, name.as_deref(), description.as_deref()),
     }
 }

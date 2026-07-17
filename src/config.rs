@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use directories::ProjectDirs;
+use std::path::PathBuf;
 
 /// Runtime configuration. Defaults live on the computer, never on scanned drives.
 pub struct Config {

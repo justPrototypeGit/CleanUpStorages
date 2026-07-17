@@ -1,10 +1,10 @@
+pub mod backup;
 pub mod models;
 pub mod schema;
 pub mod store;
-pub mod backup;
 
-use std::path::Path;
 use rusqlite::{Connection, OpenFlags};
+use std::path::Path;
 
 /// An open handle to the catalog database.
 pub struct Catalog {
@@ -35,7 +35,9 @@ impl Catalog {
 
     /// Run PRAGMA integrity_check; true if the DB reports "ok".
     pub fn integrity_ok(&self) -> anyhow::Result<bool> {
-        let result: String = self.conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        let result: String = self
+            .conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
         Ok(result == "ok")
     }
 }
@@ -51,9 +53,13 @@ mod tests {
         {
             let cat = Catalog::open(&db).unwrap();
             cat.upsert_volume(&crate::catalog::models::Volume {
-                volume_id: "vol-1".into(), label: "Test HDD".into(), identified_by: "marker".into(),
-                first_seen_at: 1, last_seen_at: 1,
-            }).unwrap();
+                volume_id: "vol-1".into(),
+                label: "Test HDD".into(),
+                identified_by: "marker".into(),
+                first_seen_at: 1,
+                last_seen_at: 1,
+            })
+            .unwrap();
         } // dropped: closes the write handle
 
         let ro = Catalog::open_readonly(&db).unwrap();
