@@ -23,7 +23,8 @@ verify its checksum, and run it — without a Rust toolchain.
 | Trigger | Push of a `v*` tag | Tags are the natural release record; provenance lives in git, not a text box. |
 | Human gate | **Draft** release the user publishes | The machine builds; the human reviews and publishes. A broken build never reaches users. Matches the loop's thesis. |
 | Release notes | **Hand-written `CHANGELOG.md`**, section per version | Strongest signal of care; cashes in the Conventional-Commits discipline. In this project "hand-written" = AI-drafted, human-approved — the loop working as designed. |
-| Targets | `windows-latest` (x86_64-msvc) + `macos-latest` (aarch64) | Exactly what CLAUDE.md commits to. Same platforms as CI. |
+| Targets | `windows-latest` (x86_64-msvc) + `macos-latest` (aarch64 / M-series) | Exactly what CLAUDE.md commits to. Same platforms as CI. macOS Intel is out — user confirmed M-series only. |
+| First release | **`v0.2.0`** | Marks "now with releases"; also serves as the first live test of the pipeline. Requires bumping `Cargo.toml` `0.1.0` → `0.2.0` before tagging (the version-match guard enforces the two agree). |
 | Signing | **Out of scope** | Notarization/code-signing needs paid Apple + Windows certs. Instead, the release notes tell users how to get past Gatekeeper/SmartScreen. |
 
 ## The release flow
@@ -90,9 +91,11 @@ is a contract, not cosmetic:
 
 - Version sections are `## [X.Y.Z] - YYYY-MM-DD`.
 - The extractor pulls everything from `## [VERSION]` up to (not including) the next `## [` line.
-- Seed it with `## [0.1.0]` documenting what exists today: catalog + search (BLAKE3, SQLite,
+- Seed it with **`## [0.2.0]`** — the first published release. Since nothing was ever released as
+  0.1.0, this section documents the whole tool to date: catalog + search (BLAKE3, SQLite,
   persistent/offline), deduplicate (visual review, quarantine-as-rename, purge), the six-page web UI,
-  and the safety model. An `## [Unreleased]` section sits on top for ongoing work.
+  the safety model, and — new in this release — automated Windows + macOS binaries. An
+  `## [Unreleased]` section sits on top for ongoing work.
 
 ### 3. Doc updates
 
@@ -142,8 +145,9 @@ CI-workflow changes can't be unit-tested, so verification is staged:
 
 ## Success criteria
 
-1. Pushing `v0.1.0` produces a **draft** GitHub Release with a Windows `.zip`, a macOS `.tar.gz`, and
-   a `SHA256SUMS`, notes = the `CHANGELOG.md` `[0.1.0]` section + the unsigned-binary footer.
+1. Pushing `v0.2.0` (after bumping `Cargo.toml` to `0.2.0`) produces a **draft** GitHub Release with a
+   Windows `.zip`, a macOS-arm64 `.tar.gz`, and a `SHA256SUMS`, notes = the `CHANGELOG.md` `[0.2.0]`
+   section + the unsigned-binary footer.
 2. A tag whose version ≠ `Cargo.toml`, or that has no `CHANGELOG.md` section, **fails and releases
    nothing**.
 3. Each archive carries `LICENSE` and `assets/LICENSES.md`, so the binary distribution is
