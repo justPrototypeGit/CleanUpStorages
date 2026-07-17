@@ -33,6 +33,17 @@ This is the whole point, so it comes before the feature list:
 
 ## Quick install
 
+**Download a binary** (no Rust needed) — grab the archive for your OS from the
+[Releases page](https://github.com/justPrototypeGit/CleanUpStorages/releases):
+
+- **Windows:** `cleanupstorages-<version>-x86_64-pc-windows-msvc.zip`
+- **macOS (Apple Silicon):** `cleanupstorages-<version>-aarch64-apple-darwin.tar.gz`
+
+Unzip it and run `cleanupstorages`. The binaries are unsigned, so your OS warns on first run — the
+release notes explain how to get past Gatekeeper / SmartScreen, and every release ships a
+`SHA256SUMS` file you can verify against (`sha256sum -c SHA256SUMS` on macOS, `Get-FileHash` in
+PowerShell).
+
 **From source** (needs [Rust](https://rustup.rs)):
 
 ```bash

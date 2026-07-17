@@ -1,0 +1,175 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+# Read-only by default; only the release job may write.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  guard:
+    name: guard (version, changelog, tests)
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.derive.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive version and check it matches Cargo.toml
+        id: derive
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          cargo_version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "([^"]+)"/\1/')"
+          echo "tag=$tag version=$version cargo=$cargo_version"
+          if [ "$version" != "$cargo_version" ]; then
+            echo "::error::tag $tag implies version '$version' but Cargo.toml is '$cargo_version'"
+            exit 1
+          fi
+
+      - name: Check CHANGELOG has a section for this version
+        shell: bash
+        run: |
+          version="${{ steps.derive.outputs.version }}"
+          if ! grep -qE "^## \[${version}\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [${version}]' section"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests
+        run: cargo test --release --locked
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: guard
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          version="${{ needs.guard.outputs.version }}"
+          name="cleanupstorages-${version}-${{ matrix.target }}"
+          mkdir -p "$name/assets"
+          cp target/release/cleanupstorages.exe "$name/"
+          cp README.md LICENSE "$name/"
+          cp assets/LICENSES.md "$name/assets/"
+          7z a "${name}.zip" "$name" >/dev/null
+
+      - name: Package (macOS)
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          version="${{ needs.guard.outputs.version }}"
+          name="cleanupstorages-${version}-${{ matrix.target }}"
+          mkdir -p "$name/assets"
+          cp target/release/cleanupstorages "$name/"
+          cp README.md LICENSE "$name/"
+          cp assets/LICENSES.md "$name/assets/"
+          tar czf "${name}.tar.gz" "$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            *.zip
+            *.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: draft release
+    needs: [guard, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        shell: bash
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          echo "----- SHA256SUMS -----"
+          cat SHA256SUMS
+
+      - name: Build release notes from CHANGELOG + unsigned-binary footer
+        shell: bash
+        run: |
+          version="${{ needs.guard.outputs.version }}"
+          # index()/substr() instead of a dynamic regex: escaping [ and ] inside an awk regex string
+          # is implementation-dependent (gawk warns and mis-parses "\[" as a bracket expression,
+          # yielding EMPTY output). Literal string matching is robust across gawk/mawk.
+          awk -v ver="$version" '
+            index($0, "## [" ver "]") == 1 {grab=1; next}
+            grab && (index($0, "## [") == 1 || substr($0,1,1) == "[") {grab=0}
+            grab {print}
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::error::extracted release notes are empty for $version"
+            exit 1
+          fi
+          cat >> notes.md <<'FOOTER'
+
+          ---
+
+          ### Downloads are unsigned
+
+          These binaries are not code-signed, so your OS warns on first run.
+
+          - **macOS (Apple Silicon):** after extracting, clear the quarantine flag —
+            `xattr -d com.apple.quarantine ./cleanupstorages` — or right-click the binary → Open, then confirm.
+          - **Windows:** if SmartScreen warns, click **More info** → **Run anyway**.
+          - **Verify your download** against `SHA256SUMS`:
+            `sha256sum -c SHA256SUMS` (macOS) or `Get-FileHash <file>` (PowerShell).
+          FOOTER
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          version="${{ needs.guard.outputs.version }}"
+          tag="${GITHUB_REF_NAME}"
+          # Idempotent re-runs: if a *draft* for this tag already exists (e.g. a previous run failed
+          # part-way), delete it and recreate cleanly. A *published* release is never touched — the
+          # create below will then fail loudly, which is the correct behaviour (don't silently
+          # replace something users may already have downloaded).
+          if [ "$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null)" = "true" ]; then
+            echo "removing existing draft for $tag before recreating"
+            gh release delete "$tag" --yes
+          fi
+          gh release create "$tag" \
+            --draft \
+            --title "v${version}" \
+            --notes-file notes.md \
+            dist/*.zip dist/*.tar.gz dist/SHA256SUMS

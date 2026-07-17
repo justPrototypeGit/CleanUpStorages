@@ -73,3 +73,18 @@ proposing a change. See [docs/ai-sdlc.md](docs/ai-sdlc.md) for how that loop wor
 
 If you're proposing something substantial, open an issue first — a short spec beats a large
 surprise PR.
+
+## Cutting a release
+
+Releases are built by `.github/workflows/release.yml` when a `v*` tag is pushed. To cut one:
+
+1. Bump `version` in `Cargo.toml`, and run `cargo build` so `Cargo.lock` updates.
+2. Add a `## [X.Y.Z] - YYYY-MM-DD` section to `CHANGELOG.md` describing the release. The workflow
+   uses this section verbatim as the release notes, and **refuses to release if it's missing**.
+3. Commit both, and merge to `main`.
+4. Tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+5. The workflow builds both binaries and opens a **draft** release. Review it on the Releases page —
+   check both archives and `SHA256SUMS` are attached and the notes read well — then click **Publish**.
+
+The `guard` job fails fast if the tag doesn't match `Cargo.toml`, the changelog section is missing, or
+tests don't pass — so a bad tag never produces a release.
