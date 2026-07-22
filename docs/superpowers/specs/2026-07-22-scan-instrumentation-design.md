@@ -114,7 +114,7 @@ CREATE TABLE IF NOT EXISTS scan_runs (
     finished_at    INTEGER,
     wall_ms        INTEGER,
     forced         INTEGER NOT NULL,
-    status         TEXT NOT NULL,          -- running | completed | failed | cancelled
+    status         TEXT NOT NULL,          -- running | completed | failed | cancelled*
     error_message  TEXT,
     files_seen     INTEGER NOT NULL DEFAULT 0,
     hashed         INTEGER NOT NULL DEFAULT 0,
@@ -132,6 +132,10 @@ CREATE TABLE IF NOT EXISTS scan_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_scan_runs_started ON scan_runs(started_at DESC);
 ```
+
+`*cancelled` is reserved for #5 (stop a running scan) and is unreachable today — nothing can cancel a
+scan yet. It is in the enum now so #5 does not need a migration; until then a killed scan is a
+`running` row that never finished.
 
 `size_histogram` is JSON rather than seven columns because it is display data, not something we
 query or aggregate over; keeping it as one column also lets the bucket list change without a
@@ -161,7 +165,7 @@ a new `GET /api/scan-runs?limit=`. Read-only; no new write endpoint, no CSRF sur
 | Risk | Mitigation |
 | --- | --- |
 | Timing overhead distorts what it measures | Two `Instant::now()` + one relaxed `fetch_add` per phase per file, against ms-scale I/O. A test asserts a scan of a synthetic tree stays within tolerance of the same scan uninstrumented. |
-| Phases silently overlap, so percentages mislead | Phases are disjoint by construction; a test asserts sum-of-phases ≤ wall-clock and ≥ 90% of it on a sequential synthetic scan. |
+| Phases silently overlap, so percentages mislead | Phases are disjoint by construction; a test asserts sum-of-phases ≤ wall-clock, and that each phase is non-zero on a tree that exercises it. **No lower bound is asserted** — untimed glue (loop overhead, path/category string work) legitimately sits outside every phase, and a tight lower bound on a shared CI runner is a flaky-test generator. The ratio is reported, not enforced. |
 | `scan_runs` growth | One row per scan, not per file. Even daily scans for years is trivial. No retention policy needed; revisit if that ever changes. |
 | A benchmark measures the wrong thing (warm cache, rescan path, Defender) | `docs/benchmarking-scans.md` documents the protocol and the three traps. |
 
