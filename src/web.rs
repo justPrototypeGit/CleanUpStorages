@@ -195,6 +195,10 @@ struct VolumeDto {
 #[derive(Serialize)]
 struct StatsDto {
     duplicate_groups: i64,
+    /// Loose-only — what quarantine can actually reclaim by renaming.
+    reclaimable_bytes: i64,
+    /// Duplicated bytes inside archives. Reported separately; needs a repack, not a quarantine.
+    archive_locked_bytes: i64,
     volumes: Vec<VolumeDto>,
 }
 
@@ -400,10 +404,15 @@ async fn api_stats(
     State(state): State<AppState>,
 ) -> Result<Json<StatsDto>, (axum::http::StatusCode, String)> {
     let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
-    let duplicate_groups = cat.duplicate_group_count().map_err(err500)?;
+    // Floor-free: the Overview headline must never move because of a review-list filter.
+    let totals = cat
+        .duplicate_totals(crate::catalog::dedup::DEFAULT_MIN_SIZE)
+        .map_err(err500)?;
     let volumes = volume_dtos(&cat).map_err(err500)?;
     Ok(Json(StatsDto {
-        duplicate_groups,
+        duplicate_groups: totals.groups_all,
+        reclaimable_bytes: totals.reclaimable_all_bytes,
+        archive_locked_bytes: totals.archive_locked_bytes,
         volumes,
     }))
 }
@@ -428,7 +437,7 @@ async fn api_drives(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<DriveDto>>, (StatusCode, String)> {
     let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
-    let reclaim = cat.reclaimable_bytes_by_volume().map_err(err500)?;
+    let reclaim = cat.reclaimable_by_volume().map_err(err500)?;
     let mounts = state.mounts.snapshot();
     let mut out = Vec::new();
     for (volume_id, label, active_files, active_bytes) in cat.volume_stats().map_err(err500)? {
@@ -513,73 +522,134 @@ struct MemberDto {
 
 #[derive(Serialize)]
 struct GroupDto {
-    hash: String,
+    content_hash: String,
+    copies: i64,
+    size_bytes: i64,
+    reclaimable_bytes: i64,
     suggested_keep_id: i64,
     members: Vec<MemberDto>,
 }
 
-/// Earliest-created (fallback earliest-modified, fallback smallest id) — keep the original.
-fn suggested_keep(members: &[FileRecord]) -> i64 {
-    members
-        .iter()
-        .min_by_key(|f| {
-            (
-                f.created_time.unwrap_or(i64::MAX),
-                f.modified_time.unwrap_or(i64::MAX),
-                f.id,
-            )
-        })
-        .map(|f| f.id)
-        .unwrap_or(0)
+#[derive(Serialize)]
+struct TotalsDto {
+    groups: i64,
+    reclaimable_bytes: i64,
+    groups_all: i64,
+    reclaimable_all_bytes: i64,
+    archive_locked_bytes: i64,
 }
 
+#[derive(Serialize)]
+struct CursorDto {
+    reclaimable_bytes: i64,
+    content_hash: String,
+}
+
+#[derive(Serialize)]
+struct DuplicatesDto {
+    totals: TotalsDto,
+    groups: Vec<GroupDto>,
+    next: Option<CursorDto>,
+}
+
+#[derive(Deserialize, Default)]
+struct DuplicatesParams {
+    min_size: Option<i64>,
+    limit: Option<usize>,
+    after_reclaimable: Option<i64>,
+    after_hash: Option<String>,
+}
+
+/// One ranked page of duplicate groups plus the honest totals. Bounded by design: a page costs two
+/// queries regardless of catalogue size.
 async fn api_duplicates(
     State(state): State<AppState>,
-) -> Result<Json<Vec<GroupDto>>, (axum::http::StatusCode, String)> {
+    Query(p): Query<DuplicatesParams>,
+) -> Result<Json<DuplicatesDto>, (axum::http::StatusCode, String)> {
+    use crate::catalog::dedup::{DuplicateCursor, DEFAULT_MIN_SIZE};
     let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
+    let min_size = p.min_size.unwrap_or(DEFAULT_MIN_SIZE);
+    let limit = p.limit.unwrap_or(50).clamp(1, 200);
+    let after = match (p.after_reclaimable, p.after_hash) {
+        (Some(reclaimable_bytes), Some(content_hash)) => Some(DuplicateCursor {
+            reclaimable_bytes,
+            content_hash,
+        }),
+        _ => None,
+    };
+
+    let t = cat.duplicate_totals(min_size).map_err(err500)?;
+    let groups = cat
+        .duplicate_groups_ranked(min_size, limit, after.as_ref())
+        .map_err(err500)?;
+    let hashes: Vec<String> = groups.iter().map(|g| g.content_hash.clone()).collect();
+    let mut members = cat.duplicate_members_for(&hashes).map_err(err500)?;
+
     let labels: std::collections::HashMap<String, String> = cat
         .volume_stats()
         .map_err(err500)?
         .into_iter()
         .map(|(id, label, _, _)| (id, label))
         .collect();
-    let groups = cat.duplicate_groups().map_err(err500)?;
     let mounts = state.mounts.snapshot();
-    let mut out = Vec::new();
-    for group in groups {
-        // Capture the shared content hash before consuming the group's rows.
-        let hash = group
-            .first()
-            .map(|f| f.content_hash.clone())
-            .unwrap_or_default();
-        let keep = suggested_keep(&group);
-        let members = group
-            .into_iter()
-            .map(|f| {
-                let mounted = mounts.contains_key(&f.volume_id);
-                MemberDto {
-                    id: f.id,
-                    location: f.display_location(),
-                    filename: f.filename.clone(),
-                    volume_label: labels.get(&f.volume_id).cloned().unwrap_or_default(),
-                    volume_id: f.volume_id,
-                    size_bytes: f.size_bytes,
-                    category: f.category.as_str().to_string(),
-                    created_time: f.created_time,
-                    modified_time: f.modified_time,
-                    status: f.status.as_str().to_string(),
-                    is_loose: f.container_chain.is_none(),
-                    mounted,
-                }
-            })
-            .collect::<Vec<_>>();
-        out.push(GroupDto {
-            hash,
-            suggested_keep_id: keep,
-            members,
-        });
-    }
-    Ok(Json(out))
+
+    let next = groups.last().map(|g| CursorDto {
+        reclaimable_bytes: g.reclaimable_bytes,
+        content_hash: g.content_hash.clone(),
+    });
+
+    let out_groups = groups
+        .into_iter()
+        .map(|g| {
+            let ms = members.remove(&g.content_hash).unwrap_or_default();
+            let suggested_keep_id = ms
+                .iter()
+                .find(|m| m.is_suggested_keep)
+                .map(|m| m.record.id)
+                .unwrap_or(0);
+            let members = ms
+                .into_iter()
+                .map(|m| {
+                    let f = m.record;
+                    let mounted = mounts.contains_key(&f.volume_id);
+                    MemberDto {
+                        id: f.id,
+                        location: f.display_location(),
+                        filename: f.filename.clone(),
+                        volume_label: labels.get(&f.volume_id).cloned().unwrap_or_default(),
+                        volume_id: f.volume_id,
+                        size_bytes: f.size_bytes,
+                        category: f.category.as_str().to_string(),
+                        created_time: f.created_time,
+                        modified_time: f.modified_time,
+                        status: f.status.as_str().to_string(),
+                        is_loose: f.container_chain.is_none(),
+                        mounted,
+                    }
+                })
+                .collect();
+            GroupDto {
+                content_hash: g.content_hash,
+                copies: g.copies,
+                size_bytes: g.size_bytes,
+                reclaimable_bytes: g.reclaimable_bytes,
+                suggested_keep_id,
+                members,
+            }
+        })
+        .collect();
+
+    Ok(Json(DuplicatesDto {
+        totals: TotalsDto {
+            groups: t.groups,
+            reclaimable_bytes: t.reclaimable_bytes,
+            groups_all: t.groups_all,
+            reclaimable_all_bytes: t.reclaimable_all_bytes,
+            archive_locked_bytes: t.archive_locked_bytes,
+        },
+        groups: out_groups,
+        next,
+    }))
 }
 
 const PREVIEW_MAX_DIM: u32 = 320;
@@ -1369,8 +1439,9 @@ mod tests {
     #[tokio::test]
     async fn api_duplicates_groups_with_suggested_keep_and_mounted() {
         let (_t, _db, state) = seed_dupes();
-        let v = get_json_state(state, "/api/duplicates").await;
-        let arr = v.as_array().unwrap();
+        // The fixture's files are 10 B, so the 1 MiB default floor would (correctly) hide them.
+        let v = get_json_state(state, "/api/duplicates?min_size=0").await;
+        let arr = v["groups"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["members"].as_array().unwrap().len(), 2);
         // earliest created_time (1000) is a.jpg -> its id is the suggested keep
@@ -1381,6 +1452,42 @@ mod tests {
         assert_eq!(a["volume_label"], "Photos HDD");
         assert_eq!(a["mounted"], true);
         assert_eq!(a["is_loose"], true);
+        // one redundant 10 B copy
+        assert_eq!(arr[0]["reclaimable_bytes"].as_i64().unwrap(), 10);
+    }
+
+    #[tokio::test]
+    async fn api_duplicates_is_ranked_bounded_and_reports_totals() {
+        let (_t, db, _state) = seed_dupes();
+        let v = get_json(&db, "/api/duplicates?min_size=0&limit=1").await;
+        assert!(v["totals"]["reclaimable_all_bytes"].as_i64().unwrap() > 0);
+        let groups = v["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "limit must bound the page");
+        assert!(groups[0]["suggested_keep_id"].as_i64().unwrap() > 0);
+        assert!(!groups[0]["members"].as_array().unwrap().is_empty());
+        assert!(
+            v["next"]["content_hash"].is_string(),
+            "a cursor for the next page"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_duplicates_floor_filters_the_list_but_not_the_headline() {
+        let (_t, db, _state) = seed_dupes();
+        let all = get_json(&db, "/api/duplicates?min_size=0").await;
+        let floored = get_json(&db, "/api/duplicates?min_size=999999999").await;
+        assert!(
+            floored["groups"].as_array().unwrap().is_empty(),
+            "the floor empties the list"
+        );
+        assert_eq!(
+            floored["totals"]["reclaimable_all_bytes"], all["totals"]["reclaimable_all_bytes"],
+            "the headline must not move when the floor changes"
+        );
+        assert_eq!(
+            floored["totals"]["groups_all"], all["totals"]["groups_all"],
+            "the headline must not move when the floor changes"
+        );
     }
 
     fn tiny_png() -> Vec<u8> {

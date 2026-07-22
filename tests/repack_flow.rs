@@ -51,19 +51,20 @@ fn scan_then_repack_removes_archived_duplicate() {
         .status
         .success());
 
-    // find the entry id via `duplicates` (dup.txt appears loose and inside bundle.zip)
+    // Find the archived entry's id via `search`. `duplicates` deliberately lists loose files only
+    // (an archived copy is not reclaimable by quarantine), so search is the way to reach one.
     let mut c = bin();
     env(&mut c);
-    let dups = String::from_utf8(c.arg("duplicates").output().unwrap().stdout).unwrap();
-    // the archived member line shows "bundle.zip › dup.txt"
-    let id: i64 = dups
+    let hits = String::from_utf8(c.args(["search", "dup.txt"]).output().unwrap().stdout).unwrap();
+    // the archived hit shows "bundle.zip › dup.txt"
+    let id: i64 = hits
         .lines()
         .find(|l| l.contains("bundle.zip › dup.txt"))
         .and_then(|l| {
             l.split_whitespace()
                 .find_map(|t| t.trim_start_matches('#').parse().ok())
         })
-        .expect("archived dup.txt id in duplicates output");
+        .expect("archived dup.txt id in search output");
 
     let mut c = bin();
     env(&mut c);

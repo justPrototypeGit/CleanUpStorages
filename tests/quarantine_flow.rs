@@ -36,7 +36,8 @@ fn scan_quarantine_purge_end_to_end() {
     // duplicates lists the pair (find a file id to quarantine)
     let mut c = bin();
     env(&mut c);
-    let dups = c.arg("duplicates").output().unwrap();
+    // --min-size 0: the fixture's files are a few bytes, well under the 1 MiB review floor.
+    let dups = c.args(["duplicates", "--min-size", "0"]).output().unwrap();
     let dtext = String::from_utf8_lossy(&dups.stdout);
     assert!(
         dtext.contains("a.txt") && dtext.contains("b.txt"),
