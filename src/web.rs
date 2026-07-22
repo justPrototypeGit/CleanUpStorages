@@ -547,7 +547,10 @@ struct CursorDto {
 
 #[derive(Serialize)]
 struct DuplicatesDto {
-    totals: TotalsDto,
+    /// Only on the first page of a filter. The totals are three full aggregate passes (~4 s on a
+    /// 1.8M-row catalogue) and do not change while paging, so continuation pages omit them and the
+    /// client keeps the ones it already has.
+    totals: Option<TotalsDto>,
     groups: Vec<GroupDto>,
     next: Option<CursorDto>,
 }
@@ -578,7 +581,10 @@ async fn api_duplicates(
         _ => None,
     };
 
-    let t = cat.duplicate_totals(min_size).map_err(err500)?;
+    let totals = match after {
+        Some(_) => None,
+        None => Some(cat.duplicate_totals(min_size).map_err(err500)?),
+    };
     let groups = cat
         .duplicate_groups_ranked(min_size, limit, after.as_ref())
         .map_err(err500)?;
@@ -640,13 +646,13 @@ async fn api_duplicates(
         .collect();
 
     Ok(Json(DuplicatesDto {
-        totals: TotalsDto {
+        totals: totals.map(|t| TotalsDto {
             groups: t.groups,
             reclaimable_bytes: t.reclaimable_bytes,
             groups_all: t.groups_all,
             reclaimable_all_bytes: t.reclaimable_all_bytes,
             archive_locked_bytes: t.archive_locked_bytes,
-        },
+        }),
         groups: out_groups,
         next,
     }))
@@ -1468,6 +1474,24 @@ mod tests {
         assert!(
             v["next"]["content_hash"].is_string(),
             "a cursor for the next page"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_duplicates_omits_totals_on_continuation_pages() {
+        let (_t, db, _state) = seed_dupes();
+        let first = get_json(&db, "/api/duplicates?min_size=0").await;
+        assert!(first["totals"].is_object(), "first page carries the totals");
+        let n = &first["next"];
+        let uri = format!(
+            "/api/duplicates?min_size=0&after_reclaimable={}&after_hash={}",
+            n["reclaimable_bytes"].as_i64().unwrap(),
+            n["content_hash"].as_str().unwrap()
+        );
+        let page2 = get_json(&db, &uri).await;
+        assert!(
+            page2["totals"].is_null(),
+            "continuation pages must not re-pay for three full aggregate passes"
         );
     }
 

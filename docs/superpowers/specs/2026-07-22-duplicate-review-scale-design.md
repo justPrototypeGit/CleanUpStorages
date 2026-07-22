@@ -107,6 +107,8 @@ attribution is genuinely required.
   group rows where `container_chain IS NOT NULL` by `content_hash`, keep groups with `COUNT(*) > 1`,
   and sum `(copies - 1) × size_bytes`. A hash can appear both loose and archived, so the two figures
   are not complements and must never be presented as though they sum to a single "total".
+  Measured: **1.23 TB**. An earlier draft of this spec said 2.2 TB, derived as "3.28 TB total minus
+  1.06 TB loose" — i.e. by treating them as complements, the exact mistake this paragraph forbids.
 
 ### HTTP
 
@@ -126,7 +128,7 @@ costs two queries regardless of size. Default `limit` 50.
 
 Keeps the existing compare-and-confirm cards — that flow is good — and gains:
 
-- a header: **"4,433 groups · 1.05 TB reclaimable · 2.2 TB locked in archives"**
+- a header: **"4,433 groups · 1.05 TB reclaimable · 1.23 TB locked in archives"**
 - a **size-floor control** (default 1 MiB) that always states what it is hiding:
   *"57,383 groups (5.8 GB) hidden by the 1 MB filter"* — one click to lower it. Never silent.
 - groups arrive **ranked by reclaimable**, walked via cursor paging; the next page loads as the user
@@ -145,7 +147,7 @@ default floor, and a `--limit` (default 20), printing reclaimable per group and 
 | **Paging skips groups** as quarantining re-ranks the list — the user believes they reviewed everything | Cursor paging (never offset), plus a test that pages while mutating the underlying data |
 | **Keep-selection changes** which copy survives (NULL ordering differs between Rust and SQLite) | The view pins the order with `IFNULL(..., i64::MAX)`; a test asserts the chosen id for NULL timestamps and for exact ties |
 | **5.8 GB hidden** by the default floor (3.7 GB of it real 100 KB–1 MB photos/docs) | The hidden count and bytes are always displayed with a one-click override; the floor never touches the headline |
-| **2.2 TB archive-locked duplicates become invisible** and forgotten | Reported as its own figure everywhere the headline appears |
+| **1.23 TB archive-locked duplicates become invisible** and forgotten | Reported as its own figure everywhere the headline appears |
 | Window function cost at 9M rows | Totals use a plain aggregate over `idx_files_hash`; measure the ranked query before shipping |
 
 ## Non-goals
@@ -159,7 +161,7 @@ default floor, and a `--limit` (default 20), printing reclaimable per group and 
 
 1. `/api/duplicates` is bounded: a page is two queries and a small payload, independent of catalogue size.
 2. Drives/Overview no longer materialise duplicate groups in memory; reclaimable comes from a SQL aggregate.
-3. Reclaimable reports **1.06 TB** (loose-only) on the real catalogue, with 2.2 TB shown separately as archive-locked.
+3. Reclaimable reports **1.06 TB** (loose-only) on the real catalogue, with 1.23 TB shown separately as archive-locked.
 4. Default review list shows **4,433** groups ranked biggest-first, and states that 57,383 groups (5.8 GB) are hidden.
 5. Keep-selection is defined once, in `dup_loose`, and is covered by tests for NULL timestamps and ties.
 6. Paging is stable while groups are quarantined — no group silently skipped.

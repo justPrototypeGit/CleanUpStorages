@@ -1103,7 +1103,7 @@ con.close()
 PY
 ```
 
-Expected, matching the spec's success criteria: floor 0 → **61,816 groups / 1.060 TB**; floor 1 MiB → **4,433 groups / ~1.054 TB**; archive-locked ≈ **2.2 TB**. Small drift is fine if the catalog has been scanned further since; the *shape* (loose ≈ 1 TB, not 3.28 TB; 1 MiB floor cutting ~57k groups) must hold.
+Expected, matching the spec's success criteria: floor 0 → **61,816 groups / 1.060 TB**; floor 1 MiB → **4,433 groups / ~1.054 TB**; archive-locked ≈ **1.23 TB**. Small drift is fine if the catalog has been scanned further since; the *shape* (loose ≈ 1 TB, not 3.28 TB; 1 MiB floor cutting ~57k groups) must hold.
 
 - [ ] **Step 2: Record the outcome**
 
@@ -1113,5 +1113,5 @@ If the numbers match, note them in the task report. If they do not, stop and rep
 
 ## Notes for later (not this plan)
 
-- Archive-locked duplicates (~2.2 TB) are only *reported*; reclaiming them needs repack-based flows.
+- Archive-locked duplicates (~1.23 TB) are only *reported*; reclaiming them needs repack-based flows.
 - The ranked query is bounded but unmeasured at 9M rows — worth timing once the catalog grows (relates to the scan-performance epic).
