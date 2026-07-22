@@ -113,8 +113,12 @@ pub fn cmd_search(
             Some(chain) => format!("{} › {}", f.relative_path, chain),
             None => f.relative_path.clone(),
         };
+        // The id is printed because it is the handle every acting verb takes (`quarantine`,
+        // `repack`). `duplicates` only lists loose files, so this is the way to find an
+        // archived entry's id.
         println!(
-            "{}  [{}]  {}  ({} bytes){}",
+            "#{}  {}  [{}]  {}  ({} bytes){}",
+            f.id,
             location,
             f.volume_id,
             f.category.as_str(),
@@ -128,8 +132,16 @@ pub fn cmd_search(
 
 pub fn cmd_status() -> anyhow::Result<()> {
     let (_cfg, cat) = open_catalog()?;
-    let groups = cat.duplicate_group_count()?;
-    println!("Duplicate groups (same content hash): {groups}");
+    let totals = cat.duplicate_totals(0)?;
+    println!(
+        "Duplicate groups (loose, same content hash): {}",
+        totals.groups_all
+    );
+    println!(
+        "Reclaimable by quarantine: {} MiB (+{} MiB locked inside archives — needs repack)",
+        totals.reclaimable_all_bytes / (1024 * 1024),
+        totals.archive_locked_bytes / (1024 * 1024)
+    );
     println!("Per-volume (active files):");
     for (id, label, count, bytes) in cat.volume_stats()? {
         let recoverable = cat.recoverable_bytes(&id)?;
@@ -142,31 +154,45 @@ pub fn cmd_status() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn cmd_duplicates() -> anyhow::Result<()> {
+/// The biggest-first duplicate worklist. Bounded and floored: printing all 250k+ groups of a real
+/// catalogue is not a review, it is a wall of text.
+pub fn cmd_duplicates(min_size: i64, limit: usize) -> anyhow::Result<()> {
     let (_cfg, cat) = open_catalog()?;
-    let groups = cat.duplicate_groups()?;
+    let totals = cat.duplicate_totals(min_size)?;
+    let groups = cat.duplicate_groups_ranked(min_size, limit, None)?;
     if groups.is_empty() {
-        println!("No duplicate groups.");
-        return Ok(());
+        println!("No duplicate groups at or above {min_size} bytes.");
     }
-    for group in &groups {
+    let hashes: Vec<String> = groups.iter().map(|g| g.content_hash.clone()).collect();
+    let members = cat.duplicate_members_for(&hashes)?;
+    for g in &groups {
         println!(
-            "hash {} — {} copies:",
-            &group[0].content_hash[..16.min(group[0].content_hash.len())],
-            group.len()
+            "{} bytes reclaimable — {} copies × {} bytes  (hash {})",
+            g.reclaimable_bytes,
+            g.copies,
+            g.size_bytes,
+            &g.content_hash[..16.min(g.content_hash.len())]
         );
-        for f in group {
-            let loc = f.display_location();
+        for m in members.get(&g.content_hash).into_iter().flatten() {
             println!(
-                "  #{}  {}  [{}]  {} bytes  {}",
-                f.id,
-                loc,
-                f.volume_id,
-                f.size_bytes,
-                f.status.as_str()
+                "  {} #{}  {}  [{}]",
+                if m.is_suggested_keep { "KEEP" } else { "    " },
+                m.record.id,
+                m.record.display_location(),
+                m.record.volume_id
             );
         }
     }
+    println!(
+        "\nShowing top {} of {} groups at/above {} bytes. Reclaimable: {} bytes shown, \
+         {} bytes total (floor-free). Archive-locked: {} bytes (needs repack).",
+        groups.len(),
+        totals.groups,
+        min_size,
+        totals.reclaimable_bytes,
+        totals.reclaimable_all_bytes,
+        totals.archive_locked_bytes
+    );
     Ok(())
 }
 

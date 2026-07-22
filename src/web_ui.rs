@@ -148,6 +148,9 @@ th{color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase;lett
 .card.rvcard{padding:0;overflow:hidden;display:flex;flex-direction:column;}
 .rvthumb{position:relative;background:var(--line);flex:1 1 auto;min-height:150px;}
 .rvthumb img,.rvthumb .noimg{width:100%;height:100%;object-fit:cover;border-radius:0;display:block;margin:0;}
+/* The rule above forces display:block, which kills .noimg's centering and drops its text into the
+   top-left corner, under the "Keep this" pill. Restore the centering (must come after). */
+.rvthumb .noimg{display:flex;align-items:center;justify-content:center;}
 .rvbody{padding:15px 16px 16px;flex:none;}
 .rvpath{font-family:var(--font-mono);font-size:12.5px;color:var(--fg);word-break:break-all;margin:0 0 12px;line-height:1.45;}
 .rvcard.keep .rvpath{color:var(--accent-text);}
@@ -685,9 +688,21 @@ init();"##;
 pub fn review_page(csrf: &str) -> String {
     let main = r##"
 <div class="rv-page">
-  <div class="row" style="justify-content:space-between;align-items:baseline;margin-bottom:20px">
+  <div class="row" style="justify-content:space-between;align-items:baseline;margin-bottom:6px">
     <h1 class="page-h" style="margin:0">Review duplicates</h1><span class="mut" id="progress"></span></div>
+  <div class="row" style="justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:18px">
+    <div class="mut" id="totals" style="font-size:13px;line-height:1.5"></div>
+    <label class="row" style="font-size:13px;color:var(--mut);gap:8px;white-space:nowrap">Only show files ≥
+      <select id="minsize">
+        <option value="0">any size</option>
+        <option value="65536">64 KB</option>
+        <option value="1048576" selected>1 MB</option>
+        <option value="10485760">10 MB</option>
+        <option value="104857600">100 MB</option>
+      </select></label>
+  </div>
   <div id="group"></div>
+  <div class="mut" id="upnext" style="font-size:12px;margin-top:14px;text-align:center"></div>
   <div class="rvbar">
     <button class="linkbtn" id="skip" style="font-size:13px">Skip this group</button>
     <button class="btn btn-primary" id="confirm">Keep selected, quarantine the rest</button>
@@ -696,15 +711,43 @@ pub fn review_page(csrf: &str) -> String {
   <div class="mut" id="msg" style="margin-top:10px;min-height:1.4em;text-align:center"></div>
 </div>"##;
     let script = r##"
-let groups=[],idx=0,keepId=null;
+let groups=[],idx=0,keepId=null,totals=null,next=null,minSize=1048576,exhausted=false;
+const fmtN=n=>Number(n).toLocaleString();
+// One ranked page at a time: the catalogue can hold hundreds of thousands of groups.
+async function loadPage(reset){
+  if(reset){ groups=[]; idx=0; next=null; exhausted=false; }
+  const p=new URLSearchParams({min_size:String(minSize),limit:"50"});
+  if(next){ p.set("after_reclaimable",String(next.reclaimable_bytes)); p.set("after_hash",next.content_hash); }
+  const r=await apiGet("/api/duplicates?"+p.toString());
+  if(r.totals) totals=r.totals;   // continuation pages omit them; keep what we have
+  if(!r.groups.length) exhausted=true;
+  groups=groups.concat(r.groups); next=r.next;
+  paintTotals();
+}
+// The size filter must never look like it changed how much space you can reclaim, so the headline
+// is floor-free and what the filter hides is always spelled out.
+function paintTotals(){
+  if(!totals)return;
+  const hiddenGroups=totals.groups_all-totals.groups, hiddenBytes=totals.reclaimable_all_bytes-totals.reclaimable_bytes;
+  let s=`<b>${fmtN(totals.groups)}</b> groups · <b>${fmtSize(totals.reclaimable_bytes)}</b> reclaimable`;
+  if(totals.archive_locked_bytes>0) s+=` · ${fmtSize(totals.archive_locked_bytes)} locked inside archives (needs repack)`;
+  if(hiddenGroups>0) s+=`<br><span style="opacity:.75">${fmtN(hiddenGroups)} smaller groups (${fmtSize(hiddenBytes)}) hidden by this filter — lower it to review them.</span>`;
+  $("#totals").innerHTML=s;
+}
 async function load(){
-  try{ groups=await apiGet("/api/duplicates"); }catch(e){ $("#msg").textContent="Load error: "+e; return; }
-  idx=0; render();
+  try{ await loadPage(true); }catch(e){ $("#msg").textContent="Load error: "+e; return; }
+  render();
 }
 function render(){
-  if(idx>=groups.length){ $("#progress").textContent=""; $("#group").innerHTML='<div class="empty"><h2 style="margin:0 0 6px">All duplicate groups reviewed 🎉</h2><p class="mut">Nothing left to compare.</p></div>'; $("#confirm").style.display="none"; $("#skip").style.display="none"; return; }
+  if(idx>=groups.length){
+    if(next&&!exhausted){ loadPage(false).then(render).catch(e=>{$("#msg").textContent="Load error: "+e;}); return; }
+    $("#progress").textContent=""; $("#upnext").textContent="";
+    $("#group").innerHTML='<div class="empty"><h2 style="margin:0 0 6px">All duplicate groups reviewed 🎉</h2><p class="mut">Nothing left to compare at this size filter.</p></div>';
+    $("#confirm").style.display="none"; $("#skip").style.display="none"; return;
+  }
+  $("#confirm").style.display=""; $("#skip").style.display="";
   const g=groups[idx]; keepId=g.suggested_keep_id;
-  $("#progress").textContent=`Group ${idx+1} of ${groups.length} · ${g.members.length} copies`;
+  $("#progress").textContent=`Group ${idx+1} of ${fmtN(totals?totals.groups:groups.length)} · ${g.members.length} copies · ${fmtSize(g.reclaimable_bytes)} reclaimable`;
   $("#group").innerHTML=`<div class="cards">${g.members.map(m=>card(m)).join("")}</div>`;
   for(const el of document.querySelectorAll(".cards .card")) el.addEventListener("click",()=>{ keepId=Number(el.dataset.id); paint(); });
   paint();
@@ -717,6 +760,8 @@ function render(){
       $("#msg").textContent=`Removed '${j.removed_entry}' from its archive (${j.retained_entries} kept). Original saved in _ToDelete.`; idx++; render();
     }catch(e){ $("#msg").textContent="Repack error: "+e; b.disabled=false; }
   });
+  const rest=groups.slice(idx+1,idx+4);
+  $("#upnext").textContent=rest.length?"Up next: "+rest.map(x=>`${fmtSize(x.reclaimable_bytes)} (${x.copies} copies)`).join(" · "):"";
 }
 function card(m){
   const img=(m.category==="photo"&&m.mounted)?`<img class="thumb" loading="lazy" src="/api/preview/${m.id}" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'noimg',textContent:'no preview'}))">`:`<div class="noimg">${m.mounted?"no preview":"drive not connected"}</div>`;
@@ -754,6 +799,8 @@ $("#confirm").addEventListener("click",async()=>{
   $("#confirm").disabled=false;
 });
 $("#skip").addEventListener("click",()=>{ idx++; $("#msg").textContent=""; render(); });
+// A plain <select>: enhanceSelect is the Browse page's multi-select widget and the floor is one value.
+$("#minsize").addEventListener("change",()=>{ minSize=Number($("#minsize").value); $("#msg").textContent=""; load(); });
 load();"##;
     shell("duplicates", csrf, "Review duplicates", main, script)
 }
@@ -1002,7 +1049,7 @@ async function exec(line){
     if(cmd==="clear"){ out.innerHTML=""; return; }
     if(cmd==="status"){ printJSON(await apiGet("/api/stats")); return; }
     if(cmd==="drives"){ printJSON(await apiGet("/api/drives")); return; }
-    if(cmd==="duplicates"){ printJSON(await apiGet("/api/duplicates")); return; }
+    if(cmd==="duplicates"){ printJSON(await apiGet("/api/duplicates?limit=20")); return; }
     if(cmd==="search"){ const cat=flag(toks,"category"), st=flag(toks,"status");
       const p=new URLSearchParams(); if(toks.length)p.set("q",toks.join(" ")); if(cat)p.set("category",cat); if(st)p.set("status",st);
       printJSON(await apiGet("/api/search?"+p.toString())); return; }

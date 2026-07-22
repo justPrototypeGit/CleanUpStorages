@@ -72,6 +72,21 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
         END;
         "#,
     )?;
+    // The single definition of "loose active duplicate + which copy is kept". Built from
+    // dedup::KEEP_ORDER so the rule lives in exactly one place. DROP-then-CREATE makes it
+    // self-migrating: an existing database picks up a changed KEEP_ORDER on next open.
+    conn.execute_batch(&format!(
+        r#"
+        DROP VIEW IF EXISTS dup_loose;
+        CREATE VIEW dup_loose AS
+        SELECT id, volume_id, content_hash, size_bytes,
+               ROW_NUMBER() OVER (PARTITION BY content_hash ORDER BY {order}) AS rn,
+               COUNT(*)     OVER (PARTITION BY content_hash)                  AS copies
+        FROM files
+        WHERE status = 'active' AND container_chain IS NULL;
+        "#,
+        order = crate::catalog::dedup::KEEP_ORDER
+    ))?;
     ensure_column(conn, "files", "original_path", "TEXT")?;
     ensure_column(conn, "volumes", "last_scanned_path", "TEXT")?;
     ensure_column(conn, "volumes", "display_name", "TEXT")?;
@@ -113,6 +128,87 @@ mod tests {
             "SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('volumes','files','scan_errors','actions_log')",
             [], |r| r.get(0)).unwrap();
         assert_eq!(count, 4);
+    }
+
+    /// Seed `n` rows sharing patterns needed by the dup_loose tests.
+    fn seed_view_fixture(cat: &Catalog, rows: &str) {
+        cat.conn
+            .execute_batch(&format!(
+                "INSERT INTO volumes(volume_id,label,identified_by,first_seen_at,last_seen_at)
+                     VALUES ('v','V','marker',1,1);
+                 INSERT INTO files(volume_id,relative_path,filename,extension,size_bytes,
+                     content_hash,created_time,modified_time,accessed_time,category,
+                     container_chain,status,first_seen_at,last_seen_at) VALUES {rows};"
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn dup_loose_view_flags_keep_and_counts_loose_copies_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
+        seed_view_fixture(
+            &cat,
+            "('v','new.txt','new.txt','txt',10,'H',200,200,NULL,'other',NULL,'active',1,1),
+             ('v','old.txt','old.txt','txt',10,'H',100,100,NULL,'other',NULL,'active',1,1),
+             ('v','solo.txt','solo.txt','txt',10,'U',100,100,NULL,'other',NULL,'active',1,1),
+             ('v','in.zip','x.txt','txt',10,'H',100,100,NULL,'other','x.txt','active',1,1)",
+        );
+
+        let keep: String = cat
+            .conn
+            .query_row(
+                "SELECT relative_path FROM files
+             WHERE id=(SELECT id FROM dup_loose WHERE content_hash='H' AND rn=1)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(keep, "old.txt");
+
+        let copies: i64 = cat
+            .conn
+            .query_row(
+                "SELECT DISTINCT copies FROM dup_loose WHERE content_hash='H'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(copies, 2, "archived row must not count toward loose copies");
+
+        let solo: i64 = cat
+            .conn
+            .query_row(
+                "SELECT copies FROM dup_loose WHERE content_hash='U'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(solo, 1);
+    }
+
+    #[test]
+    fn dup_loose_sorts_null_timestamps_last() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
+        seed_view_fixture(
+            &cat,
+            "('v','nulls.txt','nulls.txt','txt',10,'H',NULL,NULL,NULL,'other',NULL,'active',1,1),
+             ('v','dated.txt','dated.txt','txt',10,'H',500,500,NULL,'other',NULL,'active',1,1)",
+        );
+        let keep: String = cat
+            .conn
+            .query_row(
+                "SELECT relative_path FROM files
+             WHERE id=(SELECT id FROM dup_loose WHERE content_hash='H' AND rn=1)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            keep, "dated.txt",
+            "a NULL timestamp must never win the keep slot"
+        );
     }
 
     #[test]
