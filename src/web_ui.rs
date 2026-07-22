@@ -148,6 +148,9 @@ th{color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase;lett
 .card.rvcard{padding:0;overflow:hidden;display:flex;flex-direction:column;}
 .rvthumb{position:relative;background:var(--line);flex:1 1 auto;min-height:150px;}
 .rvthumb img,.rvthumb .noimg{width:100%;height:100%;object-fit:cover;border-radius:0;display:block;margin:0;}
+/* The rule above forces display:block, which kills .noimg's centering and drops its text into the
+   top-left corner, under the "Keep this" pill. Restore the centering (must come after). */
+.rvthumb .noimg{display:flex;align-items:center;justify-content:center;}
 .rvbody{padding:15px 16px 16px;flex:none;}
 .rvpath{font-family:var(--font-mono);font-size:12.5px;color:var(--fg);word-break:break-all;margin:0 0 12px;line-height:1.45;}
 .rvcard.keep .rvpath{color:var(--accent-text);}
