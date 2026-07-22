@@ -68,11 +68,15 @@ fn review_duplicates_then_quarantine_over_http() {
     let addr = start(db.clone(), drive.clone());
 
     // 1) fetch duplicates, grab a victim id (a copy that is NOT the suggested keep)
-    let dups = req(addr, "GET /api/duplicates HTTP/1.0\r\nHost: x\r\n\r\n");
+    // min_size=0: the fixture's files are a few bytes, well under the 1 MiB review floor.
+    let dups = req(
+        addr,
+        "GET /api/duplicates?min_size=0 HTTP/1.0\r\nHost: x\r\n\r\n",
+    );
     assert!(dups.contains("200 OK"), "dups: {dups}");
     let body = dups.split("\r\n\r\n").nth(1).unwrap_or("");
     let json: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
-    let g = &json[0];
+    let g = &json["groups"][0];
     let keep = g["suggested_keep_id"].as_i64().unwrap();
     let victim = g["members"]
         .as_array()
