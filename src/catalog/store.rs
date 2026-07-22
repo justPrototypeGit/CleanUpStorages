@@ -208,16 +208,6 @@ impl Catalog {
         Ok(n > 0)
     }
 
-    pub fn duplicate_group_count(&self) -> anyhow::Result<i64> {
-        let n = self.conn.query_row(
-            "SELECT count(*) FROM (SELECT content_hash FROM files
-                 WHERE status='active' GROUP BY content_hash HAVING count(*) > 1)",
-            [],
-            |r| r.get(0),
-        )?;
-        Ok(n)
-    }
-
     /// For the given content hashes, those with >1 active copy in the catalog, mapped to their
     /// active copy count. Bounded by the passed hashes (indexed on content_hash).
     pub fn duplicate_counts(
@@ -429,56 +419,6 @@ impl Catalog {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
         }
-    }
-
-    /// Groups of ≥2 active files (loose or archived) sharing a content_hash,
-    /// ordered by hash then id. Consecutive rows with the same hash form a group.
-    pub fn duplicate_groups(&self) -> anyhow::Result<Vec<Vec<FileRecord>>> {
-        let mut stmt = self.conn.prepare(&format!(
-            "SELECT {FILE_COLUMNS} FROM files
-             WHERE status='active' AND content_hash IN (
-                 SELECT content_hash FROM files WHERE status='active'
-                 GROUP BY content_hash HAVING count(*) > 1)
-             ORDER BY content_hash, id"
-        ))?;
-        let rows = stmt
-            .query_map([], Self::map_file_record)?
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut groups: Vec<Vec<FileRecord>> = Vec::new();
-        for r in rows {
-            match groups.last_mut() {
-                Some(g) if g[0].content_hash == r.content_hash => g.push(r),
-                _ => groups.push(vec![r]),
-            }
-        }
-        Ok(groups)
-    }
-
-    /// Bytes-per-volume of active duplicate members that are NOT their group's suggested keep.
-    /// Suggested keep = earliest created_time, then earliest modified_time, then smallest id.
-    pub fn reclaimable_bytes_by_volume(
-        &self,
-    ) -> anyhow::Result<std::collections::HashMap<String, i64>> {
-        let mut out: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-        for group in self.duplicate_groups()? {
-            let keep = group
-                .iter()
-                .min_by_key(|f| {
-                    (
-                        f.created_time.unwrap_or(i64::MAX),
-                        f.modified_time.unwrap_or(i64::MAX),
-                        f.id,
-                    )
-                })
-                .map(|f| f.id)
-                .unwrap_or(0);
-            for f in &group {
-                if f.id != keep {
-                    *out.entry(f.volume_id.clone()).or_default() += f.size_bytes;
-                }
-            }
-        }
-        Ok(out)
     }
 
     /// All currently-active rows sharing this content hash (loose or archived).
@@ -841,11 +781,11 @@ mod tests {
             .unwrap();
         cat.upsert_file(&mk_file("vol-1", "c.txt", "unique"), 200)
             .unwrap();
-        assert_eq!(cat.duplicate_group_count().unwrap(), 1);
+        assert_eq!(cat.duplicate_totals(0).unwrap().groups_all, 1);
     }
 
     #[test]
-    fn duplicate_group_count_ignores_all_missing_groups() {
+    fn duplicate_totals_ignore_all_missing_groups() {
         let (_t, cat) = open_tmp();
         cat.upsert_volume(&crate::catalog::models::Volume {
             volume_id: "v".into(),
@@ -876,7 +816,8 @@ mod tests {
         // Both rows have last_seen_at=1; a scan starting at 300 sweeps anything not seen this pass
         // (last_seen_at < 300) to missing. Signature: mark_missing_scanned(volume_id, scan_started_at, now).
         cat.mark_missing_scanned("v", 300, 300).unwrap();
-        assert_eq!(cat.duplicate_group_count().unwrap(), 0); // active-only: no reviewable groups
+        // active-only: no reviewable groups
+        assert_eq!(cat.duplicate_totals(0).unwrap().groups_all, 0);
     }
 
     #[test]
@@ -976,7 +917,17 @@ mod tests {
             .unwrap();
         cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("vacation.jpg", "same"), 200)
             .unwrap();
-        assert_eq!(cat.duplicate_group_count().unwrap(), 1); // loose + archived share a hash
+        // The hash is known to be duplicated across the two rows...
+        assert_eq!(
+            cat.duplicate_counts(&["same".to_string()]).unwrap()["same"],
+            2
+        );
+        // ...but a loose/archived pair is not reclaimable by quarantine, and one archived copy is
+        // not archive-locked duplication either, so neither figure claims space that isn't there.
+        let t = cat.duplicate_totals(0).unwrap();
+        assert_eq!(t.groups_all, 0);
+        assert_eq!(t.reclaimable_all_bytes, 0);
+        assert_eq!(t.archive_locked_bytes, 0);
     }
 
     #[test]
@@ -1061,7 +1012,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_groups_lists_members() {
+    fn ranked_groups_list_their_members() {
         let (_t, cat) = open_tmp();
         cat.upsert_file(&mk_file("vol-1", "a.txt", "same"), 200)
             .unwrap();
@@ -1069,13 +1020,19 @@ mod tests {
             .unwrap();
         cat.upsert_file(&mk_file("vol-1", "c.txt", "unique"), 200)
             .unwrap();
-        let groups = cat.duplicate_groups().unwrap();
+        let groups = cat.duplicate_groups_ranked(0, 10, None).unwrap();
         assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].len(), 2);
+        assert_eq!(groups[0].copies, 2);
+        let members = cat
+            .duplicate_members_for(&["same".to_string()])
+            .unwrap()
+            .remove("same")
+            .unwrap();
+        assert_eq!(members.len(), 2);
     }
 
     #[test]
-    fn reclaimable_bytes_by_volume_excludes_the_keep() {
+    fn reclaimable_by_volume_excludes_the_keep() {
         let (_t, cat) = open_tmp();
         cat.upsert_volume(&Volume {
             volume_id: "v".into(),
@@ -1108,7 +1065,7 @@ mod tests {
         f.content_hash = "uniq".into();
         f.size_bytes = 999; // unique -> not counted
         cat.upsert_file(&f, 1).unwrap();
-        let map = cat.reclaimable_bytes_by_volume().unwrap();
+        let map = cat.reclaimable_by_volume().unwrap();
         assert_eq!(map.get("v").copied().unwrap_or(0), 100); // only the non-keep duplicate
     }
 

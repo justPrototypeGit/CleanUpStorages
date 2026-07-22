@@ -44,8 +44,15 @@ enum Command {
         #[arg(long)]
         no_open: bool,
     },
-    /// List duplicate groups (files sharing a content hash), with ids to act on.
-    Duplicates,
+    /// List duplicate groups biggest-first (files sharing a content hash), with ids to act on.
+    Duplicates {
+        /// Hide groups whose files are smaller than this, in bytes (default 1 MiB). 0 shows all.
+        #[arg(long, default_value_t = cleanupstorages::catalog::dedup::DEFAULT_MIN_SIZE)]
+        min_size: i64,
+        /// How many groups to print.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Move confirmed-duplicate files (by id) to the drive's _ToDelete quarantine.
     Quarantine {
         /// Current mount path of the drive holding the files.
@@ -66,7 +73,7 @@ enum Command {
     Repack {
         /// Current mount path of the drive holding the archive.
         mount: std::path::PathBuf,
-        /// Catalog id of the archived entry to remove (from `duplicates`).
+        /// Catalog id of the archived entry to remove (from `search`).
         entry_id: i64,
     },
     /// Remove a drive's catalog entries (files on disk untouched; rescan to re-add).
@@ -104,7 +111,7 @@ fn main() -> anyhow::Result<()> {
         Command::Search { .. } => "search",
         Command::Status => "status",
         Command::Browse { .. } => "browse",
-        Command::Duplicates => "duplicates",
+        Command::Duplicates { .. } => "duplicates",
         Command::Quarantine { .. } => "quarantine",
         Command::Purge { .. } => "purge",
         Command::Repack { .. } => "repack",
@@ -134,7 +141,7 @@ fn main() -> anyhow::Result<()> {
         ),
         Command::Status => commands::cmd_status(),
         Command::Browse { no_open } => commands::cmd_browse(!no_open),
-        Command::Duplicates => commands::cmd_duplicates(),
+        Command::Duplicates { min_size, limit } => commands::cmd_duplicates(min_size, limit),
         Command::Quarantine { mount, ids } => commands::cmd_quarantine(&mount, &ids),
         Command::Purge { mount, all } => commands::cmd_purge(mount.as_deref(), all),
         Command::Repack { mount, entry_id } => commands::cmd_repack(&mount, entry_id),
