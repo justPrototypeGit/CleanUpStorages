@@ -2,7 +2,11 @@
 
 **Status:** approved
 **Date:** 2026-07-22
-**Closes:** #29 (rank by reclaimable), #30 (reclaimable overstated ~3×), #3 (duplicate noise floor)
+**Closes:** #29 (rank by reclaimable), #33 (reclaimable overstated ~3×), #3 (duplicate noise floor)
+
+> **Corrected after the merge:** earlier drafts of this spec (and the merge commit) cited the
+> reclaimable-overstated bug as **#30**. It is **#33**. #30 is "Make duplicate highlighting
+> server-backed", a Browse-tab issue this work does *not* address and which stays open.
 
 ## Why
 
@@ -23,7 +27,7 @@ path does not work at scale and reports a number it cannot deliver:
 | Decision | Choice | Why |
 | --- | --- | --- |
 | Size floor | **1 MiB default, user-adjustable** | Shows 4,433 of 61,816 groups while keeping 1054.4 GB of 1060.2 GB. Removes 93% of the noise for 0.55% of the value. |
-| Floor scope | **Review list only — never the headline** | Dragging a filter must not change your "reclaimable" number, or the figure feels arbitrary — the exact credibility problem #30 fixes. |
+| Floor scope | **Review list only — never the headline** | Dragging a filter must not change your "reclaimable" number, or the figure feels arbitrary — the exact credibility problem #33 fixes. |
 | Floor mechanism | **Query-time filter, never catalog-level** | Every row stays scanned and stored. The floor changes what is *shown*, nothing else. |
 | Reclaimable | **Loose files only**, archive-locked reported separately | Quarantine reclaims by renaming a real file; an archived duplicate needs a repack. Both numbers shown, always. |
 | Paging | **Cursor, not offset** | Quarantining re-ranks the list; offsets would silently skip groups. |
