@@ -33,3 +33,6 @@ StitchExport/
 # Local agent/session scratch
 .user/
 .superpowers/
+
+# LinkedIn / marketing post drafts — local only, not part of the project
+posts/
