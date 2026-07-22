@@ -1,5 +1,10 @@
 # Future ideas / next-version backlog
 
+> **Migrated to GitHub issues.** The items below are now tracked as issues (labels `enhancement` /
+> `refactor` / `deferred`, and the `Epic:` issues) — that is the active backlog. This file is kept as
+> the **long-form rationale** the issues link back to; read it for the "why" and the detail, but track
+> status in the issues. Run `gh issue list` or see the repo's Issues tab.
+
 Ideas captured for later versions of CleanUpStorages. These are **not** part of the current approved design
 (`docs/superpowers/specs/2026-07-04-cleanupstorages-design.md`) and are intentionally deferred. When an idea is
 picked up, it graduates into its own design spec via the normal brainstorming → spec → plan flow.
