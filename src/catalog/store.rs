@@ -18,7 +18,7 @@ pub struct SearchFilters {
 
 /// The full `files` column list, in one place. Every full-row SELECT uses this; the mapper
 /// (`map_file_record`) reads results by column NAME, so this list and the mapper cannot drift.
-const FILE_COLUMNS: &str =
+pub(crate) const FILE_COLUMNS: &str =
     "id, volume_id, relative_path, filename, extension, size_bytes, content_hash, \
      created_time, modified_time, accessed_time, category, container_chain, \
      status, first_seen_at, last_seen_at, original_path";
@@ -732,7 +732,7 @@ impl Catalog {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    fn map_file_record(r: &rusqlite::Row) -> rusqlite::Result<FileRecord> {
+    pub(crate) fn map_file_record(r: &rusqlite::Row) -> rusqlite::Result<FileRecord> {
         Ok(FileRecord {
             id: r.get("id")?,
             volume_id: r.get("volume_id")?,
