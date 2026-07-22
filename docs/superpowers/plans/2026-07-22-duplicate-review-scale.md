@@ -61,7 +61,7 @@ unchanged — the spec's own HTTP section already requires both):
 **Interfaces:**
 - Produces: `pub const KEEP_ORDER: &str` in `dedup.rs`; the `dup_loose` view with columns `id, volume_id, content_hash, size_bytes, rn, copies`. Tasks 2–5 rely on both.
 
-- [ ] **Step 1: Create `src/catalog/dedup.rs` with the single ordering definition**
+- [x] **Step 1: Create `src/catalog/dedup.rs` with the single ordering definition**
 
 ```rust
 //! Duplicate detection and reclaimable-space queries.
@@ -79,7 +79,7 @@ pub const KEEP_ORDER: &str =
 pub const DEFAULT_MIN_SIZE: i64 = 1_048_576;
 ```
 
-- [ ] **Step 2: Register the module**
+- [x] **Step 2: Register the module**
 
 In `src/catalog/mod.rs`, add alongside the existing module declarations:
 
@@ -87,7 +87,7 @@ In `src/catalog/mod.rs`, add alongside the existing module declarations:
 pub mod dedup;
 ```
 
-- [ ] **Step 3: Write the failing test for the view**
+- [x] **Step 3: Write the failing test for the view**
 
 Append to `src/catalog/schema.rs`'s test module (create `#[cfg(test)] mod tests { use super::*; ... }` if absent):
 
@@ -148,12 +148,12 @@ fn dup_loose_sorts_null_timestamps_last() {
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they fail**
+- [x] **Step 4: Run the tests to verify they fail**
 
 Run: `cargo test --lib schema::tests -- --nocapture`
 Expected: FAIL — `no such table: dup_loose`.
 
-- [ ] **Step 5: Create the view in `apply()`**
+- [x] **Step 5: Create the view in `apply()`**
 
 In `src/catalog/schema.rs`, after the existing `execute_batch(...)` call that creates tables/indexes/triggers, add:
 
@@ -176,18 +176,18 @@ In `src/catalog/schema.rs`, after the existing `execute_batch(...)` call that cr
 
 `DROP VIEW IF EXISTS` before `CREATE` makes the definition self-migrating: an existing database picks up a changed `KEEP_ORDER` on next open, with no version table.
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 Run: `cargo test --lib schema::tests -- --nocapture`
 Expected: PASS, both tests.
 
-- [ ] **Step 7: Full suite + gates**
+- [x] **Step 7: Full suite + gates**
 
 Run: `cargo test --release 2>&1 | grep "test result"` — every line `ok`.
 Run: `cargo clippy --all-targets --locked -- -D warnings && cargo fmt --check`
 Expected: both exit 0.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add src/catalog/schema.rs src/catalog/dedup.rs src/catalog/mod.rs
@@ -221,7 +221,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
   }
   ```
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `src/catalog/dedup.rs`:
 
@@ -289,12 +289,12 @@ mod tests {
 
 Add `tempfile` to `[dev-dependencies]` in `Cargo.toml` only if it is not already there (it is used by existing tests, so it should be).
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test --lib dedup::tests`
 Expected: FAIL — `duplicate_totals` / `reclaimable_by_volume` not found.
 
-- [ ] **Step 3: Implement both queries**
+- [x] **Step 3: Implement both queries**
 
 Append to `src/catalog/dedup.rs` (above the test module):
 
@@ -365,12 +365,12 @@ impl Catalog {
 }
 ```
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run: `cargo test --lib dedup::tests`
 Expected: PASS, both tests.
 
-- [ ] **Step 5: Gates + commit**
+- [x] **Step 5: Gates + commit**
 
 ```bash
 cargo test --release 2>&1 | grep "test result"
@@ -413,7 +413,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
   }
   ```
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add inside the existing `mod tests` in `src/catalog/dedup.rs`:
 
@@ -477,12 +477,12 @@ Add inside the existing `mod tests` in `src/catalog/dedup.rs`:
     }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test --lib dedup::tests`
 Expected: FAIL — `duplicate_groups_ranked` / `duplicate_members_for` not found.
 
-- [ ] **Step 3: Implement the ranked query and the per-page members query**
+- [x] **Step 3: Implement the ranked query and the per-page members query**
 
 Append to `src/catalog/dedup.rs` (above the test module):
 
@@ -595,12 +595,12 @@ Change `const FILE_COLUMNS` → `pub(crate) const FILE_COLUMNS` and `fn map_file
 `pub(crate) fn map_file_record` so `dedup.rs` reuses them. Do **not** copy the column list — the
 mapper reads by column name and the two would drift.
 
-- [ ] **Step 4: Run to verify pass**
+- [x] **Step 4: Run to verify pass**
 
 Run: `cargo test --lib dedup::tests`
 Expected: PASS, all six tests in the module.
 
-- [ ] **Step 5: Gates + commit**
+- [x] **Step 5: Gates + commit**
 
 ```bash
 cargo test --release 2>&1 | grep "test result"
@@ -630,7 +630,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
   `{ totals, groups: [{ content_hash, copies, size_bytes, reclaimable_bytes, suggested_keep_id, members: [...] }], next }`;
   `DriveDto.reclaimable_bytes` from `reclaimable_by_volume`; `/api/stats` carrying the totals.
 
-- [ ] **Step 1: Write the failing web tests**
+- [x] **Step 1: Write the failing web tests**
 
 Add to the test module in `src/web.rs`. Note `seed_dupes()` ([src/web.rs:1208](../../../src/web.rs#L1208))
 creates 10-byte files, so every duplicates request in tests must pass `min_size=0` — the 1 MiB
@@ -663,12 +663,12 @@ default would correctly hide the whole fixture.
     }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `cargo test --release --lib web::tests::api_duplicates`
 Expected: FAIL — the response is still a bare array, so the `totals`/`groups` lookups are null.
 
-- [ ] **Step 3: Replace `api_duplicates` and its DTOs**
+- [x] **Step 3: Replace `api_duplicates` and its DTOs**
 
 In `src/web.rs`, delete the old `GroupDto`, the `suggested_keep` helper, and the body of `api_duplicates`. Add:
 
@@ -787,7 +787,7 @@ async fn api_duplicates(
 }
 ```
 
-- [ ] **Step 4: Point `api_drives` and `api_stats` at the new figures**
+- [x] **Step 4: Point `api_drives` and `api_stats` at the new figures**
 
 In `api_drives`, replace `let reclaim = cat.reclaimable_bytes_by_volume()...` with:
 
@@ -808,12 +808,12 @@ and add `archive_locked_bytes: totals.archive_locked_bytes` plus
 `reclaimable_all_bytes: totals.reclaimable_all_bytes` to the stats DTO (adding both fields to the
 struct definition), so the Overview can show the honest headline and the archive figure.
 
-- [ ] **Step 5: Run to verify pass**
+- [x] **Step 5: Run to verify pass**
 
 Run: `cargo test --release --lib web::`
 Expected: PASS. Fix any other web test that asserted the old array shape by updating it to the new object shape — do not reintroduce the array.
 
-- [ ] **Step 6: Gates + commit**
+- [x] **Step 6: Gates + commit**
 
 ```bash
 cargo test --release 2>&1 | grep "test result"
@@ -844,7 +844,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 **Context:** This task exists to enforce the "one implementation" rule. `cmd_duplicates` currently prints every group (254,226 on the real catalog), so it is rewritten here rather than left calling a deleted method.
 
-- [ ] **Step 1: Rewrite `cmd_duplicates` and `cmd_status`**
+- [x] **Step 1: Rewrite `cmd_duplicates` and `cmd_status`**
 
 In `src/commands.rs`, replace the body of `cmd_duplicates` with:
 
@@ -893,14 +893,14 @@ In `cmd_status`, replace `let groups = cat.duplicate_group_count()?;` with:
     let groups = cat.duplicate_totals(0)?.groups_all;
 ```
 
-- [ ] **Step 2: Delete the old methods**
+- [x] **Step 2: Delete the old methods**
 
 In `src/catalog/store.rs`, delete these three methods entirely: `duplicate_groups`,
 `duplicate_group_count` (line ~211), and `reclaimable_bytes_by_volume` (line ~463). Delete the tests
 that exercise only those methods — including `duplicate_group_count_ignores_all_missing_groups`
 (line ~848) — since `dedup.rs` now covers that behaviour. Keep every other test.
 
-- [ ] **Step 3: Prove the old implementation is gone**
+- [x] **Step 3: Prove the old implementation is gone**
 
 ```bash
 grep -rn "duplicate_groups()\|duplicate_group_count()\|reclaimable_bytes_by_volume" src/ || echo "CLEAN: single implementation"
@@ -908,14 +908,14 @@ grep -rn "duplicate_groups()\|duplicate_group_count()\|reclaimable_bytes_by_volu
 
 Expected: `CLEAN: single implementation`. Any hit means a caller or a stale definition survived — fix it rather than re-adding the method.
 
-- [ ] **Step 4: Verify the build and full suite**
+- [x] **Step 4: Verify the build and full suite**
 
 Run: `cargo test --release 2>&1 | grep "test result"`
 Expected: every line `ok`.
 Run: `cargo clippy --all-targets --locked -- -D warnings && cargo fmt --check`
 Expected: both exit 0.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/catalog/store.rs src/commands.rs
@@ -942,7 +942,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 **Context:** The page keeps its existing compare-and-confirm cards. What changes: it loads a ranked page instead of everything, shows honest totals, and never hides groups silently.
 
-- [ ] **Step 1: Replace the page markup**
+- [x] **Step 1: Replace the page markup**
 
 In `review_page`'s `main`, replace the header row (currently the `page-h` + `#progress` row) with:
 
@@ -967,7 +967,7 @@ In `review_page`'s `main`, replace the header row (currently the `page-h` + `#pr
 
 Keep the existing `.rvbar` buttons, the `_ToDelete` note and `#msg` exactly as they are.
 
-- [ ] **Step 2: Replace the loading logic**
+- [x] **Step 2: Replace the loading logic**
 
 In `review_page`'s script, replace `load()` and the head of `render()` with:
 
@@ -1015,7 +1015,7 @@ and replace the `#progress` line with one that shows position and value:
   $("#progress").textContent=`Group ${idx+1} of ${fmtGroups(totals?totals.groups:groups.length)} · ${g.members.length} copies · ${fmtSize(g.reclaimable_bytes)} reclaimable`;
 ```
 
-- [ ] **Step 3: Add the "up next" strip and wire the floor control**
+- [x] **Step 3: Add the "up next" strip and wire the floor control**
 
 Add at the end of `render()`:
 
@@ -1032,7 +1032,7 @@ and register the control near the other listeners:
 $("#minsize").addEventListener("change",()=>{ minSize=Number($("#minsize").value); load(); });
 ```
 
-- [ ] **Step 4: Update the Console `duplicates` command**
+- [x] **Step 4: Update the Console `duplicates` command**
 
 In `console_page`'s script, replace
 `if(cmd==="duplicates"){ printJSON(await apiGet("/api/duplicates")); return; }` with:
@@ -1041,7 +1041,7 @@ In `console_page`'s script, replace
     if(cmd==="duplicates"){ printJSON(await apiGet("/api/duplicates?limit=20")); return; }
 ```
 
-- [ ] **Step 5: Verify the page renders and is self-contained**
+- [x] **Step 5: Verify the page renders and is self-contained**
 
 ```bash
 cargo build --release
@@ -1058,7 +1058,7 @@ pwsh -File UI/shoot.ps1 -Width 1600 -Height 950
 
 Read `UI/Screenshots/shot_duplicates_light.png` and confirm: the totals line shows groups + reclaimable, the size filter is present, and the compare cards still render.
 
-- [ ] **Step 6: Gates + commit**
+- [x] **Step 6: Gates + commit**
 
 ```bash
 cargo clippy --all-targets --locked -- -D warnings && cargo fmt --check
@@ -1081,7 +1081,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 **Context:** The sandbox has ~13 files; the numbers in the spec came from the real catalogue (1,788,308 files). This task proves the implementation reproduces them. **Read-only: never write to the user's catalog.**
 
-- [ ] **Step 1: Check the figures against the real database**
+- [x] **Step 1: Check the figures against the real database**
 
 ```bash
 python - <<'PY'
@@ -1105,11 +1105,35 @@ PY
 
 Expected, matching the spec's success criteria: floor 0 → **61,816 groups / 1.060 TB**; floor 1 MiB → **4,433 groups / ~1.054 TB**; archive-locked ≈ **1.23 TB**. Small drift is fine if the catalog has been scanned further since; the *shape* (loose ≈ 1 TB, not 3.28 TB; 1 MiB floor cutting ~57k groups) must hold.
 
-- [ ] **Step 2: Record the outcome**
+- [x] **Step 2: Record the outcome**
 
 If the numbers match, note them in the task report. If they do not, stop and report BLOCKED with both the expected and actual figures — a mismatch means the SQL does not implement the spec, and that must be understood before this ships.
 
 ---
+
+## Measured on the real catalogue (1,788,308 files, 1.5 GB `catalog.db`)
+
+Verified against a copy of the live catalogue, matching every figure in the spec:
+
+| | |
+| --- | --- |
+| Loose duplicate groups, no floor | **61,816** — 1.060 TB reclaimable |
+| At the 1 MiB floor | **4,433** — 1.054 TB reclaimable |
+| Hidden by the floor | **57,383** groups, 5.80 GB |
+| Archive-locked (independent) | **1.23 TB** |
+| Biggest group | 6 × 5.86 GB `.ova` → 29.28 GB |
+
+Endpoint timings (warm, per HTTP request):
+
+| | |
+| --- | --- |
+| `/api/volumes` (just opens the DB) | 2.1 s |
+| `/api/duplicates` continuation page | 3.4 s |
+| `/api/duplicates` first page (adds three aggregate passes) | 6.7 s |
+
+The 2.1 s floor is **pre-existing**: every handler calls `Catalog::open_readonly`, so each request
+re-opens a 1.5 GB database with a 100 MB WAL. That belongs to the scan/performance epic (#21), not
+here — connection reuse would take ~2 s off *every* endpoint.
 
 ## Notes for later (not this plan)
 
