@@ -110,11 +110,33 @@ fn rebuild_fts_if_stale(conn: &Connection) -> rusqlite::Result<()> {
         [],
         |r| r.get(0),
     )?;
-    if has_chain > 0 {
+    // Second condition: an index with the right columns but no rows, over a non-empty catalog.
+    // The column check alone cannot see that state — and it is reachable, because `apply`'s
+    // CREATE VIRTUAL TABLE IF NOT EXISTS above would recreate a dropped index with the current
+    // columns and no content. Checking emptiness makes the repair self-healing whatever the cause.
+    // Probed via the fts5 shadow table, not `SELECT ... FROM files_fts`: on an external-content
+    // index an unindexed scan falls through to the content table, so it reports rows even when the
+    // index is empty. `files_fts_docsize` holds one row per indexed document and tells the truth.
+    // If that table is somehow unavailable, assume healthy — a wrong guess here means a needless
+    // multi-second rebuild on every open.
+    let empty_over_rows = has_chain > 0 && {
+        let indexed: i64 = conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM files_fts_docsize)", [], |r| {
+                r.get(0)
+            })
+            .unwrap_or(1);
+        let rows: i64 = conn.query_row("SELECT EXISTS(SELECT 1 FROM files)", [], |r| r.get(0))?;
+        indexed == 0 && rows == 1
+    };
+    if has_chain > 0 && !empty_over_rows {
         return Ok(());
     }
+    // All-or-nothing: without the transaction a crash between the DROP and the rebuild would leave
+    // a catalog whose index looks migrated (the column is there) but is empty, which the guard
+    // above would then skip forever.
     conn.execute_batch(
         r#"
+        BEGIN IMMEDIATE;
         DROP TRIGGER IF EXISTS files_ai;
         DROP TRIGGER IF EXISTS files_ad;
         DROP TRIGGER IF EXISTS files_au;
@@ -139,6 +161,7 @@ fn rebuild_fts_if_stale(conn: &Connection) -> rusqlite::Result<()> {
             INSERT INTO files_fts(rowid, filename, relative_path, container_chain)
             VALUES (new.id, new.filename, new.relative_path, new.container_chain);
         END;
+        COMMIT;
         "#,
     )
 }
@@ -304,6 +327,67 @@ mod tests {
         );
         assert_eq!(hits[0].filename, "vacation.jpg");
         assert!(cat.integrity_ok().unwrap());
+    }
+
+    #[test]
+    fn an_index_with_the_right_columns_but_no_rows_is_repaired() {
+        // The state a crash mid-migration leaves behind: the index was dropped, then recreated by
+        // CREATE VIRTUAL TABLE IF NOT EXISTS with the current columns and no content. The column
+        // check alone would call that migrated and skip it forever, silently unsearchable.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("c.db");
+        {
+            let cat = Catalog::open(&db).unwrap();
+            cat.conn
+                .execute_batch(
+                    "INSERT INTO volumes(volume_id,label,identified_by,first_seen_at,last_seen_at)
+                        VALUES ('v','V','marker',1,1);
+                     INSERT INTO files(volume_id,relative_path,filename,extension,size_bytes,
+                        content_hash,created_time,modified_time,accessed_time,category,
+                        container_chain,status,first_seen_at,last_seen_at)
+                     VALUES ('v','backups/old.zip','vacation.jpg','jpg',9,'h',1,1,NULL,'photo',
+                             'photos.zip › vacation.jpg','active',1,1);
+                     DELETE FROM files_fts;",
+                )
+                .unwrap();
+            assert!(
+                cat.search("photos", None, None, None).unwrap().is_empty(),
+                "fixture must start with an empty index"
+            );
+        }
+
+        let cat = Catalog::open(&db).unwrap();
+        assert_eq!(
+            cat.search("photos", None, None, None).unwrap().len(),
+            1,
+            "an empty index over a non-empty catalog must be rebuilt, not accepted"
+        );
+    }
+
+    #[test]
+    fn an_empty_catalog_is_not_rebuilt_on_every_open() {
+        // No files at all is a legitimately empty index -- it must not look like damage.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("c.db");
+        let cat = Catalog::open(&db).unwrap();
+        cat.conn
+            .execute_batch(
+                "INSERT INTO files_fts(rowid, filename, relative_path, container_chain)
+                 VALUES (999999, 'sentinel', 'sentinel', '');",
+            )
+            .unwrap();
+        drop(cat);
+
+        let cat = Catalog::open(&db).unwrap();
+        let n: i64 = cat
+            .conn
+            .query_row(
+                "SELECT count(*) FROM files_fts WHERE files_fts MATCH 'sentinel'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "an empty catalog must not trigger a rebuild");
     }
 
     #[test]
