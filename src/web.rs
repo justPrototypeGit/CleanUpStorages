@@ -1252,6 +1252,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_search_size_bounds_are_inclusive() {
+        let (_t, db) = seed_catalog(); // thesis.pdf is 123 B; the archived inner.jpg is 9 B
+        let all = get_json(&db, "/api/search").await;
+        assert_eq!(all.as_array().unwrap().len(), 2);
+
+        let big = get_json(&db, "/api/search?min_size=123").await;
+        let arr = big.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "min_size is inclusive of the boundary");
+        assert_eq!(arr[0]["filename"], "thesis.pdf");
+
+        let small = get_json(&db, "/api/search?max_size=9").await;
+        let arr = small.as_array().unwrap();
+        assert_eq!(arr.len(), 1, "max_size is inclusive of the boundary");
+        assert_eq!(arr[0]["filename"], "inner.jpg");
+
+        assert!(
+            get_json(&db, "/api/search?min_size=10&max_size=100")
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "a window matching nothing returns nothing, not everything"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_search_date_bounds_exclude_dateless_archive_entries() {
+        // thesis.pdf has modified_time=50; the archived inner.jpg has none. A date bound must not
+        // silently admit rows with no date -- the Browse UI warns about exactly this.
+        let (_t, db) = seed_catalog();
+        let after = get_json(&db, "/api/search?modified_after=50").await;
+        let arr = after.as_array().unwrap();
+        assert_eq!(
+            arr.len(),
+            1,
+            "modified_after is inclusive; NULL is excluded"
+        );
+        assert_eq!(arr[0]["filename"], "thesis.pdf");
+
+        let before = get_json(&db, "/api/search?modified_before=50").await;
+        assert_eq!(before.as_array().unwrap().len(), 1);
+
+        assert!(get_json(&db, "/api/search?modified_after=51")
+            .await
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn api_search_copies_null_for_unique_file() {
         let (_t, db) = seed_catalog(); // thesis.pdf (h1) + archived inner.jpg (h2): both unique
         let v = get_json(&db, "/api/search?q=thesis").await;
