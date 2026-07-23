@@ -33,6 +33,8 @@ pub fn quarantine_files(
 
     let mut out = QuarantineOutcome::default();
 
+    let mut cache = crate::verify::HashCache::default();
+
     for &id in ids {
         let skip =
             |cat: &Catalog, reason: String, out: &mut QuarantineOutcome| -> anyhow::Result<()> {
@@ -60,27 +62,6 @@ pub fn quarantine_files(
             )?;
             continue;
         }
-        // Disk-aware "never remove the last copy" guard. Exclude only this id (not the whole
-        // batch): each successful quarantine commits immediately, so a doomed sibling processed
-        // earlier in this same batch is already non-active by the time we get here and can't be
-        // mistaken for a survivor. A survivor "counts" only if it is a different row AND either
-        // lives on a DIFFERENT volume (a genuinely separate physical copy we can't disk-check, so
-        // trust it) OR lives on THIS volume and its file physically exists on disk.
-        let survivor_ok = cat.active_copies(&rec.content_hash)?.iter().any(|s| {
-            s.id != id
-                && (s.volume_id != expected_volume_id || mount_root.join(&s.relative_path).exists())
-        });
-        if !survivor_ok {
-            skip(
-                cat,
-                "no surviving copy verified on disk (a same-drive duplicate may have been \
-                       deleted outside the tool — rescan the drive and retry)"
-                    .into(),
-                &mut out,
-            )?;
-            continue;
-        }
-
         let src = mount_root.join(&rec.relative_path);
         if !src.is_file() {
             skip(
@@ -90,6 +71,43 @@ pub fn quarantine_files(
             )?;
             continue;
         }
+
+        // Re-hash what we are about to move, rather than trusting the catalogue. The incremental
+        // scan skips re-hashing when size and second-granularity mtime match, so a same-size edit
+        // made within one second of the recorded mtime leaves a stale hash (#4) — and a stale hash
+        // is exactly how a unique file gets mistaken for a duplicate.
+        let live_hash = match cache.file(&src) {
+            Ok(h) => h,
+            Err(e) => {
+                skip(
+                    cat,
+                    format!("could not re-read {}: {e}", rec.relative_path),
+                    &mut out,
+                )?;
+                continue;
+            }
+        };
+
+        // Disk-aware "never remove the last copy" guard, shared with repack so the two cannot
+        // drift. Exclude only this id (not the whole batch): each successful quarantine commits
+        // immediately, so a doomed sibling processed earlier is already non-active by now and
+        // cannot be mistaken for a survivor.
+        match crate::verify::find_surviving_copy(
+            cat,
+            mount_root,
+            expected_volume_id,
+            id,
+            &rec.content_hash,
+            &live_hash,
+            &mut cache,
+        )? {
+            crate::verify::Survivor::Verified => {}
+            crate::verify::Survivor::NotFound(reason) => {
+                skip(cat, reason, &mut out)?;
+                continue;
+            }
+        }
+
         let dest_rel = quarantine_dest(cat, mount_root, expected_volume_id, &rec.relative_path)?;
         let dest = mount_root.join(&dest_rel);
         if let Some(parent) = dest.parent() {
@@ -219,6 +237,180 @@ mod tests {
         // the surviving copy is untouched
         assert!(root.join("copy_a.jpg").exists());
         let _ = tmp;
+    }
+
+    #[test]
+    fn refuses_when_the_file_no_longer_matches_its_catalogued_hash() {
+        // The #4 scenario: the incremental scan skips re-hashing when size and second-granularity
+        // mtime match, so a same-size edit can leave a stale hash. Acting on that stale verdict
+        // would quarantine a file whose content is now unique.
+        let (tmp, cat, root) = fake_drive();
+        let root = std::path::PathBuf::from(root);
+        let id = cat.loose_file_id("vol-1", "Photos/a.jpg").unwrap().unwrap();
+        let before = cat.get_file(id).unwrap().unwrap().content_hash;
+
+        // Same byte count, different content — exactly what the size+mtime skip cannot see.
+        let len = std::fs::read(root.join("Photos/a.jpg")).unwrap().len();
+        std::fs::write(root.join("Photos/a.jpg"), vec![b'Z'; len]).unwrap();
+
+        let out = quarantine_files(&cat, &root, "vol-1", &[id], 200).unwrap();
+        assert_eq!(
+            out,
+            QuarantineOutcome {
+                quarantined: 0,
+                skipped: 1
+            },
+            "a file that no longer matches its catalogued hash must not be moved"
+        );
+        assert!(
+            root.join("Photos/a.jpg").exists(),
+            "the file stays exactly where it was"
+        );
+        assert_eq!(
+            cat.get_file(id).unwrap().unwrap().status,
+            crate::catalog::models::FileStatus::Active
+        );
+        // The skip reason must name the drift, not blame a missing survivor.
+        let reason = last_skip_reason(&cat);
+        assert!(
+            reason.contains("content changed since the last scan"),
+            "unhelpful skip reason: {reason}"
+        );
+        assert_eq!(before, cat.get_file(id).unwrap().unwrap().content_hash);
+        let _ = tmp;
+    }
+
+    #[test]
+    fn refuses_when_the_survivor_on_disk_no_longer_matches() {
+        // The victim is unchanged, but the copy we were relying on has drifted. Quarantining now
+        // would leave zero copies of these bytes outside _ToDelete.
+        let (tmp, cat, root) = fake_drive();
+        let root = std::path::PathBuf::from(root);
+        let id = cat.loose_file_id("vol-1", "Photos/a.jpg").unwrap().unwrap();
+
+        let len = std::fs::read(root.join("copy_a.jpg")).unwrap().len();
+        std::fs::write(root.join("copy_a.jpg"), vec![b'Q'; len]).unwrap();
+
+        let out = quarantine_files(&cat, &root, "vol-1", &[id], 200).unwrap();
+        assert_eq!(
+            out.quarantined, 0,
+            "the survivor no longer holds these bytes"
+        );
+        assert_eq!(out.skipped, 1);
+        assert!(root.join("Photos/a.jpg").exists());
+        assert!(last_skip_reason(&cat).contains("no surviving copy verified"));
+        let _ = tmp;
+    }
+
+    #[test]
+    fn a_verified_copy_inside_a_zip_counts_as_a_survivor() {
+        // Most of a real corpus is archive entries, so "the twin is zipped" is the common case,
+        // not an edge one. The bytes genuinely survive inside the archive, so the move is allowed
+        // — but only after decompressing that entry and confirming it really holds them.
+        let (tmp, cat, root) = fake_drive();
+        let root = std::path::PathBuf::from(root);
+        let payload = std::fs::read(root.join("Photos/a.jpg")).unwrap();
+
+        // A zip on the drive holding the same bytes, catalogued as an archive entry.
+        let zip_rel = "archive.zip";
+        {
+            let f = std::fs::File::create(root.join(zip_rel)).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("a.jpg", opts).unwrap();
+            std::io::Write::write_all(&mut zw, &payload).unwrap();
+            zw.finish().unwrap();
+        }
+        let mut slice: &[u8] = &payload;
+        let hash = crate::hashing::hash_reader(&mut slice).unwrap();
+        cat.upsert_archive_entry(
+            "vol-1",
+            zip_rel,
+            &crate::archive::ArchiveEntry {
+                container_chain: "a.jpg".into(),
+                filename: "a.jpg".into(),
+                extension: "jpg".into(),
+                size_bytes: payload.len() as i64,
+                content_hash: hash,
+            },
+            100,
+        )
+        .unwrap();
+
+        // Remove the loose twin so the zip entry is the ONLY other copy.
+        let sibling = cat.loose_file_id("vol-1", "copy_a.jpg").unwrap().unwrap();
+        cat.conn
+            .execute("DELETE FROM files WHERE id=?1", [sibling])
+            .unwrap();
+        std::fs::remove_file(root.join("copy_a.jpg")).unwrap();
+
+        let id = cat.loose_file_id("vol-1", "Photos/a.jpg").unwrap().unwrap();
+        let out = quarantine_files(&cat, &root, "vol-1", &[id], 200).unwrap();
+        assert_eq!(
+            out.quarantined,
+            1,
+            "an archived copy preserves the bytes, so the loose duplicate may be quarantined: {}",
+            last_skip_reason(&cat)
+        );
+        assert!(root.join("_ToDelete/Photos/a.jpg").exists());
+        let _ = tmp;
+    }
+
+    #[test]
+    fn a_zip_entry_that_does_not_match_is_not_a_survivor() {
+        let (tmp, cat, root) = fake_drive();
+        let root = std::path::PathBuf::from(root);
+        let id = cat.loose_file_id("vol-1", "Photos/a.jpg").unwrap().unwrap();
+        let rec = cat.get_file(id).unwrap().unwrap();
+
+        // A zip catalogued under the same hash whose entry actually holds different bytes — the
+        // exact lie a stale catalogue tells.
+        {
+            let f = std::fs::File::create(root.join("archive.zip")).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("a.jpg", opts).unwrap();
+            std::io::Write::write_all(&mut zw, b"totally different bytes").unwrap();
+            zw.finish().unwrap();
+        }
+        cat.upsert_archive_entry(
+            "vol-1",
+            "archive.zip",
+            &crate::archive::ArchiveEntry {
+                container_chain: "a.jpg".into(),
+                filename: "a.jpg".into(),
+                extension: "jpg".into(),
+                size_bytes: 23,
+                content_hash: rec.content_hash.clone(),
+            },
+            100,
+        )
+        .unwrap();
+
+        let sibling = cat.loose_file_id("vol-1", "copy_a.jpg").unwrap().unwrap();
+        cat.conn
+            .execute("DELETE FROM files WHERE id=?1", [sibling])
+            .unwrap();
+        std::fs::remove_file(root.join("copy_a.jpg")).unwrap();
+
+        let out = quarantine_files(&cat, &root, "vol-1", &[id], 200).unwrap();
+        assert_eq!(out.quarantined, 0, "the zip does not hold these bytes");
+        assert!(root.join("Photos/a.jpg").exists());
+        let _ = tmp;
+    }
+
+    /// The reason recorded by the most recent `quarantine_skip` action.
+    fn last_skip_reason(cat: &Catalog) -> String {
+        cat.conn
+            .query_row(
+                "SELECT details FROM actions_log WHERE action='quarantine_skip'
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap()
     }
 
     #[test]
