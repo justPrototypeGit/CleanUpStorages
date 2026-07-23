@@ -123,24 +123,30 @@ pub fn scan_volume_with_progress(
             continue;
         };
 
-        let meta = {
+        // The failed stat is legitimately walk cost; the two SQLite writes that follow it are not,
+        // so the guard drops before the error arm runs.
+        let stat = {
             let _t = metrics.timer(crate::scan_metrics::Phase::Walk);
-            match entry.metadata() {
-                Ok(m) => m,
-                Err(e) => {
-                    cat.log_scan_error(
-                        Some(&identity.volume_id),
-                        &rel,
-                        &format!("metadata: {e}"),
-                        now,
-                    )?;
-                    summary.errors += 1;
-                    if let Some(p) = progress {
-                        p.on_error();
-                    }
-                    let _ = cat.touch_seen(&identity.volume_id, &rel, now);
-                    continue;
+            entry.metadata()
+        };
+        let meta = match stat {
+            Ok(m) => m,
+            Err(e) => {
+                // Still a file the walk considered, and it still cost a seek — but its size is
+                // genuinely unknown, so it lands in bucket 0.
+                metrics.record_file_seen(0);
+                cat.log_scan_error(
+                    Some(&identity.volume_id),
+                    &rel,
+                    &format!("metadata: {e}"),
+                    now,
+                )?;
+                summary.errors += 1;
+                if let Some(p) = progress {
+                    p.on_error();
                 }
+                let _ = cat.touch_seen(&identity.volume_id, &rel, now);
+                continue;
             }
         };
         let size = meta.len() as i64;
@@ -148,44 +154,56 @@ pub fn scan_volume_with_progress(
         metrics.record_file_seen(size);
 
         // Incremental skip: same size + mtime as catalogued -> just touch, don't re-hash.
-        if !force {
+        // `skip_check` is get_file_meta + touch_seen only; the batch COMMIT this path also
+        // triggers is db_write (it is the fsync #26 targets), so the guard must be dead before
+        // rotate_batch runs — otherwise a rescan books 100% of its fsyncs to skip_check and reads
+        // as seek-bound.
+        let is_unchanged = if force {
+            false
+        } else {
             let _t = metrics.timer(crate::scan_metrics::Phase::SkipCheck);
-            if let Some((old_size, old_mtime)) = cat.get_file_meta(&identity.volume_id, &rel)? {
-                if old_size == size && old_mtime == mtime.unwrap_or(0) {
+            match cat.get_file_meta(&identity.volume_id, &rel)? {
+                Some((old_size, old_mtime))
+                    if old_size == size && old_mtime == mtime.unwrap_or(0) =>
+                {
                     cat.touch_seen(&identity.volume_id, &rel, now)?;
                     if archive::is_archive_name(&rel) {
                         cat.touch_archive_entries(&identity.volume_id, &rel, now)?;
                     }
-                    summary.skipped += 1;
-                    metrics.add_bytes_skipped(size);
-                    if let Some(p) = progress {
-                        p.on_skipped();
-                    }
-                    in_batch += 1;
-                    rotate_batch(cat, &mut in_batch)?;
-                    continue;
+                    true
                 }
+                _ => false,
             }
+        };
+        if is_unchanged {
+            summary.skipped += 1;
+            metrics.add_bytes_skipped(size);
+            if let Some(p) = progress {
+                p.on_skipped();
+            }
+            in_batch += 1;
+            {
+                let _t = metrics.timer(crate::scan_metrics::Phase::DbWrite);
+                rotate_batch(cat, &mut in_batch)?;
+            }
+            continue;
         }
 
-        let hash = {
+        // As with the stat above: the failed read is hash cost, its error logging is not.
+        let hashed = {
             let _t = metrics.timer(crate::scan_metrics::Phase::Hash);
-            match hashing::hash_file(path) {
-                Ok(h) => h,
-                Err(e) => {
-                    cat.log_scan_error(
-                        Some(&identity.volume_id),
-                        &rel,
-                        &format!("read: {e}"),
-                        now,
-                    )?;
-                    summary.errors += 1;
-                    if let Some(p) = progress {
-                        p.on_error();
-                    }
-                    let _ = cat.touch_seen(&identity.volume_id, &rel, now);
-                    continue;
+            hashing::hash_file(path)
+        };
+        let hash = match hashed {
+            Ok(h) => h,
+            Err(e) => {
+                cat.log_scan_error(Some(&identity.volume_id), &rel, &format!("read: {e}"), now)?;
+                summary.errors += 1;
+                if let Some(p) = progress {
+                    p.on_error();
                 }
+                let _ = cat.touch_seen(&identity.volume_id, &rel, now);
+                continue;
             }
         };
         metrics.add_bytes_hashed(size);
