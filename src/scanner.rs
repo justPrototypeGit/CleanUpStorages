@@ -245,6 +245,7 @@ pub fn scan_volume_with_progress(
                 cat,
                 path,
                 &rel,
+                mtime,
                 identity,
                 &limits,
                 now,
@@ -378,6 +379,7 @@ fn descend_archive(
     cat: &Catalog,
     path: &Path,
     rel: &str,
+    archive_mtime: Option<i64>,
     identity: &VolumeIdentity,
     limits: &ArchiveLimits,
     now: i64,
@@ -403,7 +405,7 @@ fn descend_archive(
     };
     let res = archive::scan_archive(file, limits);
     for entry in &res.entries {
-        cat.upsert_archive_entry(&identity.volume_id, rel, entry, now)?;
+        cat.upsert_archive_entry(&identity.volume_id, rel, entry, archive_mtime, now)?;
         summary.archive_entries += 1;
         if let Some(p) = progress {
             p.on_archive_entry();
