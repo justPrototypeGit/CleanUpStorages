@@ -59,6 +59,7 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/drives", get(api_drives))
         .route("/api/detected-drives", get(api_detected_drives))
         .route("/api/duplicates", get(api_duplicates))
+        .route("/api/copies", get(api_copies))
         .route("/api/preview/:id", get(api_preview))
         .route("/api/quarantine", post(api_quarantine))
         .route("/api/repack", post(api_repack))
@@ -518,6 +519,54 @@ struct MemberDto {
     status: String,
     is_loose: bool,
     mounted: bool,
+}
+
+#[derive(Deserialize)]
+struct CopiesParams {
+    hash: String,
+}
+
+/// Every active copy of one content hash, wherever it lives — including on drives that are not
+/// currently connected.
+///
+/// Browse can only highlight rows it has already loaded, so on a truncated result set clicking a
+/// duplicate looked like "2 copies" when there might be twenty (#30). Under-reporting copies is the
+/// one thing a duplicate finder must never do, so the count comes from the catalogue, not the page.
+async fn api_copies(
+    State(state): State<AppState>,
+    Query(p): Query<CopiesParams>,
+) -> Result<Json<Vec<MemberDto>>, (StatusCode, String)> {
+    let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
+    let labels: std::collections::HashMap<String, String> = cat
+        .volume_stats()
+        .map_err(err500)?
+        .into_iter()
+        .map(|(id, label, _, _)| (id, label))
+        .collect();
+    let mounts = state.mounts.snapshot();
+    let out = cat
+        .active_copies(&p.hash)
+        .map_err(err500)?
+        .into_iter()
+        .map(|f| {
+            let mounted = mounts.contains_key(&f.volume_id);
+            MemberDto {
+                id: f.id,
+                location: f.display_location(),
+                filename: f.filename.clone(),
+                volume_label: labels.get(&f.volume_id).cloned().unwrap_or_default(),
+                volume_id: f.volume_id,
+                size_bytes: f.size_bytes,
+                category: f.category.as_str().to_string(),
+                created_time: f.created_time,
+                modified_time: f.modified_time,
+                status: f.status.as_str().to_string(),
+                is_loose: f.container_chain.is_none(),
+                mounted,
+            }
+        })
+        .collect();
+    Ok(Json(out))
 }
 
 #[derive(Serialize)]
@@ -1249,6 +1298,59 @@ mod tests {
             assert_eq!(h["content_hash"], "DUP");
             assert_eq!(h["copies"], 2); // both are duplicated (2 active copies)
         }
+    }
+
+    #[tokio::test]
+    async fn api_copies_reports_every_copy_including_disconnected_drives() {
+        // The point of #30: the answer must come from the catalogue, not from whatever rows a
+        // truncated page happened to load, and it must include drives that are not plugged in.
+        let (_t, db, state) = seed_dupes(); // two active copies of hash DUP on vol-1 (mounted)
+        {
+            let cat = Catalog::open(&db).unwrap();
+            cat.upsert_volume(&crate::catalog::models::Volume {
+                volume_id: "vol-elsewhere".into(),
+                label: "Offline HDD".into(),
+                identified_by: "marker".into(),
+                first_seen_at: 1,
+                last_seen_at: 1,
+            })
+            .unwrap();
+            cat.upsert_file(
+                &crate::catalog::models::NewFile {
+                    volume_id: "vol-elsewhere".into(),
+                    relative_path: "far/away.jpg".into(),
+                    filename: "away.jpg".into(),
+                    extension: "jpg".into(),
+                    size_bytes: 10,
+                    content_hash: "DUP".into(),
+                    created_time: Some(1),
+                    modified_time: Some(1),
+                    accessed_time: None,
+                    category: crate::category::Category::Photo,
+                    container_chain: None,
+                },
+                100,
+            )
+            .unwrap();
+        }
+
+        let v = get_json_state(state, "/api/copies?hash=DUP").await;
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 3, "all three copies, not just the mounted ones");
+
+        let offline = arr
+            .iter()
+            .find(|m| m["volume_label"] == "Offline HDD")
+            .expect("the copy on the unplugged drive must still be listed");
+        assert_eq!(offline["mounted"], false, "and be marked as unreachable");
+        assert!(arr.iter().any(|m| m["mounted"] == true));
+    }
+
+    #[tokio::test]
+    async fn api_copies_of_an_unknown_hash_is_empty_not_an_error() {
+        let (_t, db, _state) = seed_dupes();
+        let v = get_json(&db, "/api/copies?hash=nothing-has-this").await;
+        assert!(v.as_array().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -194,6 +194,11 @@ details.drive>summary:hover,details.folder>summary:hover{background:var(--line);
 .rangelbl input[type=date]:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-weak);}
 /* Mirrors .dd.multi.has-sel: a filter that is doing something must look different from one that isn't. */
 .linkbtn.has-sel{color:var(--accent-text);background:var(--accent-weak);}
+#copies[hidden]{display:none;}
+.copyhead{font-size:13px;margin-bottom:8px;}
+.copyrow{display:flex;gap:10px;align-items:baseline;justify-content:space-between;
+ font-size:12.5px;padding:4px 0;border-top:1px solid var(--line);}
+.copyrow .mono{word-break:break-all;}
 .dd{position:relative;display:inline-block;}
 .dd-btn{display:inline-flex;align-items:center;gap:6px;background:var(--content);border:1px solid var(--line-strong);
  border-radius:999px;padding:8px 10px 8px 15px;font:inherit;font-size:13px;font-weight:500;color:var(--fg);
@@ -556,6 +561,7 @@ pub fn browse_page(csrf: &str) -> String {
   </div>
   <div class="mut" id="datenote" style="font-size:12px;margin:0 0 8px" hidden>A date filter hides files inside archives — we don't record a modified date for them.</div>
   <div class="mut" style="font-size:12px;margin:0 0 10px">Grouped by drive and folder. Files sharing identical content share a <span class="diamond" style="--dup:hsl(280,72%,52%)">◆</span> color — click one to highlight every copy.</div>
+  <div class="card" id="copies" hidden style="margin-bottom:12px;padding:12px 14px"></div>
   <div class="card tree-card" style="padding:8px"><div id="results" class="tree"></div></div>
 </div>"##;
     let script = r##"
@@ -669,8 +675,31 @@ $("#results").addEventListener("click",e=>{
   const leaf=e.target.closest(".leaf.dup"); if(!leaf)return;
   const hash=leaf.dataset.hash, was=leaf.classList.contains("hl");
   document.querySelectorAll(".leaf.hl").forEach(el=>el.classList.remove("hl"));
-  if(!was) document.querySelectorAll('.leaf[data-hash="'+CSS.escape(hash)+'"]').forEach(el=>el.classList.add("hl"));
+  if(was){ $("#copies").hidden=true; return; }
+  document.querySelectorAll('.leaf[data-hash="'+CSS.escape(hash)+'"]').forEach(el=>el.classList.add("hl"));
+  showCopies(hash);
 });
+// The highlight can only mark rows this page loaded, and the page is capped. Ask the catalogue
+// where the copies actually are, or a truncated result set quietly under-reports them (#30).
+async function showCopies(hash){
+  const box=$("#copies"); box.hidden=false;
+  box.innerHTML='<span class="mut">Looking for every copy…</span>';
+  try{
+    const cs=await apiGet("/api/copies?hash="+encodeURIComponent(hash));
+    const onPage=document.querySelectorAll('.leaf[data-hash="'+CSS.escape(hash)+'"]').length;
+    const rows=cs.map(c=>{
+      const where=c.mounted?"":' <span class="mut">(drive not connected)</span>';
+      const st=c.status!=="active"?` <span class="pill ${esc(c.status)}">${esc(c.status)}</span>`:"";
+      return `<div class="copyrow"><span class="mono">${esc(c.location)}</span>
+        <span class="mut">${esc(c.volume_label||c.volume_id)}${where}</span>${st}</div>`;
+    }).join("");
+    const hidden=cs.length-onPage;
+    const note=hidden>0
+      ? `<span class="mut">${hidden} of them ${hidden===1?"is":"are"} not shown in the tree above.</span>`
+      : "";
+    box.innerHTML=`<div class="copyhead"><b>${cs.length}</b> ${cs.length===1?"copy":"copies"} of this content ${note}</div>${rows}`;
+  }catch(err){ box.innerHTML='<span class="mut">Could not load the copy list: '+esc(String(err))+'</span>'; }
+}
 function debounced(){ clearTimeout(timer); timer=setTimeout(run,180); }
 // Turn a native <select> into a styled MULTI-select dropdown. The chosen values live in F[sel.id]
 // (an array; empty = no filter). `opts.badge(value)` may return a count to flag on each option,
