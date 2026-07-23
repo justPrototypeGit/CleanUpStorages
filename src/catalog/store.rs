@@ -911,6 +911,31 @@ mod tests {
     }
 
     #[test]
+    fn an_intermediate_archive_name_is_searchable() {
+        // "photos.zip" appears only in the container chain -- not in the filename, not in the
+        // relative path. Before container_chain was indexed this query found nothing, which on a
+        // catalog that is mostly archive entries hides most of the corpus from search.
+        let (_t, cat) = open_tmp();
+        cat.upsert_archive_entry(
+            "vol-1",
+            "backups/old.zip",
+            &mk_entry("photos.zip › vacation.jpg", "h-vac"),
+            200,
+        )
+        .unwrap();
+
+        let hits = cat.search("photos", None, None, None).unwrap();
+        assert_eq!(hits.len(), 1, "found via the intermediate archive name");
+        assert_eq!(hits[0].filename, "vacation.jpg");
+
+        // The trigger keeps the index in step with a delete, or the row would linger in search.
+        cat.conn
+            .execute("DELETE FROM files WHERE filename='vacation.jpg'", [])
+            .unwrap();
+        assert!(cat.search("photos", None, None, None).unwrap().is_empty());
+    }
+
+    #[test]
     fn archive_entry_dedupes_against_loose_file_by_hash() {
         let (_t, cat) = open_tmp();
         cat.upsert_file(&mk_file("vol-1", "loose/vacation.jpg", "same"), 200)
