@@ -184,6 +184,21 @@ details.drive>summary:hover,details.folder>summary:hover{background:var(--line);
 .searchbar input{flex:1;font:inherit;font-size:14px;color:var(--fg);}
 .browsetools{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:14px;}
 .browsetools .count{margin-left:auto;font-size:13px;}
+/* `.browsetools` sets display:flex, which outranks the UA sheet's [hidden]{display:none} at equal
+   specificity — without this the collapsed row is never actually collapsed. */
+.browsetools[hidden]{display:none;}
+#rangerow{margin-top:-6px;}
+.rangelbl{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--mut);}
+.rangelbl input[type=date]{font:inherit;font-size:12.5px;color:var(--fg);background:var(--content);
+ border:1px solid var(--line-strong);border-radius:8px;padding:5px 8px;}
+.rangelbl input[type=date]:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-weak);}
+/* Mirrors .dd.multi.has-sel: a filter that is doing something must look different from one that isn't. */
+.linkbtn.has-sel{color:var(--accent-text);background:var(--accent-weak);}
+#copies[hidden]{display:none;}
+.copyhead{font-size:13px;margin-bottom:8px;}
+.copyrow{display:flex;gap:10px;align-items:baseline;justify-content:space-between;
+ font-size:12.5px;padding:4px 0;border-top:1px solid var(--line);}
+.copyrow .mono{word-break:break-all;}
 .dd{position:relative;display:inline-block;}
 .dd-btn{display:inline-flex;align-items:center;gap:6px;background:var(--content);border:1px solid var(--line-strong);
  border-radius:999px;padding:8px 10px 8px 15px;font:inherit;font-size:13px;font-weight:500;color:var(--fg);
@@ -525,9 +540,28 @@ pub fn browse_page(csrf: &str) -> String {
     <select id="status"><option value="">Any status</option>
       <option value="active">Active</option><option value="missing">Missing</option>
       <option value="quarantined">Quarantined</option><option value="purged">Purged</option></select>
+    <button type="button" class="linkbtn" id="rangetoggle" aria-expanded="false">Size &amp; date</button>
     <span class="mut count" id="count"></span>
   </div>
+  <div class="browsetools" id="rangerow" hidden>
+    <label class="rangelbl">Size
+      <select id="minsize"><option value="">any</option>
+        <option value="1048576">≥ 1 MB</option><option value="10485760">≥ 10 MB</option>
+        <option value="104857600">≥ 100 MB</option><option value="1073741824">≥ 1 GB</option></select>
+      <select id="maxsize"><option value="">any</option>
+        <option value="1048576">≤ 1 MB</option><option value="10485760">≤ 10 MB</option>
+        <option value="104857600">≤ 100 MB</option><option value="1073741824">≤ 1 GB</option></select>
+    </label>
+    <label class="rangelbl">Modified
+      <input type="date" id="datefrom" aria-label="Modified on or after">
+      <span class="mut">to</span>
+      <input type="date" id="dateto" aria-label="Modified on or before">
+    </label>
+    <button type="button" class="linkbtn" id="clearranges">Clear</button>
+  </div>
+  <div class="mut" id="datenote" style="font-size:12px;margin:0 0 8px" hidden>A date filter hides files inside archives — we don't record a modified date for them.</div>
   <div class="mut" style="font-size:12px;margin:0 0 10px">Grouped by drive and folder. Files sharing identical content share a <span class="diamond" style="--dup:hsl(280,72%,52%)">◆</span> color — click one to highlight every copy.</div>
+  <div class="card" id="copies" hidden style="margin-bottom:12px;padding:12px 14px"></div>
   <div class="card tree-card" style="padding:8px"><div id="results" class="tree"></div></div>
 </div>"##;
     let script = r##"
@@ -606,9 +640,31 @@ function renderTree(drives){
   }
   return html;
 }
+// A picked date is a LOCAL calendar day, so "to" means the end of that day, inclusive — otherwise
+// choosing the same day for both bounds would match only midnight.
+function dayEpoch(value,endOfDay){
+  if(!value) return null;
+  const [y,m,d]=value.split("-").map(Number);
+  if(!y||!m||!d) return null;
+  const dt=endOfDay ? new Date(y,m-1,d,23,59,59) : new Date(y,m-1,d,0,0,0);
+  return Math.floor(dt.getTime()/1000);
+}
+function rangeParams(p){
+  const minS=$("#minsize").value, maxS=$("#maxsize").value;
+  if(minS) p.set("min_size",minS);
+  if(maxS) p.set("max_size",maxS);
+  const from=dayEpoch($("#datefrom").value,false), to=dayEpoch($("#dateto").value,true);
+  if(from!==null) p.set("modified_after",String(from));
+  if(to!==null) p.set("modified_before",String(to));
+  // Archive entries carry no modified_time, so any date bound silently drops them. Say so.
+  $("#datenote").hidden = (from===null && to===null);
+  return (minS||maxS||from!==null||to!==null);
+}
 async function run(){ try{
   const p=new URLSearchParams(); const q=$("#q").value.trim(); if(q)p.set("q",q);
   for(const k of ["volume","category","status"]){ if(F[k].length) p.set(k,F[k].join(",")); }
+  const ranged=rangeParams(p);
+  $("#rangetoggle").classList.toggle("has-sel",ranged);
   p.set("limit","3000");
   const hits=await apiGet("/api/search?"+p.toString());
   $("#count").textContent=hits.length+" result"+(hits.length===1?"":"s")+(hits.length>=3000?" (showing first 3000 — refine your search)":"");
@@ -619,8 +675,31 @@ $("#results").addEventListener("click",e=>{
   const leaf=e.target.closest(".leaf.dup"); if(!leaf)return;
   const hash=leaf.dataset.hash, was=leaf.classList.contains("hl");
   document.querySelectorAll(".leaf.hl").forEach(el=>el.classList.remove("hl"));
-  if(!was) document.querySelectorAll('.leaf[data-hash="'+CSS.escape(hash)+'"]').forEach(el=>el.classList.add("hl"));
+  if(was){ $("#copies").hidden=true; return; }
+  document.querySelectorAll('.leaf[data-hash="'+CSS.escape(hash)+'"]').forEach(el=>el.classList.add("hl"));
+  showCopies(hash);
 });
+// The highlight can only mark rows this page loaded, and the page is capped. Ask the catalogue
+// where the copies actually are, or a truncated result set quietly under-reports them (#30).
+async function showCopies(hash){
+  const box=$("#copies"); box.hidden=false;
+  box.innerHTML='<span class="mut">Looking for every copy…</span>';
+  try{
+    const cs=await apiGet("/api/copies?hash="+encodeURIComponent(hash));
+    const onPage=document.querySelectorAll('.leaf[data-hash="'+CSS.escape(hash)+'"]').length;
+    const rows=cs.map(c=>{
+      const where=c.mounted?"":' <span class="mut">(drive not connected)</span>';
+      const st=c.status!=="active"?` <span class="pill ${esc(c.status)}">${esc(c.status)}</span>`:"";
+      return `<div class="copyrow"><span class="mono">${esc(c.location)}</span>
+        <span class="mut">${esc(c.volume_label||c.volume_id)}${where}</span>${st}</div>`;
+    }).join("");
+    const hidden=cs.length-onPage;
+    const note=hidden>0
+      ? `<span class="mut">${hidden} of them ${hidden===1?"is":"are"} not shown in the tree above.</span>`
+      : "";
+    box.innerHTML=`<div class="copyhead"><b>${cs.length}</b> ${cs.length===1?"copy":"copies"} of this content ${note}</div>${rows}`;
+  }catch(err){ box.innerHTML='<span class="mut">Could not load the copy list: '+esc(String(err))+'</span>'; }
+}
 function debounced(){ clearTimeout(timer); timer=setTimeout(run,180); }
 // Turn a native <select> into a styled MULTI-select dropdown. The chosen values live in F[sel.id]
 // (an array; empty = no filter). `opts.badge(value)` may return a count to flag on each option,
@@ -678,6 +757,18 @@ async function init(){
   // Status filter flags how many rows carry each kind (active/missing/quarantined/purged), so
   // hidden-by-default purged rows stay discoverable; toggling combines statuses (OR).
   enhanceSelect($("#status"),{onChange:run, badge: val => (statusCounts[val]||0)});
+  // Size/date are ranges, not multi-select, so they stay plain controls (enhanceSelect is the
+  // multi-select widget and would misrepresent them).
+  $("#rangetoggle").addEventListener("click",()=>{
+    const row=$("#rangerow"), open=row.hidden;
+    row.hidden=!open;
+    $("#rangetoggle").setAttribute("aria-expanded",String(open));
+  });
+  for(const id of ["minsize","maxsize","datefrom","dateto"]) $("#"+id).addEventListener("change",run);
+  $("#clearranges").addEventListener("click",()=>{
+    for(const id of ["minsize","maxsize","datefrom","dateto"]) $("#"+id).value="";
+    run();
+  });
   await loadCounts();
   run();
 }
