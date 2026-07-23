@@ -483,7 +483,7 @@ fn scan_records_phase_timings_and_the_size_histogram() {
     assert_eq!(m.histogram[2], 1, "the 5000-byte file");
     assert_eq!(m.bytes_hashed, 5010);
     assert_eq!(m.bytes_skipped, 0);
-    assert!(m.wall_ms > 0 || m.total_phase_ms() == 0);
+    assert!(m.hash_ms > 0 || m.walk_ms > 0, "some phase must have been timed");
     assert!(
         m.total_phase_ms() <= m.wall_ms,
         "phases {} exceeded wall {}",
