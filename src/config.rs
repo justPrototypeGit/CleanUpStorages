@@ -8,6 +8,9 @@ pub struct Config {
     pub max_archive_depth: usize,
     pub archive_entry_max_bytes: u64,
     pub archive_ratio_cap: u64,
+    /// Nested-archive bytes held in memory at once across a whole descent. `archive_entry_max_bytes`
+    /// bounds one level; without this a deep chain keeps every ancestor's buffer alive at once.
+    pub archive_total_buffer_bytes: u64,
 }
 
 impl Config {
@@ -22,6 +25,7 @@ impl Config {
                 max_archive_depth: 8,
                 archive_entry_max_bytes: 2 * 1024 * 1024 * 1024,
                 archive_ratio_cap: 200,
+                archive_total_buffer_bytes: 2 * 1024 * 1024 * 1024,
             });
         }
 
@@ -35,6 +39,7 @@ impl Config {
             max_archive_depth: 8,
             archive_entry_max_bytes: 2 * 1024 * 1024 * 1024,
             archive_ratio_cap: 200,
+            archive_total_buffer_bytes: 2 * 1024 * 1024 * 1024,
         })
     }
 
