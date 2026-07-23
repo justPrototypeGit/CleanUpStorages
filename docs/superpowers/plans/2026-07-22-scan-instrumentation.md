@@ -10,9 +10,9 @@
 
 **Spec:** [docs/superpowers/specs/2026-07-22-scan-instrumentation-design.md](../specs/2026-07-22-scan-instrumentation-design.md)
 
-**Two deliberate deviations from the spec's architecture sketch** (behaviour and stored data unchanged):
+**One deliberate deviation from the spec's architecture sketch** (behaviour and stored data unchanged):
 
-1. **The scanner owns `ScanMetrics`; it is not passed in as a parameter.** The spec sketched `&ScanMetrics` alongside `Option<&dyn Progress>`. Passing it would change the signature of `scan_volume_with_progress` and every one of its ~12 call sites (mostly tests) for no gain, since live per-phase display is an explicit non-goal. `ScanMetrics` is still `Send + Sync`, so #23 wraps it in an `Arc` locally and hands clones to workers — the property that mattered is preserved.
+1. ~~**The scanner owns `ScanMetrics`; it is not passed in as a parameter.**~~ **Reverted in pre-merge review — the spec's `&ScanMetrics` parameter was built after all.** The estimate of "~12 call sites" was wrong (there are three), and owning the accumulator inside the scan meant a *failed* scan recorded `wall_ms=0, files_seen=0` — destroying the measurement for the run most worth measuring. `run_scan` now constructs the accumulator and keeps it, so a scan that dies late still persists what it measured.
 2. **Counters have exactly one owner each.** `ScanSummary` keeps `hashed`/`skipped`/`errors`/`archive_entries` (it already owns them, and tests assert on them); `ScanMetrics` owns only what is new — phase timings, `files_seen`, `bytes_hashed`, `bytes_skipped`, and the histogram. Duplicating the existing counters into `ScanMetrics` would create two sources of truth that can drift. `finish_scan_run` takes both structs.
 
 **One spec test deliberately not built.** The spec's risk table proposes asserting that an
