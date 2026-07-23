@@ -666,19 +666,17 @@ mod tests {
 
     #[test]
     fn scan_records_phase_timings_and_the_size_histogram() {
-        let (_t, cat, root) = fixture_with_files(&[("a.txt", 10), ("big.bin", 30_000_000)]);
+        let (_t, cat, root) = fixture_with_files(&[("a.txt", 10), ("big.bin", 5000)]);
         let s = scan_volume(&cat, &root, &ident(), false, 100).unwrap();
         let m = &s.metrics;
 
         assert_eq!(m.files_seen, 2);
         assert_eq!(m.histogram[1], 1, "the 10-byte file");
-        assert_eq!(m.histogram[5], 1, "the 30MB file");
-        assert_eq!(m.bytes_hashed, 30_000_010);
+        assert_eq!(m.histogram[2], 1, "the 5000-byte file");
+        assert_eq!(m.bytes_hashed, 5010);
         assert_eq!(m.bytes_skipped, 0);
-        assert!(
-            m.hash_ms > 0 || m.walk_ms > 0,
-            "some phase must have been timed"
-        );
+        // Upper bound only: on a fast disk these phases legitimately round to 0 ms. That the
+        // timers accumulate at all is proven in scan_metrics with a controlled sleep.
         assert!(
             m.total_phase_ms() <= m.wall_ms,
             "phases {} exceeded wall {}",
