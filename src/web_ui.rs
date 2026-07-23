@@ -943,6 +943,10 @@ pub fn scan_page(csrf: &str) -> String {
 <div class="card">
   <h3 style="margin:0 0 4px">Recent scans</h3>
   <div id="recent" class="mut">None yet.</div>
+</div>
+<div class="card" style="margin-top:20px">
+  <h2 style="margin:0 0 12px;font-size:15px">Recent scans</h2>
+  <div id="runs"><span class="mut">Loading…</span></div>
 </div>"##;
     let script = r##"
 function baseName(p){ const s=String(p).replace(/[\\/]+$/,""); const m=s.split(/[\\/]/); return m[m.length-1]||s; }
@@ -1008,7 +1012,33 @@ async function poll(){
     if(s.running || s.queued.length) setTimeout(poll, 1500);
   }catch(e){ /* stop polling on error */ }
 }
-loadDrives(); poll();"##;
+function runRow(r){
+  const m=r.metrics, tot=m.walk_ms+m.skip_check_ms+m.hash_ms+m.db_write_ms+m.archive_ms;
+  const pct=v=>tot?Math.round(v*100/tot):0;
+  const when=r.started_at?fmtDate(r.started_at):"";
+  const status=r.status==="running"?'<span class="mut">running…</span>'
+    :r.status==="failed"?`<span style="color:var(--red)">failed</span>`:r.status;
+  // Phase split as a single bar: the shape is the point, not the exact numbers.
+  const bar=[["walk",m.walk_ms],["skip",m.skip_check_ms],["hash",m.hash_ms],
+             ["db",m.db_write_ms],["arch",m.archive_ms]]
+    .filter(([,v])=>v>0)
+    .map(([k,v])=>`<span title="${k} ${v} ms">${k} ${pct(v)}%</span>`).join(" · ");
+  return `<div class="dl"><span class="k">${esc(when)} — ${esc(r.root_path)}</span>
+    <span class="v">${status}</span></div>
+    <div class="mut" style="font-size:12px;padding:0 0 10px">
+      ${r.hashed} hashed · ${r.skipped} unchanged · ${r.errors} errors ·
+      ${fmtSize(m.bytes_hashed)} hashed in ${m.wall_ms} ms${bar?" · "+bar:""}
+      ${r.error_message?"<br>"+esc(r.error_message):""}
+    </div>`;
+}
+async function loadRuns(){
+  try{
+    const rs=await apiGet("/api/scan-runs?limit=10");
+    $("#runs").innerHTML = rs.length ? rs.map(runRow).join("")
+      : '<span class="mut">No scans recorded yet.</span>';
+  }catch(e){ $("#runs").innerHTML='<span class="mut">Could not load scan history.</span>'; }
+}
+loadDrives(); poll(); loadRuns();"##;
     shell("scan", csrf, "Scan a drive", main, script)
 }
 
