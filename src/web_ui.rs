@@ -559,7 +559,7 @@ pub fn browse_page(csrf: &str) -> String {
     </label>
     <button type="button" class="linkbtn" id="clearranges">Clear</button>
   </div>
-  <div class="mut" id="datenote" style="font-size:12px;margin:0 0 8px" hidden>A date filter hides files inside archives — we don't record a modified date for them.</div>
+  <div class="mut" id="datenote" style="font-size:12px;margin:0 0 8px" hidden>Files inside archives use the date of the archive they're in. Any catalogued before this feature need a rescan to pick that up.</div>
   <div class="mut" style="font-size:12px;margin:0 0 10px">Grouped by drive and folder. Files sharing identical content share a <span class="diamond" style="--dup:hsl(280,72%,52%)">◆</span> color — click one to highlight every copy.</div>
   <div class="card" id="copies" hidden style="margin-bottom:12px;padding:12px 14px"></div>
   <div class="card tree-card" style="padding:8px"><div id="results" class="tree"></div></div>
@@ -656,7 +656,8 @@ function rangeParams(p){
   const from=dayEpoch($("#datefrom").value,false), to=dayEpoch($("#dateto").value,true);
   if(from!==null) p.set("modified_after",String(from));
   if(to!==null) p.set("modified_before",String(to));
-  // Archive entries carry no modified_time, so any date bound silently drops them. Say so.
+  // Archive entries inherit their archive's date, but only from a scan done since that feature
+  // landed. Flag it whenever a date bound is active so an under-count isn't mistaken for a bug.
   $("#datenote").hidden = (from===null && to===null);
   return (minS||maxS||from!==null||to!==null);
 }
