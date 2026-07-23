@@ -12,6 +12,7 @@ pub mod quarantine;
 pub mod repack;
 pub mod scan_queue;
 pub mod scanner;
+pub mod verify;
 pub mod volume;
 pub mod web;
 pub mod web_ui;
