@@ -1018,7 +1018,7 @@ function runRow(r){
   const pct=v=>tot?Math.round(v*100/tot):0;
   const when=r.started_at?fmtDate(r.started_at):"";
   const status=r.status==="running"?'<span class="mut">running…</span>'
-    :r.status==="failed"?`<span style="color:var(--red)">failed</span>`:r.status;
+    :r.status==="failed"?`<span style="color:var(--red)">failed</span>`:esc(r.status);
   // Phase split as a single bar: the shape is the point, not the exact numbers.
   const bar=[["walk",m.walk_ms],["skip",m.skip_check_ms],["hash",m.hash_ms],
              ["db",m.db_write_ms],["arch",m.archive_ms]]
