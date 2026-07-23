@@ -33,6 +33,13 @@ pub fn quarantine_files(
 
     let mut out = QuarantineOutcome::default();
 
+    // Hashes computed during THIS call, keyed by absolute path. Confirming a K-copy group costs
+    // ~2K full file reads otherwise — ten 5 GB copies would read ~100 GB over USB for one click.
+    // The cost: a later victim may trust a hash read seconds earlier, which widens the
+    // check-to-rename window slightly. Better than a user cancelling a correct operation midway.
+    let mut hashed: std::collections::HashMap<std::path::PathBuf, String> =
+        std::collections::HashMap::new();
+
     for &id in ids {
         let skip =
             |cat: &Catalog, reason: String, out: &mut QuarantineOutcome| -> anyhow::Result<()> {
@@ -74,7 +81,7 @@ pub fn quarantine_files(
         // scan skips re-hashing when size and second-granularity mtime match, so a same-size edit
         // made within one second of the recorded mtime leaves a stale hash (#4) — and a stale hash
         // is exactly how a unique file gets mistaken for a duplicate.
-        let live_hash = match crate::hashing::hash_file(&src) {
+        let live_hash = match hash_cached(&mut hashed, &src) {
             Ok(h) => h,
             Err(e) => {
                 skip(
@@ -98,27 +105,39 @@ pub fn quarantine_files(
         //     this file still matches its catalogued hash, because once the victim has drifted we
         //     have no evidence the remote copy holds these bytes.
         let mut survivor_ok = false;
+        let mut only_archived = false;
+        let mut read_error: Option<String> = None;
         for s in cat.active_copies(&rec.content_hash)? {
             if s.id == id {
+                continue;
+            }
+            if s.container_chain.is_some() {
+                // An archived copy cannot stand in for a loose one: reclaiming it needs a repack,
+                // and hashing its row would hash the containing zip, never these bytes.
+                only_archived = true;
                 continue;
             }
             if s.volume_id != expected_volume_id {
                 survivor_ok = live_hash == rec.content_hash;
             } else {
                 let path = mount_root.join(&s.relative_path);
-                survivor_ok = path.is_file()
-                    && crate::hashing::hash_file(&path).is_ok_and(|h| h == live_hash);
+                survivor_ok = match hash_cached(&mut hashed, &path) {
+                    Ok(h) => h == live_hash,
+                    Err(e) => {
+                        // Safe direction: an unreadable candidate is not a survivor. Keep the
+                        // reason so the user is not told to rescan when the real problem is a
+                        // permission error or a bad sector.
+                        read_error = Some(format!("{}: {e}", s.relative_path));
+                        false
+                    }
+                };
             }
             if survivor_ok {
                 break;
             }
         }
         if !survivor_ok {
-            let reason = if live_hash == rec.content_hash {
-                "no surviving copy verified on disk (a same-drive duplicate may have been \
-                 deleted outside the tool — rescan the drive and retry)"
-                    .to_string()
-            } else {
+            let reason = if live_hash != rec.content_hash {
                 // The catalogue disagrees with the bytes on disk, so the "duplicate" verdict that
                 // put this file in the review queue was made against content that no longer exists.
                 format!(
@@ -127,6 +146,16 @@ pub fn quarantine_files(
                     &live_hash[..16.min(live_hash.len())],
                     &rec.content_hash[..16.min(rec.content_hash.len())]
                 )
+            } else if only_archived {
+                "the only other copy is inside an archive — quarantine cannot reclaim that; \
+                 use repack instead"
+                    .to_string()
+            } else if let Some(e) = read_error {
+                format!("could not verify the surviving copy ({e})")
+            } else {
+                "no surviving copy verified on disk (a same-drive duplicate may have been \
+                 deleted outside the tool — rescan the drive and retry)"
+                    .to_string()
             };
             skip(cat, reason, &mut out)?;
             continue;
@@ -167,6 +196,20 @@ pub fn quarantine_files(
         }
     }
     Ok(out)
+}
+
+/// Hash `path`, reusing a hash already computed in this call. Scoped to one `quarantine_files`
+/// invocation, so it cannot serve a stale value across separate user actions.
+fn hash_cached(
+    cache: &mut std::collections::HashMap<std::path::PathBuf, String>,
+    path: &Path,
+) -> std::io::Result<String> {
+    if let Some(h) = cache.get(path) {
+        return Ok(h.clone());
+    }
+    let h = crate::hashing::hash_file(path)?;
+    cache.insert(path.to_path_buf(), h.clone());
+    Ok(h)
 }
 
 /// Compute a collision-free `_ToDelete/<origin>` relative path (adds ` (n)` before the
