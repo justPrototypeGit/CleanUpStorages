@@ -27,6 +27,8 @@ pub struct ScanSummary {
     pub errors: usize,
     pub marked_missing: usize,
     pub archive_entries: usize,
+    /// Where this scan's time went. Measured always; see `scan_metrics`.
+    pub metrics: crate::scan_metrics::MetricsSnapshot,
 }
 
 /// Metadata timestamp (best-effort) as seconds since UNIX_EPOCH.
@@ -67,6 +69,9 @@ fn rotate_batch(cat: &Catalog, in_batch: &mut usize) -> anyhow::Result<()> {
 /// scan's `last_seen_at` stamp and as `scan_started_at` for the missing-file sweep: because every
 /// file touched this scan gets `last_seen_at == now`, `mark_missing_scanned` (which flags rows
 /// with `last_seen_at < scan_started_at`) only ever catches files genuinely absent this pass.
+///
+/// `metrics` is owned by the caller so a scan that bails part-way still yields what it measured
+/// before it died — the multi-day run that fails late is the one most worth measuring.
 pub fn scan_volume_with_progress(
     cat: &Catalog,
     root: &Path,
@@ -74,6 +79,7 @@ pub fn scan_volume_with_progress(
     force: bool,
     now: i64,
     progress: Option<&dyn Progress>,
+    metrics: &crate::scan_metrics::ScanMetrics,
 ) -> anyhow::Result<ScanSummary> {
     let scan_started_at = now;
     let limits = ArchiveLimits::from_config(&Config::default_paths()?);
@@ -81,7 +87,13 @@ pub fn scan_volume_with_progress(
     let mut in_batch = 0usize;
     cat.conn.execute_batch("BEGIN")?;
 
-    for entry in WalkDir::new(root) {
+    let mut walker = WalkDir::new(root).into_iter();
+    loop {
+        let next = {
+            let _t = metrics.timer(crate::scan_metrics::Phase::Walk);
+            walker.next()
+        };
+        let Some(entry) = next else { break };
         let entry = match entry {
             Ok(e) => e,
             Err(err) => {
@@ -114,9 +126,18 @@ pub fn scan_volume_with_progress(
             continue;
         };
 
-        let meta = match entry.metadata() {
+        // The failed stat is legitimately walk cost; the two SQLite writes that follow it are not,
+        // so the guard drops before the error arm runs.
+        let stat = {
+            let _t = metrics.timer(crate::scan_metrics::Phase::Walk);
+            entry.metadata()
+        };
+        let meta = match stat {
             Ok(m) => m,
             Err(e) => {
+                // Still a file the walk considered, and it still cost a seek — but its size is
+                // genuinely unknown, so it lands in bucket 0.
+                metrics.record_file_seen(0);
                 cat.log_scan_error(
                     Some(&identity.volume_id),
                     &rel,
@@ -133,27 +154,50 @@ pub fn scan_volume_with_progress(
         };
         let size = meta.len() as i64;
         let mtime = unix_secs(meta.modified());
+        metrics.record_file_seen(size);
 
         // Incremental skip: same size + mtime as catalogued -> just touch, don't re-hash.
-        if !force {
-            if let Some((old_size, old_mtime)) = cat.get_file_meta(&identity.volume_id, &rel)? {
-                if old_size == size && old_mtime == mtime.unwrap_or(0) {
+        // `skip_check` is get_file_meta + touch_seen only; the batch COMMIT this path also
+        // triggers is db_write (it is the fsync #26 targets), so the guard must be dead before
+        // rotate_batch runs — otherwise a rescan books 100% of its fsyncs to skip_check and reads
+        // as seek-bound.
+        let is_unchanged = if force {
+            false
+        } else {
+            let _t = metrics.timer(crate::scan_metrics::Phase::SkipCheck);
+            match cat.get_file_meta(&identity.volume_id, &rel)? {
+                Some((old_size, old_mtime))
+                    if old_size == size && old_mtime == mtime.unwrap_or(0) =>
+                {
                     cat.touch_seen(&identity.volume_id, &rel, now)?;
                     if archive::is_archive_name(&rel) {
                         cat.touch_archive_entries(&identity.volume_id, &rel, now)?;
                     }
-                    summary.skipped += 1;
-                    if let Some(p) = progress {
-                        p.on_skipped();
-                    }
-                    in_batch += 1;
-                    rotate_batch(cat, &mut in_batch)?;
-                    continue;
+                    true
                 }
+                _ => false,
             }
+        };
+        if is_unchanged {
+            summary.skipped += 1;
+            metrics.add_bytes_skipped(size);
+            if let Some(p) = progress {
+                p.on_skipped();
+            }
+            in_batch += 1;
+            {
+                let _t = metrics.timer(crate::scan_metrics::Phase::DbWrite);
+                rotate_batch(cat, &mut in_batch)?;
+            }
+            continue;
         }
 
-        let hash = match hashing::hash_file(path) {
+        // As with the stat above: the failed read is hash cost, its error logging is not.
+        let hashed = {
+            let _t = metrics.timer(crate::scan_metrics::Phase::Hash);
+            hashing::hash_file(path)
+        };
+        let hash = match hashed {
             Ok(h) => h,
             Err(e) => {
                 cat.log_scan_error(Some(&identity.volume_id), &rel, &format!("read: {e}"), now)?;
@@ -165,6 +209,7 @@ pub fn scan_volume_with_progress(
                 continue;
             }
         };
+        metrics.add_bytes_hashed(size);
 
         let ext = path
             .extension()
@@ -183,15 +228,19 @@ pub fn scan_volume_with_progress(
             category: Category::from_extension(&ext),
             container_chain: None,
         };
-        cat.upsert_file(&nf, now)?;
+        {
+            let _t = metrics.timer(crate::scan_metrics::Phase::DbWrite);
+            cat.upsert_file(&nf, now)?;
+            in_batch += 1;
+            rotate_batch(cat, &mut in_batch)?;
+        }
         summary.hashed += 1;
         if let Some(p) = progress {
             p.on_hashed();
         }
-        in_batch += 1;
-        rotate_batch(cat, &mut in_batch)?;
 
         if archive::is_archive_name(&rel) {
+            let _t = metrics.timer(crate::scan_metrics::Phase::Archive);
             descend_archive(
                 cat,
                 path,
@@ -206,8 +255,16 @@ pub fn scan_volume_with_progress(
         }
     }
 
-    cat.conn.execute_batch("COMMIT")?;
-    summary.marked_missing = cat.mark_missing_scanned(&identity.volume_id, scan_started_at, now)?;
+    // The final COMMIT and the missing-sweep are both real scan cost and both hit SQLite, so they
+    // belong to db_write. Leaving them untimed would inflate the unaccounted gap and understate
+    // exactly the fsync cost #26 targets.
+    {
+        let _t = metrics.timer(crate::scan_metrics::Phase::DbWrite);
+        cat.conn.execute_batch("COMMIT")?;
+        summary.marked_missing =
+            cat.mark_missing_scanned(&identity.volume_id, scan_started_at, now)?;
+    }
+    summary.metrics = metrics.snapshot();
     Ok(summary)
 }
 
@@ -219,7 +276,8 @@ pub fn scan_volume(
     force: bool,
     now: i64,
 ) -> anyhow::Result<ScanSummary> {
-    scan_volume_with_progress(cat, root, identity, force, now, None)
+    let metrics = crate::scan_metrics::ScanMetrics::new();
+    scan_volume_with_progress(cat, root, identity, force, now, None, &metrics)
 }
 
 /// Resolve identity, upsert the volume, and scan. `Ok(None)` iff a read-only drive was skipped.
@@ -250,7 +308,52 @@ pub fn run_scan(
     // Remember where this volume was scanned so a folder-drive (not a disk root) can be recognized
     // as connected later. Best-effort: a bookkeeping failure must not fail the scan.
     let _ = cat.set_volume_path(&identity.volume_id, &mount_root.display().to_string(), now);
-    let summary = scan_volume_with_progress(cat, mount_root, &identity, force, now, progress)?;
+
+    // Best-effort throughout: a bookkeeping failure must never fail a scan. Started before the
+    // scan opens its transaction, so the 'running' row is committed immediately and an
+    // interrupted multi-day scan leaves a record.
+    let run_id = cat
+        .start_scan_run(
+            Some(&identity.volume_id),
+            &mount_root.display().to_string(),
+            now,
+            force,
+        )
+        .map_err(|e| tracing::warn!("could not record scan start: {e}"))
+        .ok();
+
+    // Owned here, not inside the scan, so a scan that bails part-way still reports what it
+    // measured before it died.
+    let metrics = crate::scan_metrics::ScanMetrics::new();
+    let result =
+        scan_volume_with_progress(cat, mount_root, &identity, force, now, progress, &metrics);
+
+    if result.is_err() {
+        // The scan bailed with its BEGIN still open; end it so the metrics UPDATE below is its
+        // own transaction and survives. Nothing durable is lost -- it would have been rolled
+        // back at connection close anyway.
+        let _ = cat.conn.execute_batch("ROLLBACK");
+    }
+
+    if let Some(id) = run_id {
+        let finished_at = crate::commands::now_secs();
+        let outcome = match &result {
+            Ok(summary) => cat.finish_scan_run(id, finished_at, "completed", None, summary),
+            Err(e) => {
+                let msg = e.to_string();
+                let partial = ScanSummary {
+                    metrics: metrics.snapshot(),
+                    ..Default::default()
+                };
+                cat.finish_scan_run(id, finished_at, "failed", Some(&msg), &partial)
+            }
+        };
+        if let Err(e) = outcome {
+            tracing::warn!("could not record scan result: {e}");
+        }
+    }
+
+    let summary = result?;
     // Audit trail: one row per completed scan so the Overview "recent activity" feed can show it.
     let _ = cat.log_action(
         "scan",
@@ -597,11 +700,164 @@ mod tests {
         fs::write(root.join("sub/b.txt"), b"beta").unwrap();
 
         let p = CountingProgress::new();
-        let s = scan_volume_with_progress(&cat, &root, &ident(), false, 100, Some(&p)).unwrap();
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let s = scan_volume_with_progress(&cat, &root, &ident(), false, 100, Some(&p), &m).unwrap();
         assert_eq!(p.hashed.load(Relaxed), s.hashed);
         assert_eq!(p.skipped.load(Relaxed), s.skipped);
         assert_eq!(p.errors.load(Relaxed), s.errors);
         assert_eq!(p.arch.load(Relaxed), s.archive_entries);
         assert_eq!(s.hashed, 2);
+    }
+
+    /// A temp dir containing `files` (name, byte length), plus an open catalog with the `ident()`
+    /// volume already upserted (the `files` table's `volume_id` is FK-enforced).
+    fn fixture_with_files(
+        files: &[(&str, usize)],
+    ) -> (tempfile::TempDir, Catalog, std::path::PathBuf) {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        for (name, len) in files {
+            std::fs::write(root.join(name), vec![b'x'; *len]).unwrap();
+        }
+        let cat = Catalog::open(&t.path().join("c.db")).unwrap();
+        cat.upsert_volume(&Volume {
+            volume_id: "vol-1".into(),
+            label: "T".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
+        (t, cat, root)
+    }
+
+    #[test]
+    fn scan_records_phase_timings_and_the_size_histogram() {
+        let (_t, cat, root) = fixture_with_files(&[("a.txt", 10), ("big.bin", 5000)]);
+        let s = scan_volume(&cat, &root, &ident(), false, 100).unwrap();
+        let m = &s.metrics;
+
+        assert_eq!(m.files_seen, 2);
+        assert_eq!(m.histogram[1], 1, "the 10-byte file");
+        assert_eq!(m.histogram[2], 1, "the 5000-byte file");
+        assert_eq!(m.bytes_hashed, 5010);
+        assert_eq!(m.bytes_skipped, 0);
+        // Upper bound only: on a fast disk these phases legitimately round to 0 ms. That the
+        // timers accumulate at all is proven in scan_metrics with a controlled sleep.
+        assert!(
+            m.total_phase_ms() <= m.wall_ms,
+            "phases {} exceeded wall {}",
+            m.total_phase_ms(),
+            m.wall_ms
+        );
+    }
+
+    #[test]
+    fn rescan_attributes_bytes_to_skipped_not_hashed() {
+        let (_t, cat, root) = fixture_with_files(&[("a.txt", 10), ("b.txt", 20)]);
+        scan_volume(&cat, &root, &ident(), false, 100).unwrap();
+        let s = scan_volume(&cat, &root, &ident(), false, 200).unwrap();
+
+        assert_eq!(s.skipped, 2, "second pass takes the incremental-skip path");
+        assert_eq!(s.metrics.bytes_hashed, 0);
+        assert_eq!(s.metrics.bytes_skipped, 30);
+        assert_eq!(s.metrics.files_seen, 2, "skipped files are still 'seen'");
+        assert_eq!(s.metrics.histogram[1], 2);
+    }
+
+    #[test]
+    fn run_scan_records_a_completed_run() {
+        let (_t, cat, root) = fixture_with_files(&[("a.txt", 10)]);
+        let out = run_scan(
+            &cat,
+            &root,
+            false,
+            crate::volume::ReadonlyMode::Fingerprint,
+            100,
+            None,
+        )
+        .unwrap();
+        assert!(out.is_some());
+
+        let runs = cat.recent_scan_runs(10).unwrap();
+        assert_eq!(runs.len(), 1, "exactly one row per scan, not one per file");
+        assert_eq!(runs[0].status, "completed");
+        assert!(runs[0].finished_at.is_some());
+        assert_eq!(runs[0].hashed, 1);
+        assert_eq!(runs[0].metrics.files_seen, 1);
+        assert!(!runs[0].root_path.is_empty());
+    }
+
+    #[test]
+    fn a_failed_scan_records_failed_with_its_error_and_its_partial_metrics() {
+        let (t, cat, root) = fixture_with_files(&[("a.txt", 10)]);
+        let db = t.path().join("c.db");
+        // Abort the very first file insert. RAISE(ABORT) undoes the statement but leaves the
+        // scan's BEGIN open -- the exact shape that used to swallow the 'failed' row.
+        cat.conn
+            .execute_batch(
+                "CREATE TRIGGER boom BEFORE INSERT ON files
+                 BEGIN SELECT RAISE(ABORT, 'induced scan failure'); END",
+            )
+            .unwrap();
+
+        let out = run_scan(
+            &cat,
+            &root,
+            false,
+            crate::volume::ReadonlyMode::Fingerprint,
+            100,
+            None,
+        );
+        assert!(out.is_err(), "the induced trigger must fail the scan");
+        drop(cat);
+
+        // A fresh connection is the point: reading on the scan's own connection would see the
+        // update inside its abandoned transaction and pass spuriously.
+        let fresh = Catalog::open(&db).unwrap();
+        let runs = fresh.recent_scan_runs(10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            runs[0].status, "failed",
+            "outcome must survive the rollback"
+        );
+        assert!(
+            runs[0]
+                .error_message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("induced scan failure"),
+            "error lost: {:?}",
+            runs[0].error_message
+        );
+        assert_eq!(
+            runs[0].metrics.files_seen, 1,
+            "partial measurement must survive the failure"
+        );
+    }
+
+    #[test]
+    fn a_metrics_write_failure_never_fails_the_scan() {
+        let (_t, cat, root) = fixture_with_files(&[("a.txt", 10)]);
+        // Drop the table out from under the run: recording must degrade, not propagate.
+        cat.conn.execute_batch("DROP TABLE scan_runs").unwrap();
+        let out = run_scan(
+            &cat,
+            &root,
+            false,
+            crate::volume::ReadonlyMode::Fingerprint,
+            100,
+            None,
+        );
+        assert!(
+            out.is_ok(),
+            "a bookkeeping failure must not fail a scan: {out:?}"
+        );
+        assert_eq!(
+            out.unwrap().unwrap().1.hashed,
+            1,
+            "the scan still did its work"
+        );
     }
 }

@@ -10,6 +10,7 @@ pub mod observability;
 pub mod purge;
 pub mod quarantine;
 pub mod repack;
+pub mod scan_metrics;
 pub mod scan_queue;
 pub mod scanner;
 pub mod verify;

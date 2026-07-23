@@ -1,6 +1,7 @@
 pub mod backup;
 pub mod dedup;
 pub mod models;
+pub mod scan_runs;
 pub mod schema;
 pub mod store;
 

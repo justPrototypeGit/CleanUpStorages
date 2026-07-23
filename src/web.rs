@@ -67,6 +67,7 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/purge-all", post(api_purge_all))
         .route("/api/scan", post(api_scan))
         .route("/api/scan/status", get(api_scan_status))
+        .route("/api/scan-runs", get(api_scan_runs))
         .route("/api/pick-folder", post(api_pick_folder))
         .route("/review", get(review))
         .route("/scan", get(scan_page_h))
@@ -947,6 +948,21 @@ async fn api_scan(
 
 async fn api_scan_status(State(state): State<AppState>) -> Json<crate::scan_queue::StatusSnapshot> {
     Json(state.scan_queue.status())
+}
+
+#[derive(Deserialize, Default)]
+struct ScanRunsParams {
+    limit: Option<usize>,
+}
+
+/// Recent scan runs with their phase breakdown. Read-only — no CSRF surface.
+async fn api_scan_runs(
+    State(state): State<AppState>,
+    Query(p): Query<ScanRunsParams>,
+) -> Result<Json<Vec<crate::catalog::scan_runs::ScanRun>>, (StatusCode, String)> {
+    let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
+    let limit = p.limit.unwrap_or(20).clamp(1, 200);
+    Ok(Json(cat.recent_scan_runs(limit).map_err(err500)?))
 }
 
 #[derive(Serialize)]
@@ -2443,5 +2459,45 @@ mod tests {
             "quarantine summary should name the file: {}",
             q["summary"]
         );
+    }
+
+    #[tokio::test]
+    async fn api_scan_runs_lists_recent_runs_newest_first() {
+        let (_t, db, _state) = seed_dupes();
+        {
+            let cat = Catalog::open(&db).unwrap();
+            let id = cat
+                .start_scan_run(Some("vol-1"), "D:/one", 100, false)
+                .unwrap();
+            let s = crate::scanner::ScanSummary {
+                hashed: 3,
+                metrics: crate::scan_metrics::MetricsSnapshot {
+                    hash_ms: 42,
+                    histogram: [0, 1, 2, 0, 0, 0, 0],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            cat.finish_scan_run(id, 150, "completed", None, &s).unwrap();
+            cat.start_scan_run(Some("vol-1"), "D:/two", 200, true)
+                .unwrap();
+        }
+
+        let v = get_json(&db, "/api/scan-runs?limit=10").await;
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["root_path"], "D:/two", "newest first");
+        assert_eq!(arr[0]["status"], "running");
+        assert_eq!(arr[1]["status"], "completed");
+        assert_eq!(arr[1]["hashed"], 3);
+        assert_eq!(arr[1]["metrics"]["hash_ms"], 42);
+        assert_eq!(arr[1]["metrics"]["histogram"][2], 2);
+    }
+
+    #[tokio::test]
+    async fn api_scan_runs_clamps_its_limit() {
+        let (_t, db, _state) = seed_dupes();
+        let v = get_json(&db, "/api/scan-runs?limit=100000").await;
+        assert!(v.is_array(), "an absurd limit must not error: {v}");
     }
 }

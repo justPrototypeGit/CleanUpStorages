@@ -27,7 +27,7 @@ impl From<ReadonlyFallback> for ReadonlyMode {
     }
 }
 
-fn now_secs() -> i64 {
+pub(crate) fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -83,6 +83,7 @@ pub fn cmd_scan(path: &Path, force: bool, fallback: ReadonlyFallback) -> anyhow:
                 "Done: {} hashed, {} unchanged, {} errors, {} newly missing, {} archive entries.",
                 s.hashed, s.skipped, s.errors, s.marked_missing, s.archive_entries
             );
+            print!("{}", s.metrics.report());
         }
     }
     let snap = snapshot(&cfg, now)?;

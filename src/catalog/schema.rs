@@ -53,6 +53,32 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
             occurred_at INTEGER NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS scan_runs (
+            id              INTEGER PRIMARY KEY,
+            volume_id       TEXT,
+            root_path       TEXT NOT NULL,
+            started_at      INTEGER NOT NULL,
+            finished_at     INTEGER,
+            wall_ms         INTEGER,
+            forced          INTEGER NOT NULL,
+            status          TEXT NOT NULL,
+            error_message   TEXT,
+            files_seen      INTEGER NOT NULL DEFAULT 0,
+            hashed          INTEGER NOT NULL DEFAULT 0,
+            skipped         INTEGER NOT NULL DEFAULT 0,
+            errors          INTEGER NOT NULL DEFAULT 0,
+            archive_entries INTEGER NOT NULL DEFAULT 0,
+            bytes_hashed    INTEGER NOT NULL DEFAULT 0,
+            bytes_skipped   INTEGER NOT NULL DEFAULT 0,
+            walk_ms         INTEGER NOT NULL DEFAULT 0,
+            skip_check_ms   INTEGER NOT NULL DEFAULT 0,
+            hash_ms         INTEGER NOT NULL DEFAULT 0,
+            db_write_ms     INTEGER NOT NULL DEFAULT 0,
+            archive_ms      INTEGER NOT NULL DEFAULT 0,
+            size_histogram  TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_scan_runs_started ON scan_runs(started_at DESC);
+
         CREATE VIRTUAL TABLE IF NOT EXISTS files_fts
             USING fts5(filename, relative_path, content='files', content_rowid='id');
 
