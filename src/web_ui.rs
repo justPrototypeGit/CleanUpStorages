@@ -944,8 +944,9 @@ pub fn scan_page(csrf: &str) -> String {
   <h3 style="margin:0 0 4px">Recent scans</h3>
   <div id="recent" class="mut">None yet.</div>
 </div>
-<div class="card" style="margin-top:20px">
-  <h2 style="margin:0 0 12px;font-size:15px">Recent scans</h2>
+<div class="card">
+  <h3 style="margin:0 0 4px">Scan timings</h3>
+  <div class="mut" style="font-size:12px;margin-bottom:10px">Where past scans spent their time. Kept across restarts, unlike the list above.</div>
   <div id="runs"><span class="mut">Loading…</span></div>
 </div>"##;
     let script = r##"
