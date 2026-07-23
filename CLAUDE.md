@@ -80,3 +80,4 @@ Actionable work is tracked as **GitHub issues** (`gh issue list`), not scattered
 - How this was built with AI (the SDLC loop): `docs/ai-sdlc.md`
 - Deferred-idea rationale (now migrated to issues; kept as the long-form "why"): `docs/future-ideas.md`
 - Active backlog: GitHub issues (`gh issue list`)
+- How to benchmark a scan (and the three traps): `docs/benchmarking-scans.md`

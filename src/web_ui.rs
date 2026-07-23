@@ -946,6 +946,11 @@ pub fn scan_page(csrf: &str) -> String {
 <div class="card">
   <h3 style="margin:0 0 4px">Recent scans</h3>
   <div id="recent" class="mut">None yet.</div>
+</div>
+<div class="card">
+  <h3 style="margin:0 0 4px">Scan timings</h3>
+  <div class="mut" style="font-size:12px;margin-bottom:10px">Where past scans spent their time. Kept across restarts, unlike the list above.</div>
+  <div id="runs"><span class="mut">Loading…</span></div>
 </div>"##;
     let script = r##"
 function baseName(p){ const s=String(p).replace(/[\\/]+$/,""); const m=s.split(/[\\/]/); return m[m.length-1]||s; }
@@ -1011,7 +1016,35 @@ async function poll(){
     if(s.running || s.queued.length) setTimeout(poll, 1500);
   }catch(e){ /* stop polling on error */ }
 }
-loadDrives(); poll();"##;
+function runRow(r){
+  const m=r.metrics;
+  // Percent of WALL, matching the CLI. Dividing by the sum of phases would force them to total
+  // 100% and hide exactly the overlap #23 is meant to create.
+  const pct=v=>m.wall_ms?Math.round(v*100/m.wall_ms):0;
+  const when=r.started_at?fmtDate(r.started_at):"";
+  const status=r.status==="running"?'<span class="mut">running…</span>'
+    :r.status==="failed"?`<span style="color:var(--red)">failed</span>`:esc(r.status);
+  // Phase split as a single bar: the shape is the point, not the exact numbers.
+  const bar=[["walk",m.walk_ms],["skip",m.skip_check_ms],["hash",m.hash_ms],
+             ["db",m.db_write_ms],["arch",m.archive_ms]]
+    .filter(([,v])=>v>0)
+    .map(([k,v])=>`<span title="${k} ${v} ms">${k} ${pct(v)}%</span>`).join(" · ");
+  return `<div class="dl"><span class="k">${esc(when)} — ${esc(r.root_path)}</span>
+    <span class="v">${status}</span></div>
+    <div class="mut" style="font-size:12px;padding:0 0 10px">
+      ${r.hashed} hashed · ${r.skipped} unchanged · ${r.errors} errors ·
+      ${fmtSize(m.bytes_hashed)} hashed in ${m.wall_ms} ms${bar?" · "+bar:""}
+      ${r.error_message?"<br>"+esc(r.error_message):""}
+    </div>`;
+}
+async function loadRuns(){
+  try{
+    const rs=await apiGet("/api/scan-runs?limit=10");
+    $("#runs").innerHTML = rs.length ? rs.map(runRow).join("")
+      : '<span class="mut">No scans recorded yet.</span>';
+  }catch(e){ $("#runs").innerHTML='<span class="mut">Could not load scan history.</span>'; }
+}
+loadDrives(); poll(); loadRuns();"##;
     shell("scan", csrf, "Scan a drive", main, script)
 }
 
