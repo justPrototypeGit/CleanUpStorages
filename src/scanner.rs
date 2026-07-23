@@ -286,7 +286,43 @@ pub fn run_scan(
     // Remember where this volume was scanned so a folder-drive (not a disk root) can be recognized
     // as connected later. Best-effort: a bookkeeping failure must not fail the scan.
     let _ = cat.set_volume_path(&identity.volume_id, &mount_root.display().to_string(), now);
-    let summary = scan_volume_with_progress(cat, mount_root, &identity, force, now, progress)?;
+
+    // Best-effort throughout: a bookkeeping failure must never fail a scan. Started before the
+    // scan opens its transaction, so the 'running' row is committed immediately and an
+    // interrupted multi-day scan leaves a record.
+    let run_id = cat
+        .start_scan_run(
+            Some(&identity.volume_id),
+            &mount_root.display().to_string(),
+            now,
+            force,
+        )
+        .map_err(|e| tracing::warn!("could not record scan start: {e}"))
+        .ok();
+
+    let result = scan_volume_with_progress(cat, mount_root, &identity, force, now, progress);
+
+    if let Some(id) = run_id {
+        let finished_at = crate::commands::now_secs();
+        let outcome = match &result {
+            Ok(summary) => cat.finish_scan_run(id, finished_at, "completed", None, summary),
+            Err(e) => {
+                let msg = e.to_string();
+                cat.finish_scan_run(
+                    id,
+                    finished_at,
+                    "failed",
+                    Some(&msg),
+                    &ScanSummary::default(),
+                )
+            }
+        };
+        if let Err(e) = outcome {
+            tracing::warn!("could not record scan result: {e}");
+        }
+    }
+
+    let summary = result?;
     // Audit trail: one row per completed scan so the Overview "recent activity" feed can show it.
     let _ = cat.log_action(
         "scan",
@@ -696,5 +732,52 @@ mod tests {
         assert_eq!(s.metrics.bytes_skipped, 30);
         assert_eq!(s.metrics.files_seen, 2, "skipped files are still 'seen'");
         assert_eq!(s.metrics.histogram[1], 2);
+    }
+
+    #[test]
+    fn run_scan_records_a_completed_run() {
+        let (_t, cat, root) = fixture_with_files(&[("a.txt", 10)]);
+        let out = run_scan(
+            &cat,
+            &root,
+            false,
+            crate::volume::ReadonlyMode::Fingerprint,
+            100,
+            None,
+        )
+        .unwrap();
+        assert!(out.is_some());
+
+        let runs = cat.recent_scan_runs(10).unwrap();
+        assert_eq!(runs.len(), 1, "exactly one row per scan, not one per file");
+        assert_eq!(runs[0].status, "completed");
+        assert!(runs[0].finished_at.is_some());
+        assert_eq!(runs[0].hashed, 1);
+        assert_eq!(runs[0].metrics.files_seen, 1);
+        assert!(!runs[0].root_path.is_empty());
+    }
+
+    #[test]
+    fn a_metrics_write_failure_never_fails_the_scan() {
+        let (_t, cat, root) = fixture_with_files(&[("a.txt", 10)]);
+        // Drop the table out from under the run: recording must degrade, not propagate.
+        cat.conn.execute_batch("DROP TABLE scan_runs").unwrap();
+        let out = run_scan(
+            &cat,
+            &root,
+            false,
+            crate::volume::ReadonlyMode::Fingerprint,
+            100,
+            None,
+        );
+        assert!(
+            out.is_ok(),
+            "a bookkeeping failure must not fail a scan: {out:?}"
+        );
+        assert_eq!(
+            out.unwrap().unwrap().1.hashed,
+            1,
+            "the scan still did its work"
+        );
     }
 }
