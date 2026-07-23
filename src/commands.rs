@@ -27,7 +27,7 @@ impl From<ReadonlyFallback> for ReadonlyMode {
     }
 }
 
-fn now_secs() -> i64 {
+pub(crate) fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
