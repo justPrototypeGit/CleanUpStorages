@@ -334,6 +334,7 @@ mod tests {
                 size_bytes: payload.len() as i64,
                 content_hash: hash,
             },
+            None,
             100,
         )
         .unwrap();
@@ -385,6 +386,7 @@ mod tests {
                 size_bytes: 23,
                 content_hash: rec.content_hash.clone(),
             },
+            None,
             100,
         )
         .unwrap();

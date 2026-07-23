@@ -123,22 +123,29 @@ impl Catalog {
 
     /// Insert/update one archive entry (a file inside an archive). Identity is
     /// (volume_id, archive_rel_path, container_chain) via idx_files_archived_identity.
+    ///
+    /// `archive_modified` is the containing archive's own mtime. A zip records a per-entry date, but
+    /// we do not read it; inheriting the archive's date is what lets Browse's date filter include
+    /// archived files instead of dropping every one (#10). It is updated on conflict so a repacked
+    /// or replaced archive re-dates its entries.
     pub fn upsert_archive_entry(
         &self,
         volume_id: &str,
         archive_rel_path: &str,
         e: &crate::archive::ArchiveEntry,
+        archive_modified: Option<i64>,
         now: i64,
     ) -> anyhow::Result<()> {
         self.conn.execute(
             "INSERT INTO files(volume_id, relative_path, filename, extension, size_bytes,
                  content_hash, created_time, modified_time, accessed_time, category,
                  container_chain, status, first_seen_at, last_seen_at)
-             VALUES (?1,?2,?3,?4,?5,?6,NULL,NULL,NULL,?7,?8,'active',?9,?9)
+             VALUES (?1,?2,?3,?4,?5,?6,NULL,?7,NULL,?8,?9,'active',?10,?10)
              ON CONFLICT(volume_id, relative_path, container_chain)
                  WHERE container_chain IS NOT NULL DO UPDATE SET
                  filename=excluded.filename, extension=excluded.extension,
                  size_bytes=excluded.size_bytes, content_hash=excluded.content_hash,
+                 modified_time=excluded.modified_time,
                  category=excluded.category, status='active', last_seen_at=excluded.last_seen_at",
             params![
                 volume_id,
@@ -147,6 +154,7 @@ impl Catalog {
                 e.extension,
                 e.size_bytes,
                 e.content_hash,
+                archive_modified,
                 Category::from_extension(&e.extension).as_str(),
                 e.container_chain,
                 now
@@ -897,9 +905,9 @@ mod tests {
     fn archive_entry_upsert_is_idempotent_and_searchable() {
         let (_t, cat) = open_tmp();
         let e = mk_entry("photos.zip › vacation.jpg", "h-vac");
-        cat.upsert_archive_entry("vol-1", "backups/old.zip", &e, 200)
+        cat.upsert_archive_entry("vol-1", "backups/old.zip", &e, None, 200)
             .unwrap();
-        cat.upsert_archive_entry("vol-1", "backups/old.zip", &e, 250)
+        cat.upsert_archive_entry("vol-1", "backups/old.zip", &e, None, 250)
             .unwrap(); // same identity again
         let hits = cat.search("vacation", None, None, None).unwrap();
         assert_eq!(hits.len(), 1);
@@ -908,6 +916,52 @@ mod tests {
             Some("photos.zip › vacation.jpg")
         );
         assert_eq!(hits[0].relative_path, "backups/old.zip");
+    }
+
+    #[test]
+    fn archive_entries_inherit_the_archive_modified_date() {
+        // #10: a zip records per-entry dates but we do not read them; without this an archive entry
+        // has NULL modified_time and every date filter drops it. It inherits the archive's date.
+        let (_t, cat) = open_tmp();
+        cat.upsert_archive_entry(
+            "vol-1",
+            "photos.zip",
+            &mk_entry("holiday.jpg", "h1"),
+            Some(1_700_000_000),
+            200,
+        )
+        .unwrap();
+
+        // Found within a window around the archive's date...
+        let f = SearchFilters {
+            modified_after: Some(1_600_000_000),
+            modified_before: Some(1_800_000_000),
+            ..Default::default()
+        };
+        assert_eq!(cat.search_filtered(&f, 100).unwrap().len(), 1);
+
+        // ...and correctly excluded by a window that does not contain it.
+        let before = SearchFilters {
+            modified_before: Some(1_600_000_000),
+            ..Default::default()
+        };
+        assert!(cat.search_filtered(&before, 100).unwrap().is_empty());
+
+        // A rescan with a newer archive date re-dates the entry (updated on conflict).
+        cat.upsert_archive_entry(
+            "vol-1",
+            "photos.zip",
+            &mk_entry("holiday.jpg", "h1"),
+            Some(1_900_000_000),
+            300,
+        )
+        .unwrap();
+        assert!(cat.search_filtered(&before, 100).unwrap().is_empty());
+        let after = SearchFilters {
+            modified_after: Some(1_850_000_000),
+            ..Default::default()
+        };
+        assert_eq!(cat.search_filtered(&after, 100).unwrap().len(), 1);
     }
 
     #[test]
@@ -920,6 +974,7 @@ mod tests {
             "vol-1",
             "backups/old.zip",
             &mk_entry("photos.zip › vacation.jpg", "h-vac"),
+            None,
             200,
         )
         .unwrap();
@@ -940,8 +995,14 @@ mod tests {
         let (_t, cat) = open_tmp();
         cat.upsert_file(&mk_file("vol-1", "loose/vacation.jpg", "same"), 200)
             .unwrap();
-        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("vacation.jpg", "same"), 200)
-            .unwrap();
+        cat.upsert_archive_entry(
+            "vol-1",
+            "old.zip",
+            &mk_entry("vacation.jpg", "same"),
+            None,
+            200,
+        )
+        .unwrap();
         // The hash is known to be duplicated across the two rows...
         assert_eq!(
             cat.duplicate_counts(&["same".to_string()]).unwrap()["same"],
@@ -958,12 +1019,12 @@ mod tests {
     #[test]
     fn missing_sweep_covers_archive_entries() {
         let (_t, cat) = open_tmp();
-        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("gone.jpg", "h1"), 200)
+        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("gone.jpg", "h1"), None, 200)
             .unwrap();
-        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("kept.jpg", "h2"), 200)
+        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("kept.jpg", "h2"), None, 200)
             .unwrap();
         // rescan at 300 re-sees only kept.jpg
-        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("kept.jpg", "h2"), 300)
+        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("kept.jpg", "h2"), None, 300)
             .unwrap();
         let n = cat.mark_missing_scanned("vol-1", 300, 300).unwrap();
         assert_eq!(n, 1);
@@ -978,9 +1039,9 @@ mod tests {
     #[test]
     fn touch_archive_entries_refreshes_all_under_archive() {
         let (_t, cat) = open_tmp();
-        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("a.jpg", "h1"), 200)
+        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("a.jpg", "h1"), None, 200)
             .unwrap();
-        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("b.jpg", "h2"), 200)
+        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("b.jpg", "h2"), None, 200)
             .unwrap();
         let touched = cat.touch_archive_entries("vol-1", "old.zip", 300).unwrap();
         assert_eq!(touched, 2);
@@ -1166,12 +1227,12 @@ mod tests {
     #[test]
     fn touch_does_not_resurrect_missing_archive_entries() {
         let (_t, cat) = open_tmp();
-        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("a.jpg", "h1"), 200)
+        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("a.jpg", "h1"), None, 200)
             .unwrap();
-        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("gone.jpg", "h2"), 200)
+        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("gone.jpg", "h2"), None, 200)
             .unwrap();
         // rescan at 300 re-sees only a.jpg -> gone.jpg swept to missing
-        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("a.jpg", "h1"), 300)
+        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("a.jpg", "h1"), None, 300)
             .unwrap();
         cat.mark_missing_scanned("vol-1", 300, 300).unwrap();
         assert_eq!(
@@ -1206,11 +1267,11 @@ mod tests {
             size_bytes: 5,
             content_hash: hash.into(),
         };
-        cat.upsert_archive_entry("vol-1", "a.zip", &e("x.jpg", "h1"), 100)
+        cat.upsert_archive_entry("vol-1", "a.zip", &e("x.jpg", "h1"), None, 100)
             .unwrap();
-        cat.upsert_archive_entry("vol-1", "a.zip", &e("y.jpg", "h2"), 100)
+        cat.upsert_archive_entry("vol-1", "a.zip", &e("y.jpg", "h2"), None, 100)
             .unwrap();
-        cat.upsert_archive_entry("vol-1", "b.zip", &e("z.jpg", "h3"), 100)
+        cat.upsert_archive_entry("vol-1", "b.zip", &e("z.jpg", "h3"), None, 100)
             .unwrap();
         let es = cat.archive_entries("vol-1", "a.zip").unwrap();
         assert_eq!(es.len(), 2);
@@ -1232,6 +1293,7 @@ mod tests {
                 size_bytes: 5,
                 content_hash: "h1".into(),
             },
+            None,
             100,
         )
         .unwrap();

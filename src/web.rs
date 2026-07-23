@@ -1271,6 +1271,7 @@ mod tests {
                     size_bytes: 9,
                     content_hash: "h2".into(),
                 },
+                None,
                 100,
             )
             .unwrap();
@@ -2102,6 +2103,7 @@ mod tests {
                     size_bytes: 6,
                     content_hash: "H".into(),
                 },
+                None,
                 100,
             )
             .unwrap();

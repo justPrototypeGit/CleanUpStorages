@@ -542,6 +542,7 @@ mod tests {
                 size_bytes: 3,
                 content_hash: "SHARED_H".into(),
             },
+            None,
             100,
         )
         .unwrap();
