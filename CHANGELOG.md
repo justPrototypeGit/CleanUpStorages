@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Quarantine now verifies content before it moves anything.** It re-hashes the file being moved
+  and the copy it is relying on, instead of trusting the catalogue. The incremental scan skips
+  re-hashing when size and second-granularity mtime match, so a same-size edit within a second of
+  the recorded time could leave a stale hash — and a stale hash is how a unique file gets mistaken
+  for a duplicate. A file that no longer matches is skipped with a message naming the drift, not
+  moved. This makes quarantining a large file slower, by design (#4).
+
 ## [0.2.0] - 2026-07-17
 
 First published release, with downloadable Windows and macOS (Apple Silicon) binaries.
