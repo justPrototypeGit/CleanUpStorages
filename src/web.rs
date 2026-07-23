@@ -741,7 +741,18 @@ async fn api_quarantine(
     let mounts = state.mounts.snapshot();
     for (volume_id, ids) in by_volume {
         if let Some(mount) = mounts.get(&volume_id) {
-            match crate::quarantine::quarantine_files(&cat, mount, &volume_id, &ids, now) {
+            // Quarantine verifies content by re-hashing before it moves anything, so this can run
+            // for minutes on large files. Off the async worker, or the whole UI stops responding.
+            let (mount, vid, cat_path) =
+                (mount.clone(), volume_id.clone(), state.catalog_path.clone());
+            let ids2 = ids.clone();
+            let joined = tokio::task::spawn_blocking(move || {
+                let cat = Catalog::open(&cat_path)?;
+                crate::quarantine::quarantine_files(&cat, &mount, &vid, &ids2, now)
+            })
+            .await
+            .map_err(|e| err500(anyhow::anyhow!("quarantine task failed: {e}")))?;
+            match joined {
                 Ok(out) => {
                     result.quarantined += out.quarantined;
                     result.skipped += out.skipped;

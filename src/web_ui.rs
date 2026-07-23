@@ -791,7 +791,10 @@ $("#confirm").addEventListener("click",async()=>{
   const g=groups[idx]; if(!g)return;
   const victims=g.members.filter(m=>m.id!==keepId&&m.is_loose).map(m=>m.id);
   if(victims.length===0){ $("#msg").textContent="Nothing to quarantine (the other copies are inside archives)."; return; }
-  $("#confirm").disabled=true; $("#msg").textContent="Quarantining…";
+  $("#confirm").disabled=true;
+  // Verification re-reads both files, so a multi-GB group takes real time. Say so, or the wait
+  // reads as a hang.
+  $("#msg").textContent="Verifying content, then quarantining… (large files take a while)";
   try{
     const j=await apiPost("/api/quarantine",{quarantine_ids:victims});
     let m=`Quarantined ${j.quarantined}, skipped ${j.skipped}.`; if(j.unmounted_volumes&&j.unmounted_volumes.length) m+=" Some drives not connected."; if(j.errors&&j.errors.length) m+=" Errors: "+j.errors.join("; "); $("#msg").textContent=m; idx++; render();

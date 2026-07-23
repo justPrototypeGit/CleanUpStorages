@@ -54,15 +54,23 @@ pub fn repack_entry(
         None => anyhow::bail!("no identity marker; refusing to repack on an unidentified drive"),
     }
 
-    // 3. Disk-aware survivor guard: never remove the last remaining copy of this content.
-    require_surviving_copy(cat, mount_root, expected_volume_id, &entry)?;
-
-    // 4. Archive must actually be on disk where the catalog says it is.
+    // 3. Archive must actually be on disk where the catalog says it is. Checked before the
+    // survivor guard, which needs to read this entry out of it.
     let archive_rel = entry.relative_path.clone();
     let archive_path = mount_root.join(&archive_rel);
     if !archive_path.is_file() {
         anyhow::bail!("archive {archive_rel} not found on disk");
     }
+
+    // 4. Disk-aware survivor guard: never remove the last remaining copy of this content.
+    require_surviving_copy(
+        cat,
+        mount_root,
+        expected_volume_id,
+        &entry,
+        &archive_path,
+        &chain,
+    )?;
     let archive_size = std::fs::metadata(&archive_path)?.len();
 
     // 5. Pre-flight free space check.
@@ -200,24 +208,43 @@ fn load_repackable_entry(
     Ok(entry)
 }
 
-/// Step 3: a survivor counts if it's a different catalog row AND (on a different volume, or its
-/// relative_path still exists on this mount) — mirrors the disk-aware guard from Phase 2a.
+/// Never remove the last copy: prove another active copy currently holds the bytes we are about
+/// to drop from the archive. Shares `verify::find_surviving_copy` with quarantine, so the two
+/// destructive paths cannot drift apart on what counts as proof (#34).
+///
+/// The entry being removed is re-hashed out of the archive rather than trusted from the catalogue —
+/// an unchanged archive is skipped by the incremental scan, so its entries' hashes can be as stale
+/// as any loose file's (#4).
 fn require_surviving_copy(
     cat: &Catalog,
     mount_root: &Path,
     expected_volume_id: &str,
     entry: &crate::catalog::models::FileRecord,
+    archive_path: &Path,
+    chain: &str,
 ) -> anyhow::Result<()> {
-    let survivor_ok = cat.active_copies(&entry.content_hash)?.iter().any(|s| {
-        s.id != entry.id
-            && (s.volume_id != expected_volume_id || mount_root.join(&s.relative_path).exists())
-    });
-    if !survivor_ok {
-        anyhow::bail!(
-            "no surviving copy verified — refusing to remove the last copy of this content"
-        );
+    let mut cache = crate::verify::HashCache::default();
+    let live_hash = cache.zip_entry(archive_path, chain).map_err(|e| {
+        anyhow::anyhow!(
+            "could not re-read {chain} from {}: {e}",
+            entry.relative_path
+        )
+    })?;
+
+    match crate::verify::find_surviving_copy(
+        cat,
+        mount_root,
+        expected_volume_id,
+        entry.id,
+        &entry.content_hash,
+        &live_hash,
+        &mut cache,
+    )? {
+        crate::verify::Survivor::Verified => Ok(()),
+        crate::verify::Survivor::NotFound(reason) => {
+            anyhow::bail!("refusing to remove the last copy of this content — {reason}")
+        }
     }
-    Ok(())
 }
 
 /// Steps 6-7: rebuild into `tmp` and verify every retained catalogued entry matches by hash and
@@ -470,6 +497,34 @@ mod tests {
         assert!(res.is_err());
         // the archive is untouched — dup.txt still inside
         assert!(extract_entry(&root.join("bundle.zip"), "dup.txt").is_ok());
+        let _ = tmp;
+    }
+
+    #[test]
+    fn repack_refuses_when_the_surviving_copy_no_longer_matches() {
+        // #34: repack used to accept any survivor whose PATH existed, trusting the catalogued
+        // hash. The incremental scan can leave that hash stale, so the "duplicate" it relied on
+        // may no longer hold these bytes — and removing the entry would then lose them.
+        let (tmp, cat, root) = fake_drive_with_archive();
+        let loose = root.join("loose_dup.txt");
+        let len = std::fs::read(&loose).unwrap().len();
+        std::fs::write(&loose, vec![b'X'; len]).unwrap(); // same size, different content
+
+        let entry = cat
+            .archive_entries("vol-1", "bundle.zip")
+            .unwrap()
+            .into_iter()
+            .find(|e| e.container_chain.as_deref() == Some("dup.txt"))
+            .unwrap();
+        let res = repack_entry(&cat, &root, "vol-1", entry.id, 200);
+        assert!(
+            res.is_err(),
+            "a survivor that no longer holds these bytes must not authorise the removal"
+        );
+        assert!(
+            extract_entry(&root.join("bundle.zip"), "dup.txt").is_ok(),
+            "the archive is left untouched"
+        );
         let _ = tmp;
     }
 
