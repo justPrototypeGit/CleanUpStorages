@@ -54,21 +54,22 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
         );
 
         CREATE VIRTUAL TABLE IF NOT EXISTS files_fts
-            USING fts5(filename, relative_path, content='files', content_rowid='id');
+            USING fts5(filename, relative_path, container_chain,
+                       content='files', content_rowid='id');
 
         CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
-            INSERT INTO files_fts(rowid, filename, relative_path)
-            VALUES (new.id, new.filename, new.relative_path);
+            INSERT INTO files_fts(rowid, filename, relative_path, container_chain)
+            VALUES (new.id, new.filename, new.relative_path, new.container_chain);
         END;
         CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON files BEGIN
-            INSERT INTO files_fts(files_fts, rowid, filename, relative_path)
-            VALUES('delete', old.id, old.filename, old.relative_path);
+            INSERT INTO files_fts(files_fts, rowid, filename, relative_path, container_chain)
+            VALUES('delete', old.id, old.filename, old.relative_path, old.container_chain);
         END;
         CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
-            INSERT INTO files_fts(files_fts, rowid, filename, relative_path)
-            VALUES('delete', old.id, old.filename, old.relative_path);
-            INSERT INTO files_fts(rowid, filename, relative_path)
-            VALUES (new.id, new.filename, new.relative_path);
+            INSERT INTO files_fts(files_fts, rowid, filename, relative_path, container_chain)
+            VALUES('delete', old.id, old.filename, old.relative_path, old.container_chain);
+            INSERT INTO files_fts(rowid, filename, relative_path, container_chain)
+            VALUES (new.id, new.filename, new.relative_path, new.container_chain);
         END;
         "#,
     )?;
@@ -87,11 +88,59 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
         "#,
         order = crate::catalog::dedup::KEEP_ORDER
     ))?;
+    rebuild_fts_if_stale(conn)?;
     ensure_column(conn, "files", "original_path", "TEXT")?;
     ensure_column(conn, "volumes", "last_scanned_path", "TEXT")?;
     ensure_column(conn, "volumes", "display_name", "TEXT")?;
     ensure_column(conn, "volumes", "description", "TEXT")?;
     Ok(())
+}
+
+/// Bring a pre-existing `files_fts` up to the current column set.
+///
+/// `CREATE VIRTUAL TABLE IF NOT EXISTS` leaves an older index alone, so a catalog built before
+/// `container_chain` was indexed would keep searching only filename+path forever. An FTS index is
+/// derived data — dropping and rebuilding it from `files` cannot lose anything.
+///
+/// Guarded on the column actually being absent: the rebuild walks every row, which is seconds on a
+/// million-file catalog and must not happen on every open.
+fn rebuild_fts_if_stale(conn: &Connection) -> rusqlite::Result<()> {
+    let has_chain: i64 = conn.query_row(
+        "SELECT count(*) FROM pragma_table_info('files_fts') WHERE name='container_chain'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_chain > 0 {
+        return Ok(());
+    }
+    conn.execute_batch(
+        r#"
+        DROP TRIGGER IF EXISTS files_ai;
+        DROP TRIGGER IF EXISTS files_ad;
+        DROP TRIGGER IF EXISTS files_au;
+        DROP TABLE IF EXISTS files_fts;
+
+        CREATE VIRTUAL TABLE files_fts
+            USING fts5(filename, relative_path, container_chain,
+                       content='files', content_rowid='id');
+        INSERT INTO files_fts(files_fts) VALUES('rebuild');
+
+        CREATE TRIGGER files_ai AFTER INSERT ON files BEGIN
+            INSERT INTO files_fts(rowid, filename, relative_path, container_chain)
+            VALUES (new.id, new.filename, new.relative_path, new.container_chain);
+        END;
+        CREATE TRIGGER files_ad AFTER DELETE ON files BEGIN
+            INSERT INTO files_fts(files_fts, rowid, filename, relative_path, container_chain)
+            VALUES('delete', old.id, old.filename, old.relative_path, old.container_chain);
+        END;
+        CREATE TRIGGER files_au AFTER UPDATE ON files BEGIN
+            INSERT INTO files_fts(files_fts, rowid, filename, relative_path, container_chain)
+            VALUES('delete', old.id, old.filename, old.relative_path, old.container_chain);
+            INSERT INTO files_fts(rowid, filename, relative_path, container_chain)
+            VALUES (new.id, new.filename, new.relative_path, new.container_chain);
+        END;
+        "#,
+    )
 }
 
 /// Add `<table>.<column> <decl>` if it does not already exist (idempotent, data-preserving).
@@ -209,6 +258,79 @@ mod tests {
             keep, "dated.txt",
             "a NULL timestamp must never win the keep slot"
         );
+    }
+
+    #[test]
+    fn an_old_two_column_fts_is_rebuilt_with_container_chain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("c.db");
+        {
+            // A catalog whose FTS predates container_chain indexing.
+            let cat = Catalog::open(&db).unwrap();
+            cat.conn
+                .execute_batch(
+                    "DROP TRIGGER files_ai; DROP TRIGGER files_ad; DROP TRIGGER files_au;
+                     DROP TABLE files_fts;
+                     CREATE VIRTUAL TABLE files_fts
+                        USING fts5(filename, relative_path, content='files', content_rowid='id');
+                     INSERT INTO volumes(volume_id,label,identified_by,first_seen_at,last_seen_at)
+                        VALUES ('v','V','marker',1,1);
+                     INSERT INTO files(volume_id,relative_path,filename,extension,size_bytes,
+                        content_hash,created_time,modified_time,accessed_time,category,
+                        container_chain,status,first_seen_at,last_seen_at)
+                     VALUES ('v','backups/old.zip','vacation.jpg','jpg',9,'h',1,1,NULL,'photo',
+                             'photos.zip › vacation.jpg','active',1,1);
+                     INSERT INTO files_fts(files_fts) VALUES('rebuild');",
+                )
+                .unwrap();
+            let n: i64 = cat
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('files_fts') WHERE name='container_chain'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 0, "fixture must start on the old shape");
+        }
+
+        // Re-opening migrates the index and backfills it from the rows already present.
+        let cat = Catalog::open(&db).unwrap();
+        let hits = cat.search("photos", None, None, None).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "an intermediate archive name must be searchable after the rebuild"
+        );
+        assert_eq!(hits[0].filename, "vacation.jpg");
+        assert!(cat.integrity_ok().unwrap());
+    }
+
+    #[test]
+    fn rebuilding_is_skipped_once_the_index_is_current() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("c.db");
+        let cat = Catalog::open(&db).unwrap();
+        // Sentinel: a row inserted straight into the index would be wiped by an unnecessary rebuild
+        // (the content table has no such row).
+        cat.conn
+            .execute_batch(
+                "INSERT INTO files_fts(rowid, filename, relative_path, container_chain)
+                 VALUES (999999, 'sentinel', 'sentinel', '');",
+            )
+            .unwrap();
+        drop(cat);
+
+        let cat = Catalog::open(&db).unwrap();
+        let n: i64 = cat
+            .conn
+            .query_row(
+                "SELECT count(*) FROM files_fts WHERE files_fts MATCH 'sentinel'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "a current index must not be rebuilt on every open");
     }
 
     #[test]
