@@ -202,6 +202,17 @@ fn scan_level<R: Read + Seek>(
             let bytes = match read_capped(&mut entry, cap) {
                 Ok(b) => b,
                 Err(reason) => {
+                    // Budget pressure from legitimate ancestors is not a bomb; saying so would
+                    // send the user hunting for a hostile file that does not exist.
+                    let reason = if cap < limits.entry_max_bytes {
+                        format!(
+                            "nested archive skipped: only {cap} of the {} byte buffer budget \
+                             remained (ancestor archives hold the rest)",
+                            limits.total_buffer_bytes
+                        )
+                    } else {
+                        reason
+                    };
                     result.errors.push((chain, reason));
                     continue;
                 }
@@ -434,6 +445,41 @@ mod tests {
         );
         // The levels that did fit are still catalogued — the budget skips, it does not abort.
         assert!(res.entries.iter().any(|e| e.filename == "level2.zip"));
+        assert!(
+            !res.errors.iter().any(|(_, m)| m.contains("zip bomb")),
+            "budget pressure from legitimate ancestors must not be reported as a bomb: {:?}",
+            res.errors
+        );
+    }
+
+    #[test]
+    fn a_partially_constrained_buffer_is_not_called_a_zip_bomb() {
+        // Budget leaves SOME room but not enough: the read fails inside read_capped, whose own
+        // message says "zip bomb". The caller must relabel it.
+        let inner = make_zip(&[("leaf.txt", &[b'y'; 800][..])]);
+        let top = nest_zip("inner.zip", inner, &[]);
+        let held = level2_len_named(&top, "inner.zip");
+        let tight = ArchiveLimits {
+            max_depth: 8,
+            entry_max_bytes: 64 * 1024,
+            ratio_cap: 200,
+            total_buffer_bytes: held - 1, // one byte short of the nested archive
+        };
+        let res = scan_archive(Cursor::new(top), &tight);
+        assert!(!res.entries.iter().any(|e| e.filename == "leaf.txt"));
+        let msgs = format!("{:?}", res.errors);
+        assert!(
+            msgs.contains("buffer budget"),
+            "expected a budget message: {msgs}"
+        );
+        assert!(!msgs.contains("zip bomb"), "must not blame a bomb: {msgs}");
+    }
+
+    /// Uncompressed length of the named entry inside `top`.
+    fn level2_len_named(top: &[u8], name: &str) -> u64 {
+        let mut z = zip::ZipArchive::new(Cursor::new(top.to_vec())).unwrap();
+        let n = z.by_name(name).unwrap().size();
+        n
     }
 
     /// Uncompressed length of the single nested `level2.zip` entry inside `top`.
