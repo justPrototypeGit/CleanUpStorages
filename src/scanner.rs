@@ -27,6 +27,8 @@ pub struct ScanSummary {
     pub errors: usize,
     pub marked_missing: usize,
     pub archive_entries: usize,
+    /// Where this scan's time went. Measured always; see `scan_metrics`.
+    pub metrics: crate::scan_metrics::MetricsSnapshot,
 }
 
 /// Metadata timestamp (best-effort) as seconds since UNIX_EPOCH.
@@ -79,9 +81,16 @@ pub fn scan_volume_with_progress(
     let limits = ArchiveLimits::from_config(&Config::default_paths()?);
     let mut summary = ScanSummary::default();
     let mut in_batch = 0usize;
+    let metrics = crate::scan_metrics::ScanMetrics::new();
     cat.conn.execute_batch("BEGIN")?;
 
-    for entry in WalkDir::new(root) {
+    let mut walker = WalkDir::new(root).into_iter();
+    loop {
+        let next = {
+            let _t = metrics.timer(crate::scan_metrics::Phase::Walk);
+            walker.next()
+        };
+        let Some(entry) = next else { break };
         let entry = match entry {
             Ok(e) => e,
             Err(err) => {
@@ -114,28 +123,33 @@ pub fn scan_volume_with_progress(
             continue;
         };
 
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(e) => {
-                cat.log_scan_error(
-                    Some(&identity.volume_id),
-                    &rel,
-                    &format!("metadata: {e}"),
-                    now,
-                )?;
-                summary.errors += 1;
-                if let Some(p) = progress {
-                    p.on_error();
+        let meta = {
+            let _t = metrics.timer(crate::scan_metrics::Phase::Walk);
+            match entry.metadata() {
+                Ok(m) => m,
+                Err(e) => {
+                    cat.log_scan_error(
+                        Some(&identity.volume_id),
+                        &rel,
+                        &format!("metadata: {e}"),
+                        now,
+                    )?;
+                    summary.errors += 1;
+                    if let Some(p) = progress {
+                        p.on_error();
+                    }
+                    let _ = cat.touch_seen(&identity.volume_id, &rel, now);
+                    continue;
                 }
-                let _ = cat.touch_seen(&identity.volume_id, &rel, now);
-                continue;
             }
         };
         let size = meta.len() as i64;
         let mtime = unix_secs(meta.modified());
+        metrics.record_file_seen(size);
 
         // Incremental skip: same size + mtime as catalogued -> just touch, don't re-hash.
         if !force {
+            let _t = metrics.timer(crate::scan_metrics::Phase::SkipCheck);
             if let Some((old_size, old_mtime)) = cat.get_file_meta(&identity.volume_id, &rel)? {
                 if old_size == size && old_mtime == mtime.unwrap_or(0) {
                     cat.touch_seen(&identity.volume_id, &rel, now)?;
@@ -143,6 +157,7 @@ pub fn scan_volume_with_progress(
                         cat.touch_archive_entries(&identity.volume_id, &rel, now)?;
                     }
                     summary.skipped += 1;
+                    metrics.add_bytes_skipped(size);
                     if let Some(p) = progress {
                         p.on_skipped();
                     }
@@ -153,18 +168,27 @@ pub fn scan_volume_with_progress(
             }
         }
 
-        let hash = match hashing::hash_file(path) {
-            Ok(h) => h,
-            Err(e) => {
-                cat.log_scan_error(Some(&identity.volume_id), &rel, &format!("read: {e}"), now)?;
-                summary.errors += 1;
-                if let Some(p) = progress {
-                    p.on_error();
+        let hash = {
+            let _t = metrics.timer(crate::scan_metrics::Phase::Hash);
+            match hashing::hash_file(path) {
+                Ok(h) => h,
+                Err(e) => {
+                    cat.log_scan_error(
+                        Some(&identity.volume_id),
+                        &rel,
+                        &format!("read: {e}"),
+                        now,
+                    )?;
+                    summary.errors += 1;
+                    if let Some(p) = progress {
+                        p.on_error();
+                    }
+                    let _ = cat.touch_seen(&identity.volume_id, &rel, now);
+                    continue;
                 }
-                let _ = cat.touch_seen(&identity.volume_id, &rel, now);
-                continue;
             }
         };
+        metrics.add_bytes_hashed(size);
 
         let ext = path
             .extension()
@@ -183,15 +207,19 @@ pub fn scan_volume_with_progress(
             category: Category::from_extension(&ext),
             container_chain: None,
         };
-        cat.upsert_file(&nf, now)?;
+        {
+            let _t = metrics.timer(crate::scan_metrics::Phase::DbWrite);
+            cat.upsert_file(&nf, now)?;
+            in_batch += 1;
+            rotate_batch(cat, &mut in_batch)?;
+        }
         summary.hashed += 1;
         if let Some(p) = progress {
             p.on_hashed();
         }
-        in_batch += 1;
-        rotate_batch(cat, &mut in_batch)?;
 
         if archive::is_archive_name(&rel) {
+            let _t = metrics.timer(crate::scan_metrics::Phase::Archive);
             descend_archive(
                 cat,
                 path,
@@ -206,8 +234,16 @@ pub fn scan_volume_with_progress(
         }
     }
 
-    cat.conn.execute_batch("COMMIT")?;
-    summary.marked_missing = cat.mark_missing_scanned(&identity.volume_id, scan_started_at, now)?;
+    // The final COMMIT and the missing-sweep are both real scan cost and both hit SQLite, so they
+    // belong to db_write. Leaving them untimed would inflate the unaccounted gap and understate
+    // exactly the fsync cost #26 targets.
+    {
+        let _t = metrics.timer(crate::scan_metrics::Phase::DbWrite);
+        cat.conn.execute_batch("COMMIT")?;
+        summary.marked_missing =
+            cat.mark_missing_scanned(&identity.volume_id, scan_started_at, now)?;
+    }
+    summary.metrics = metrics.snapshot();
     Ok(summary)
 }
 
@@ -603,5 +639,64 @@ mod tests {
         assert_eq!(p.errors.load(Relaxed), s.errors);
         assert_eq!(p.arch.load(Relaxed), s.archive_entries);
         assert_eq!(s.hashed, 2);
+    }
+
+    /// A temp dir containing `files` (name, byte length), plus an open catalog with the `ident()`
+    /// volume already upserted (the `files` table's `volume_id` is FK-enforced).
+    fn fixture_with_files(
+        files: &[(&str, usize)],
+    ) -> (tempfile::TempDir, Catalog, std::path::PathBuf) {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        for (name, len) in files {
+            std::fs::write(root.join(name), vec![b'x'; *len]).unwrap();
+        }
+        let cat = Catalog::open(&t.path().join("c.db")).unwrap();
+        cat.upsert_volume(&Volume {
+            volume_id: "vol-1".into(),
+            label: "T".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
+        (t, cat, root)
+    }
+
+    #[test]
+    fn scan_records_phase_timings_and_the_size_histogram() {
+        let (_t, cat, root) = fixture_with_files(&[("a.txt", 10), ("big.bin", 30_000_000)]);
+        let s = scan_volume(&cat, &root, &ident(), false, 100).unwrap();
+        let m = &s.metrics;
+
+        assert_eq!(m.files_seen, 2);
+        assert_eq!(m.histogram[1], 1, "the 10-byte file");
+        assert_eq!(m.histogram[5], 1, "the 30MB file");
+        assert_eq!(m.bytes_hashed, 30_000_010);
+        assert_eq!(m.bytes_skipped, 0);
+        assert!(
+            m.hash_ms > 0 || m.walk_ms > 0,
+            "some phase must have been timed"
+        );
+        assert!(
+            m.total_phase_ms() <= m.wall_ms,
+            "phases {} exceeded wall {}",
+            m.total_phase_ms(),
+            m.wall_ms
+        );
+    }
+
+    #[test]
+    fn rescan_attributes_bytes_to_skipped_not_hashed() {
+        let (_t, cat, root) = fixture_with_files(&[("a.txt", 10), ("b.txt", 20)]);
+        scan_volume(&cat, &root, &ident(), false, 100).unwrap();
+        let s = scan_volume(&cat, &root, &ident(), false, 200).unwrap();
+
+        assert_eq!(s.skipped, 2, "second pass takes the incremental-skip path");
+        assert_eq!(s.metrics.bytes_hashed, 0);
+        assert_eq!(s.metrics.bytes_skipped, 30);
+        assert_eq!(s.metrics.files_seen, 2, "skipped files are still 'seen'");
+        assert_eq!(s.metrics.histogram[1], 2);
     }
 }
