@@ -230,7 +230,8 @@ impl MetricsSnapshot {
             self.archive_ms,
             pct(self.archive_ms),
             self.total_phase_ms(),
-            pct(self.total_phase_ms()),
+            // One definition of sum-of-phases ÷ wall, shared with every other caller.
+            self.overlap_ratio() * 100.0,
         );
         out.push_str(&format!(
             "Rates: {:.1} files/s · {:.1} MB/s overall · {:.1} MB/s while hashing\n",
@@ -332,6 +333,26 @@ mod tests {
         // Guards the property #23 depends on: this must compile and stay true.
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<ScanMetrics>();
+    }
+
+    #[test]
+    fn overlap_ratio_is_phases_over_wall_and_survives_a_zero_wall() {
+        let s = MetricsSnapshot {
+            wall_ms: 200,
+            walk_ms: 50,
+            hash_ms: 150,
+            ..Default::default()
+        };
+        assert!((s.overlap_ratio() - 1.0).abs() < 1e-9);
+
+        // A scan too short to register a millisecond must report 0, not NaN or infinity.
+        let z = MetricsSnapshot {
+            wall_ms: 0,
+            hash_ms: 5,
+            ..Default::default()
+        };
+        assert_eq!(z.overlap_ratio(), 0.0);
+        assert!(z.report().contains("accounted"));
     }
 
     #[test]

@@ -1014,8 +1014,10 @@ async function poll(){
   }catch(e){ /* stop polling on error */ }
 }
 function runRow(r){
-  const m=r.metrics, tot=m.walk_ms+m.skip_check_ms+m.hash_ms+m.db_write_ms+m.archive_ms;
-  const pct=v=>tot?Math.round(v*100/tot):0;
+  const m=r.metrics;
+  // Percent of WALL, matching the CLI. Dividing by the sum of phases would force them to total
+  // 100% and hide exactly the overlap #23 is meant to create.
+  const pct=v=>m.wall_ms?Math.round(v*100/m.wall_ms):0;
   const when=r.started_at?fmtDate(r.started_at):"";
   const status=r.status==="running"?'<span class="mut">running…</span>'
     :r.status==="failed"?`<span style="color:var(--red)">failed</span>`:esc(r.status);
