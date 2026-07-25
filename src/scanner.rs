@@ -32,14 +32,14 @@ pub struct ScanSummary {
 }
 
 /// Metadata timestamp (best-effort) as seconds since UNIX_EPOCH.
-fn unix_secs(t: std::io::Result<std::time::SystemTime>) -> Option<i64> {
+pub(crate) fn unix_secs(t: std::io::Result<std::time::SystemTime>) -> Option<i64> {
     t.ok()
         .and_then(|st| st.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs() as i64)
 }
 
 /// True if `path` is the identity marker file or lives under a `_ToDelete` quarantine dir.
-fn should_skip(path: &Path, file_name: &std::ffi::OsStr) -> bool {
+pub(crate) fn should_skip(path: &Path, file_name: &std::ffi::OsStr) -> bool {
     file_name == crate::volume::MARKER
         || path
             .components()
@@ -47,7 +47,7 @@ fn should_skip(path: &Path, file_name: &std::ffi::OsStr) -> bool {
 }
 
 /// Path of `path` relative to `root`, normalized to forward slashes; `None` if not under `root`.
-fn relative_path(path: &Path, root: &Path) -> Option<String> {
+pub(crate) fn relative_path(path: &Path, root: &Path) -> Option<String> {
     path.strip_prefix(root)
         .ok()
         .map(|r| r.to_string_lossy().replace('\\', "/"))

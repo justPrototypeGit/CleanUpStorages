@@ -7,9 +7,13 @@
 #![allow(dead_code)]
 
 use crate::catalog::models::NewFile;
+use crate::catalog::Catalog;
 use crate::category::Category;
 use crate::scan_metrics::{Phase, ScanMetrics};
+use crate::volume::VolumeIdentity;
+use crossbeam_channel::Sender;
 use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
 
 /// Work the walker hands to a worker. `Touch` and `Error` carry no I/O — they pass through a worker
 /// unchanged so the topology stays one-in/one-out (walker has one output, writer one input).
@@ -189,10 +193,216 @@ pub(crate) fn run_job(job: Job, volume_id: &str, metrics: &ScanMetrics) -> Vec<S
     }
 }
 
+/// Walk `root`, stat + skip-check each file, and emit a `Job` per file. Never returns an error:
+/// walk and stat failures become `Job::Error`, matching the pre-parallel scan. Runs on its own
+/// thread with a read-only catalog connection; `walk`/`skip_check` timing is charged here.
+pub(crate) fn walk(
+    ro: &Catalog,
+    root: &Path,
+    identity: &VolumeIdentity,
+    force: bool,
+    _now: i64,
+    metrics: &ScanMetrics,
+    jobs: &Sender<Job>,
+) {
+    let send = |j: Job| {
+        // The only reason send fails is the writer/workers went away (fatal). Stop walking.
+        let _ = jobs.send(j);
+    };
+    let mut walker = WalkDir::new(root).into_iter();
+    loop {
+        let next = {
+            let _t = metrics.timer(Phase::Walk);
+            walker.next()
+        };
+        let Some(entry) = next else { break };
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                let rel = err
+                    .path()
+                    .map(|p| {
+                        p.strip_prefix(root)
+                            .unwrap_or(p)
+                            .to_string_lossy()
+                            .replace('\\', "/")
+                    })
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                send(Job::Error {
+                    rel,
+                    reason: format!("walk: {err}"),
+                });
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let name = entry.file_name();
+        if crate::scanner::should_skip(path, name) {
+            continue;
+        }
+        let Some(rel) = crate::scanner::relative_path(path, root) else {
+            continue;
+        };
+
+        let stat = {
+            let _t = metrics.timer(Phase::Walk);
+            entry.metadata()
+        };
+        let meta = match stat {
+            Ok(m) => m,
+            Err(e) => {
+                metrics.record_file_seen(0);
+                send(Job::Error {
+                    rel,
+                    reason: format!("metadata: {e}"),
+                });
+                continue;
+            }
+        };
+        let size = meta.len() as i64;
+        let mtime = crate::scanner::unix_secs(meta.modified());
+        metrics.record_file_seen(size);
+
+        let is_archive = crate::archive::is_archive_name(&rel);
+
+        if !force {
+            let _t = metrics.timer(Phase::SkipCheck);
+            // A read error on the RO connection degrades to "not catalogued", i.e. re-hash. That is
+            // the conservative direction: it can never skip a file that should have been hashed.
+            if let Ok(Some((old_size, old_mtime))) = ro.get_file_meta(&identity.volume_id, &rel) {
+                if old_size == size && old_mtime == mtime.unwrap_or(0) {
+                    metrics.add_bytes_skipped(size);
+                    send(Job::Touch { rel, is_archive });
+                    continue;
+                }
+            }
+        }
+
+        let filename = name.to_string_lossy().into_owned();
+        let created = crate::scanner::unix_secs(meta.created());
+        let accessed = crate::scanner::unix_secs(meta.accessed());
+        if is_archive {
+            send(Job::ScanArchive {
+                path: path.to_path_buf(),
+                rel,
+                filename,
+                size,
+                created,
+                modified: mtime,
+                accessed,
+            });
+        } else {
+            send(Job::HashLoose {
+                path: path.to_path_buf(),
+                rel,
+                filename,
+                size,
+                created,
+                modified: mtime,
+                accessed,
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::Catalog;
     use crate::scan_metrics::ScanMetrics;
+    use crate::volume::VolumeIdentity;
+
+    fn ident() -> VolumeIdentity {
+        VolumeIdentity {
+            volume_id: "v1".into(),
+            label: "D".into(),
+            identified_by: "marker".into(),
+        }
+    }
+
+    /// Drain the walker's jobs into a Vec.
+    fn walk_to_vec(cat: &Catalog, root: &std::path::Path, force: bool) -> Vec<Job> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let m = ScanMetrics::new();
+        walk(cat, root, &ident(), force, 100, &m, &tx);
+        drop(tx);
+        rx.into_iter().collect()
+    }
+
+    #[test]
+    fn walker_emits_hash_jobs_for_new_files_and_scan_jobs_for_archives() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(t.path().join("doc.txt"), b"hi").unwrap();
+        {
+            let f = std::fs::File::create(t.path().join("bundle.zip")).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("e.txt", opts).unwrap();
+            std::io::Write::write_all(&mut zw, b"x").unwrap();
+            zw.finish().unwrap();
+        }
+        let cat = Catalog::open(&t.path().join("c.db")).unwrap();
+        let jobs = walk_to_vec(&cat, t.path(), false);
+        assert!(jobs
+            .iter()
+            .any(|j| matches!(j, Job::HashLoose { rel, .. } if rel == "doc.txt")));
+        assert!(jobs
+            .iter()
+            .any(|j| matches!(j, Job::ScanArchive { rel, .. } if rel == "bundle.zip")));
+    }
+
+    #[test]
+    fn walker_emits_touch_for_an_unchanged_catalogued_file() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("same.txt");
+        std::fs::write(&p, b"stable").unwrap();
+        let meta = std::fs::metadata(&p).unwrap();
+        let size = meta.len() as i64;
+        let mtime = crate::scanner::unix_secs(meta.modified());
+        let cat = Catalog::open(&t.path().join("c.db")).unwrap();
+        cat.upsert_volume(&crate::catalog::models::Volume {
+            volume_id: "v1".into(),
+            label: "D".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
+        cat.upsert_file(
+            &crate::catalog::models::NewFile {
+                volume_id: "v1".into(),
+                relative_path: "same.txt".into(),
+                filename: "same.txt".into(),
+                extension: "txt".into(),
+                size_bytes: size,
+                content_hash: "h".into(),
+                created_time: None,
+                modified_time: mtime,
+                accessed_time: None,
+                category: crate::category::Category::Other,
+                container_chain: None,
+            },
+            50,
+        )
+        .unwrap();
+
+        let jobs = walk_to_vec(&cat, t.path(), false); // not forced
+        assert!(
+            jobs.iter()
+                .any(|j| matches!(j, Job::Touch { rel, .. } if rel == "same.txt")),
+            "unchanged file should be a Touch, got {jobs:?}"
+        );
+
+        // --force re-hashes it instead.
+        let forced = walk_to_vec(&cat, t.path(), true);
+        assert!(forced
+            .iter()
+            .any(|j| matches!(j, Job::HashLoose { rel, .. } if rel == "same.txt")));
+    }
 
     fn tmp_file(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
         let p = dir.join(name);
