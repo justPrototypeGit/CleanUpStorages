@@ -10,8 +10,9 @@ use crate::catalog::models::NewFile;
 use crate::catalog::Catalog;
 use crate::category::Category;
 use crate::scan_metrics::{Phase, ScanMetrics};
+use crate::scanner::{Progress, ScanSummary};
 use crate::volume::VolumeIdentity;
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
@@ -308,6 +309,96 @@ pub(crate) fn walk(
     }
 }
 
+/// Drain every result into the catalogue inside one batched transaction, then run the missing-sweep.
+/// The single writer: only this function writes to SQLite during a scan. `db_write` timing is
+/// charged here. On any DB error it aborts and the caller rolls back.
+pub(crate) fn write_results(
+    cat: &Catalog,
+    results: Receiver<ScanResult>,
+    identity: &VolumeIdentity,
+    scan_started_at: i64,
+    now: i64,
+    metrics: &ScanMetrics,
+    progress: Option<&dyn Progress>,
+) -> anyhow::Result<ScanSummary> {
+    let mut summary = ScanSummary::default();
+    let mut in_batch = 0usize;
+    cat.conn.execute_batch("BEGIN")?;
+
+    for result in results {
+        let _t = metrics.timer(Phase::DbWrite);
+        match result {
+            ScanResult::Touch { rel, is_archive } => {
+                cat.touch_seen(&identity.volume_id, &rel, now)?;
+                if is_archive {
+                    cat.touch_archive_entries(&identity.volume_id, &rel, now)?;
+                }
+                summary.skipped += 1;
+                if let Some(p) = progress {
+                    p.on_skipped();
+                }
+                in_batch += 1;
+            }
+            ScanResult::Error { rel, reason } => {
+                cat.log_scan_error(Some(&identity.volume_id), &rel, &reason, now)?;
+                summary.errors += 1;
+                if let Some(p) = progress {
+                    p.on_error();
+                }
+                // Touch so a readable-but-unhashable file is not swept to 'missing' (matches today).
+                let _ = cat.touch_seen(&identity.volume_id, &rel, now);
+                in_batch += 1;
+            }
+            ScanResult::Upsert(nf) => {
+                cat.upsert_file(&nf, now)?;
+                summary.hashed += 1;
+                if let Some(p) = progress {
+                    p.on_hashed();
+                }
+                in_batch += 1;
+            }
+            ScanResult::ArchiveEntries {
+                rel,
+                modified,
+                scan,
+            } => {
+                for entry in &scan.entries {
+                    cat.upsert_archive_entry(&identity.volume_id, &rel, entry, modified, now)?;
+                    summary.archive_entries += 1;
+                    if let Some(p) = progress {
+                        p.on_archive_entry();
+                    }
+                    in_batch += 1;
+                }
+                for (ctx, reason) in &scan.errors {
+                    // Same location format as the pre-parallel scan: the inner context qualified by
+                    // the archive it came from, or the archive alone when there is no inner context.
+                    let where_ = if ctx.is_empty() {
+                        rel.clone()
+                    } else {
+                        format!("{rel} › {ctx}")
+                    };
+                    cat.log_scan_error(Some(&identity.volume_id), &where_, reason, now)?;
+                    summary.errors += 1;
+                    if let Some(p) = progress {
+                        p.on_error();
+                    }
+                }
+            }
+        }
+        crate::scanner::rotate_batch(cat, &mut in_batch)?;
+    }
+
+    {
+        let _t = metrics.timer(Phase::DbWrite);
+        cat.conn.execute_batch("COMMIT")?;
+        summary.marked_missing =
+            cat.mark_missing_scanned(&identity.volume_id, scan_started_at, now)?;
+    }
+    summary.metrics = metrics.snapshot();
+    Ok(summary)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,6 +493,99 @@ mod tests {
         assert!(forced
             .iter()
             .any(|j| matches!(j, Job::HashLoose { rel, .. } if rel == "same.txt")));
+    }
+
+    #[test]
+    fn writer_applies_results_and_counts_them() {
+        let t = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(&t.path().join("c.db")).unwrap();
+        cat.upsert_volume(&crate::catalog::models::Volume {
+            volume_id: "v1".into(),
+            label: "D".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(ScanResult::Upsert(crate::catalog::models::NewFile {
+            volume_id: "v1".into(),
+            relative_path: "a.txt".into(),
+            filename: "a.txt".into(),
+            extension: "txt".into(),
+            size_bytes: 3,
+            content_hash: "H".into(),
+            created_time: None,
+            modified_time: Some(7),
+            accessed_time: None,
+            category: crate::category::Category::Other,
+            container_chain: None,
+        }))
+        .unwrap();
+        tx.send(ScanResult::Error {
+            rel: "bad.txt".into(),
+            reason: "read: nope".into(),
+        })
+        .unwrap();
+        drop(tx);
+
+        let m = ScanMetrics::new();
+        let summary = write_results(&cat, rx, &ident(), 100, 100, &m, None).unwrap();
+
+        assert_eq!(summary.hashed, 1);
+        assert_eq!(summary.errors, 1);
+        // The row landed.
+        let hits = cat.search("a.txt", None, None, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].content_hash, "H");
+        // The error was logged.
+        assert!(cat.volume_has_scan_errors("v1").unwrap());
+    }
+
+    #[test]
+    fn writer_prefixes_archive_errors_with_the_archive_path() {
+        // The pre-parallel scan logged an archive's internal error as "<archive> › <entry>", and
+        // bare "<archive>" when the error had no inner context. Scan errors are user-facing, so the
+        // location must not silently lose its archive prefix.
+        let t = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(&t.path().join("c.db")).unwrap();
+        cat.upsert_volume(&crate::catalog::models::Volume {
+            volume_id: "v1".into(),
+            label: "D".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
+
+        let mut scan = crate::archive::ArchiveScanResult::default();
+        scan.errors.push(("inner.txt".into(), "zip bomb".into()));
+        scan.errors
+            .push((String::new(), "unreadable archive".into()));
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(ScanResult::ArchiveEntries {
+            rel: "bundle.zip".into(),
+            modified: Some(5),
+            scan,
+        })
+        .unwrap();
+        drop(tx);
+
+        let m = ScanMetrics::new();
+        let summary = write_results(&cat, rx, &ident(), 100, 100, &m, None).unwrap();
+        assert_eq!(summary.errors, 2);
+
+        let paths: Vec<String> = cat
+            .conn
+            .prepare("SELECT path FROM scan_errors ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(paths, vec!["bundle.zip › inner.txt", "bundle.zip"]);
     }
 
     fn tmp_file(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {

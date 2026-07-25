@@ -54,7 +54,7 @@ pub(crate) fn relative_path(path: &Path, root: &Path) -> Option<String> {
 }
 
 /// Commit the current transaction and open the next one, resetting the in-batch counter.
-fn rotate_batch(cat: &Catalog, in_batch: &mut usize) -> anyhow::Result<()> {
+pub(crate) fn rotate_batch(cat: &Catalog, in_batch: &mut usize) -> anyhow::Result<()> {
     if *in_batch >= BATCH_SIZE {
         cat.conn.execute_batch("COMMIT; BEGIN")?;
         *in_batch = 0;
