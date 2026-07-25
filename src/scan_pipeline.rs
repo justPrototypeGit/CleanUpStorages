@@ -177,7 +177,9 @@ pub(crate) fn run_job(job: Job, volume_id: &str, metrics: &ScanMetrics) -> Vec<S
                     Ok(f) => crate::archive::scan_archive(f, &limits),
                     Err(e) => {
                         let mut r = crate::archive::ArchiveScanResult::default();
-                        r.errors.push((rel.clone(), format!("archive open: {e}")));
+                        // Empty inner context: the writer qualifies these by the archive path, so
+                        // naming the archive again here would log "bundle.zip › bundle.zip".
+                        r.errors.push((String::new(), format!("archive open: {e}")));
                         r
                     }
                 }
@@ -586,6 +588,63 @@ mod tests {
             .map(|r| r.unwrap())
             .collect();
         assert_eq!(paths, vec!["bundle.zip › inner.txt", "bundle.zip"]);
+    }
+
+    #[test]
+    fn an_unopenable_archive_logs_the_archive_path_once() {
+        // run_job and write_results have to agree on who names the archive. If the worker also put
+        // the archive path in the inner context, the writer would log "x.zip › x.zip".
+        let t = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(&t.path().join("c.db")).unwrap();
+        cat.upsert_volume(&crate::catalog::models::Volume {
+            volume_id: "v1".into(),
+            label: "D".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
+
+        // A path that exists for stat purposes but cannot be opened as a file: use a directory.
+        let dir_as_archive = t.path().join("notreally.zip");
+        std::fs::create_dir(&dir_as_archive).unwrap();
+
+        let m = ScanMetrics::new();
+        let out = run_job(
+            Job::ScanArchive {
+                path: dir_as_archive,
+                rel: "notreally.zip".into(),
+                filename: "notreally.zip".into(),
+                size: 0,
+                created: None,
+                modified: None,
+                accessed: None,
+            },
+            "v1",
+            &m,
+        );
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        for r in out {
+            tx.send(r).unwrap();
+        }
+        drop(tx);
+        write_results(&cat, rx, &ident(), 100, 100, &m, None).unwrap();
+
+        let paths: Vec<String> = cat
+            .conn
+            .prepare("SELECT path FROM scan_errors")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        for p in &paths {
+            assert!(
+                !p.contains("notreally.zip › notreally.zip"),
+                "archive path logged twice: {p}"
+            );
+        }
     }
 
     fn tmp_file(dir: &std::path::Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
