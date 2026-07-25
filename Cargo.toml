@@ -34,6 +34,8 @@ rfd = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tower-http = { version = "0.6", features = ["trace"] }
+crossbeam-channel = "0.5"
+thread-priority = "1"
 
 # Windows-only: crisp (DPI-aware) native folder dialog, owned by the foreground window and
 # re-centered on the monitor once it appears.
