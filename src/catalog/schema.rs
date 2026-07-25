@@ -61,6 +61,7 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
             finished_at     INTEGER,
             wall_ms         INTEGER,
             forced          INTEGER NOT NULL,
+            jobs            INTEGER NOT NULL DEFAULT 1,
             status          TEXT NOT NULL,
             error_message   TEXT,
             files_seen      INTEGER NOT NULL DEFAULT 0,
@@ -115,6 +116,7 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
         order = crate::catalog::dedup::KEEP_ORDER
     ))?;
     rebuild_fts_if_stale(conn)?;
+    ensure_column(conn, "scan_runs", "jobs", "INTEGER NOT NULL DEFAULT 1")?;
     ensure_column(conn, "files", "original_path", "TEXT")?;
     ensure_column(conn, "volumes", "last_scanned_path", "TEXT")?;
     ensure_column(conn, "volumes", "display_name", "TEXT")?;

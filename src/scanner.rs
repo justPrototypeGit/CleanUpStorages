@@ -166,6 +166,9 @@ pub fn scan_volume(
 ///
 /// The single shared definition of "how a scan works" — used by both the CLI's `cmd_scan` and
 /// the web worker, so the two callers can never drift apart on volume-identity/upsert semantics.
+///
+/// `jobs` is the parallel read+hash worker count (1 disables parallelism); it is recorded on the
+/// scan_runs row so a later comparison knows the concurrency each run used.
 pub fn run_scan(
     cat: &Catalog,
     mount_root: &Path,
@@ -173,6 +176,7 @@ pub fn run_scan(
     fallback: crate::volume::ReadonlyMode,
     now: i64,
     progress: Option<&dyn Progress>,
+    jobs: usize,
 ) -> anyhow::Result<Option<(VolumeIdentity, ScanSummary)>> {
     let identity = match crate::volume::resolve(mount_root, fallback)? {
         Some(id) => id,
@@ -200,6 +204,7 @@ pub fn run_scan(
             &mount_root.display().to_string(),
             now,
             force,
+            jobs as i64,
         )
         .map_err(|e| tracing::warn!("could not record scan start: {e}"))
         .ok();
@@ -430,6 +435,7 @@ mod tests {
             crate::volume::ReadonlyMode::Fingerprint,
             100,
             None,
+            1,
         )
         .unwrap();
         let (identity, summary) = out.expect("not skipped");
@@ -482,6 +488,7 @@ mod tests {
             crate::volume::ReadonlyMode::Fingerprint,
             100,
             None,
+            1,
         )
         .unwrap();
         let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
@@ -506,6 +513,7 @@ mod tests {
             crate::volume::ReadonlyMode::Fingerprint,
             1234,
             None,
+            1,
         )
         .unwrap();
         assert!(n.is_some());
@@ -654,6 +662,7 @@ mod tests {
             crate::volume::ReadonlyMode::Fingerprint,
             100,
             None,
+            1,
         )
         .unwrap();
         assert!(out.is_some());
@@ -687,6 +696,7 @@ mod tests {
             crate::volume::ReadonlyMode::Fingerprint,
             100,
             None,
+            1,
         );
         assert!(out.is_err(), "the induced trigger must fail the scan");
         drop(cat);
@@ -727,6 +737,7 @@ mod tests {
             crate::volume::ReadonlyMode::Fingerprint,
             100,
             None,
+            1,
         );
         assert!(
             out.is_ok(),

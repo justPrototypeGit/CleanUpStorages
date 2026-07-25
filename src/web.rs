@@ -2621,7 +2621,7 @@ mod tests {
         {
             let cat = Catalog::open(&db).unwrap();
             let id = cat
-                .start_scan_run(Some("vol-1"), "D:/one", 100, false)
+                .start_scan_run(Some("vol-1"), "D:/one", 100, false, 1)
                 .unwrap();
             let s = crate::scanner::ScanSummary {
                 hashed: 3,
@@ -2633,7 +2633,7 @@ mod tests {
                 ..Default::default()
             };
             cat.finish_scan_run(id, 150, "completed", None, &s).unwrap();
-            cat.start_scan_run(Some("vol-1"), "D:/two", 200, true)
+            cat.start_scan_run(Some("vol-1"), "D:/two", 200, true, 4)
                 .unwrap();
         }
 

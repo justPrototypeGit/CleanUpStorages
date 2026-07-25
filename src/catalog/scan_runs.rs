@@ -18,6 +18,8 @@ pub struct ScanRun {
     pub started_at: i64,
     pub finished_at: Option<i64>,
     pub forced: bool,
+    /// Parallel worker count this run used (#23). 1 = no parallelism.
+    pub jobs: i64,
     pub status: String,
     pub error_message: Option<String>,
     pub hashed: i64,
@@ -38,11 +40,12 @@ impl Catalog {
         root_path: &str,
         started_at: i64,
         forced: bool,
+        jobs: i64,
     ) -> anyhow::Result<i64> {
         self.conn.execute(
-            "INSERT INTO scan_runs(volume_id, root_path, started_at, forced, status)
-             VALUES (?1, ?2, ?3, ?4, 'running')",
-            params![volume_id, root_path, started_at, forced as i64],
+            "INSERT INTO scan_runs(volume_id, root_path, started_at, forced, jobs, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'running')",
+            params![volume_id, root_path, started_at, forced as i64, jobs],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -92,41 +95,45 @@ impl Catalog {
     /// Most recent runs, newest first.
     pub fn recent_scan_runs(&self, limit: usize) -> anyhow::Result<Vec<ScanRun>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, volume_id, root_path, started_at, finished_at, forced, status,
+            "SELECT id, volume_id, root_path, started_at, finished_at, forced, jobs, status,
                     error_message, files_seen, hashed, skipped, errors, archive_entries,
                     bytes_hashed, bytes_skipped, wall_ms, walk_ms, skip_check_ms, hash_ms,
                     db_write_ms, archive_ms, size_histogram
              FROM scan_runs ORDER BY started_at DESC, id DESC LIMIT ?1",
         )?;
+        // Read by column NAME, not position. Inserting a column into the SELECT above used to shift
+        // every later index, which silently puts the wrong number in the wrong field — a defect no
+        // test would catch if two columns share a type. Names cannot drift that way.
         let rows = stmt.query_map(params![limit as i64], |r| {
             // Display data must never fail a read: a corrupt histogram degrades to zeroes.
             let histogram = r
-                .get::<_, Option<String>>(21)?
+                .get::<_, Option<String>>("size_histogram")?
                 .and_then(|s| serde_json::from_str::<[u64; BUCKET_COUNT]>(&s).ok())
                 .unwrap_or([0; BUCKET_COUNT]);
             Ok(ScanRun {
-                id: r.get(0)?,
-                volume_id: r.get(1)?,
-                root_path: r.get(2)?,
-                started_at: r.get(3)?,
-                finished_at: r.get(4)?,
-                forced: r.get::<_, i64>(5)? != 0,
-                status: r.get(6)?,
-                error_message: r.get(7)?,
-                hashed: r.get(9)?,
-                skipped: r.get(10)?,
-                errors: r.get(11)?,
-                archive_entries: r.get(12)?,
+                id: r.get("id")?,
+                volume_id: r.get("volume_id")?,
+                root_path: r.get("root_path")?,
+                started_at: r.get("started_at")?,
+                finished_at: r.get("finished_at")?,
+                forced: r.get::<_, i64>("forced")? != 0,
+                jobs: r.get("jobs")?,
+                status: r.get("status")?,
+                error_message: r.get("error_message")?,
+                hashed: r.get("hashed")?,
+                skipped: r.get("skipped")?,
+                errors: r.get("errors")?,
+                archive_entries: r.get("archive_entries")?,
                 metrics: MetricsSnapshot {
-                    files_seen: r.get::<_, i64>(8)? as u64,
-                    bytes_hashed: r.get::<_, i64>(13)? as u64,
-                    bytes_skipped: r.get::<_, i64>(14)? as u64,
-                    wall_ms: r.get::<_, Option<i64>>(15)?.unwrap_or(0) as u64,
-                    walk_ms: r.get::<_, i64>(16)? as u64,
-                    skip_check_ms: r.get::<_, i64>(17)? as u64,
-                    hash_ms: r.get::<_, i64>(18)? as u64,
-                    db_write_ms: r.get::<_, i64>(19)? as u64,
-                    archive_ms: r.get::<_, i64>(20)? as u64,
+                    files_seen: r.get::<_, i64>("files_seen")? as u64,
+                    bytes_hashed: r.get::<_, i64>("bytes_hashed")? as u64,
+                    bytes_skipped: r.get::<_, i64>("bytes_skipped")? as u64,
+                    wall_ms: r.get::<_, Option<i64>>("wall_ms")?.unwrap_or(0) as u64,
+                    walk_ms: r.get::<_, i64>("walk_ms")? as u64,
+                    skip_check_ms: r.get::<_, i64>("skip_check_ms")? as u64,
+                    hash_ms: r.get::<_, i64>("hash_ms")? as u64,
+                    db_write_ms: r.get::<_, i64>("db_write_ms")? as u64,
+                    archive_ms: r.get::<_, i64>("archive_ms")? as u64,
                     histogram,
                 },
             })
@@ -151,7 +158,7 @@ mod tests {
     fn a_started_run_is_visible_as_running_before_it_finishes() {
         let (_t, cat) = open();
         let id = cat
-            .start_scan_run(Some("v1"), "D:/drive", 100, false)
+            .start_scan_run(Some("v1"), "D:/drive", 100, false, 4)
             .unwrap();
         let runs = cat.recent_scan_runs(10).unwrap();
         assert_eq!(runs.len(), 1);
@@ -159,13 +166,30 @@ mod tests {
         assert_eq!(runs[0].status, "running");
         assert_eq!(runs[0].finished_at, None);
         assert_eq!(runs[0].root_path, "D:/drive");
+        // The concurrency the run used is recorded, so a later before/after comparison knows which
+        // --jobs produced which timings (#23).
+        assert_eq!(runs[0].jobs, 4);
+    }
+
+    #[test]
+    fn the_worker_count_is_recorded_per_run() {
+        let (_t, cat) = open();
+        cat.start_scan_run(Some("v1"), "D:/serial", 100, false, 1)
+            .unwrap();
+        cat.start_scan_run(Some("v1"), "D:/parallel", 200, false, 8)
+            .unwrap();
+        let runs = cat.recent_scan_runs(10).unwrap();
+        // Newest first.
+        assert_eq!(runs[0].root_path, "D:/parallel");
+        assert_eq!(runs[0].jobs, 8);
+        assert_eq!(runs[1].jobs, 1);
     }
 
     #[test]
     fn finishing_a_run_stores_counters_phases_and_histogram() {
         let (_t, cat) = open();
         let id = cat
-            .start_scan_run(Some("v1"), "D:/drive", 100, true)
+            .start_scan_run(Some("v1"), "D:/drive", 100, true, 4)
             .unwrap();
         let summary = ScanSummary {
             hashed: 7,
@@ -205,7 +229,7 @@ mod tests {
     #[test]
     fn a_failed_run_keeps_its_error_and_its_partial_numbers() {
         let (_t, cat) = open();
-        let id = cat.start_scan_run(None, "D:/x", 100, false).unwrap();
+        let id = cat.start_scan_run(None, "D:/x", 100, false, 1).unwrap();
         let summary = ScanSummary {
             hashed: 4,
             metrics: MetricsSnapshot {
@@ -229,7 +253,7 @@ mod tests {
     fn recent_runs_are_newest_first_and_bounded() {
         let (_t, cat) = open();
         for i in 0..5 {
-            cat.start_scan_run(Some("v"), "D:/d", 100 + i, false)
+            cat.start_scan_run(Some("v"), "D:/d", 100 + i, false, 1)
                 .unwrap();
         }
         let runs = cat.recent_scan_runs(3).unwrap();
@@ -241,7 +265,9 @@ mod tests {
     #[test]
     fn a_corrupt_histogram_column_reads_back_as_zeroes_not_an_error() {
         let (_t, cat) = open();
-        let id = cat.start_scan_run(Some("v"), "D:/d", 100, false).unwrap();
+        let id = cat
+            .start_scan_run(Some("v"), "D:/d", 100, false, 1)
+            .unwrap();
         cat.conn
             .execute(
                 "UPDATE scan_runs SET size_histogram='not json' WHERE id=?1",

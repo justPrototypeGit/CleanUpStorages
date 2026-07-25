@@ -24,6 +24,9 @@ enum Command {
         /// How to handle read-only drives where the marker cannot be written.
         #[arg(long, value_enum, default_value = "ask")]
         readonly_fallback: commands::ReadonlyFallback,
+        /// Number of parallel read+hash workers (use 1 to disable parallelism).
+        #[arg(long, default_value_t = 4)]
+        jobs: usize,
     },
     /// Search the catalog for files by name/path.
     Search {
@@ -127,7 +130,8 @@ fn main() -> anyhow::Result<()> {
             path,
             force,
             readonly_fallback,
-        } => commands::cmd_scan(&path, force, readonly_fallback),
+            jobs,
+        } => commands::cmd_scan(&path, force, readonly_fallback, jobs),
         Command::Search {
             query,
             category,
