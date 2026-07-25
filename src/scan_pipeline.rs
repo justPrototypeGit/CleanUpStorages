@@ -1,6 +1,7 @@
 //! The scan pipeline: a walker produces jobs, workers read+hash them, a single writer persists the
 //! results. Workers never touch SQLite — the writer is the sole writer. See the design spec.
 
+use crate::archive::ArchiveLimits;
 use crate::catalog::models::NewFile;
 use crate::catalog::Catalog;
 use crate::category::Category;
@@ -9,6 +10,7 @@ use crate::scanner::{Progress, ScanSummary};
 use crate::volume::VolumeIdentity;
 use crossbeam_channel::{Receiver, Sender};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use walkdir::WalkDir;
 
 /// Work the walker hands to a worker. `Touch` and `Error` carry no I/O — they pass through a worker
@@ -96,7 +98,12 @@ fn loose_record(
 
 /// Do one job's I/O and hashing. No DB access — the writer persists what this returns. Runs on a
 /// worker thread; `hash`/`archive` timing is charged here.
-pub(crate) fn run_job(job: Job, volume_id: &str, metrics: &ScanMetrics) -> Vec<ScanResult> {
+pub(crate) fn run_job(
+    job: Job,
+    volume_id: &str,
+    limits: &ArchiveLimits,
+    metrics: &ScanMetrics,
+) -> Vec<ScanResult> {
     match job {
         Job::Touch { rel, is_archive } => vec![ScanResult::Touch { rel, is_archive }],
         Job::Error { rel, reason } => vec![ScanResult::Error { rel, reason }],
@@ -158,18 +165,8 @@ pub(crate) fn run_job(job: Job, volume_id: &str, metrics: &ScanMetrics) -> Vec<S
             // Descend. archive::scan_archive is pure (no DB); the writer persists its entries.
             let scan = {
                 let _t = metrics.timer(Phase::Archive);
-                // ArchiveLimits::from_config only reads three static numbers; a failure to resolve
-                // the data dir must not abort a scan, so fall back to the config defaults.
-                let limits = crate::config::Config::default_paths()
-                    .map(|c| crate::archive::ArchiveLimits::from_config(&c))
-                    .unwrap_or_else(|_| crate::archive::ArchiveLimits {
-                        max_depth: 8,
-                        entry_max_bytes: 2 * 1024 * 1024 * 1024,
-                        ratio_cap: 200,
-                        total_buffer_bytes: 2 * 1024 * 1024 * 1024,
-                    });
                 match std::fs::File::open(&path) {
-                    Ok(f) => crate::archive::scan_archive(f, &limits),
+                    Ok(f) => crate::archive::scan_archive(f, limits),
                     Err(e) => {
                         let mut r = crate::archive::ArchiveScanResult::default();
                         // Empty inner context: the writer qualifies these by the archive path, so
@@ -199,14 +196,13 @@ pub(crate) fn walk(
     root: &Path,
     identity: &VolumeIdentity,
     force: bool,
-    _now: i64,
     metrics: &ScanMetrics,
     jobs: &Sender<Job>,
 ) {
-    let send = |j: Job| {
-        // The only reason send fails is the writer/workers went away (fatal). Stop walking.
-        let _ = jobs.send(j);
-    };
+    // A send only fails once the workers/writer are gone, i.e. the scan is already doomed. Returning
+    // false makes the caller stop: otherwise the walker would keep stat-ing every remaining file on
+    // a 20 TB drive — hours of seeking — just to throw each job away.
+    let send = |j: Job| jobs.send(j).is_ok();
     let mut walker = WalkDir::new(root).into_iter();
     loop {
         let next = {
@@ -226,10 +222,12 @@ pub(crate) fn walk(
                             .replace('\\', "/")
                     })
                     .unwrap_or_else(|| "<unknown>".to_string());
-                send(Job::Error {
+                if !send(Job::Error {
                     rel,
                     reason: format!("walk: {err}"),
-                });
+                }) {
+                    return;
+                }
                 continue;
             }
         };
@@ -253,10 +251,12 @@ pub(crate) fn walk(
             Ok(m) => m,
             Err(e) => {
                 metrics.record_file_seen(0);
-                send(Job::Error {
+                if !send(Job::Error {
                     rel,
                     reason: format!("metadata: {e}"),
-                });
+                }) {
+                    return;
+                }
                 continue;
             }
         };
@@ -273,7 +273,9 @@ pub(crate) fn walk(
             if let Ok(Some((old_size, old_mtime))) = ro.get_file_meta(&identity.volume_id, &rel) {
                 if old_size == size && old_mtime == mtime.unwrap_or(0) {
                     metrics.add_bytes_skipped(size);
-                    send(Job::Touch { rel, is_archive });
+                    if !send(Job::Touch { rel, is_archive }) {
+                        return;
+                    }
                     continue;
                 }
             }
@@ -282,7 +284,7 @@ pub(crate) fn walk(
         let filename = name.to_string_lossy().into_owned();
         let created = crate::scanner::unix_secs(meta.created());
         let accessed = crate::scanner::unix_secs(meta.accessed());
-        if is_archive {
+        let sent = if is_archive {
             send(Job::ScanArchive {
                 path: path.to_path_buf(),
                 rel,
@@ -291,7 +293,7 @@ pub(crate) fn walk(
                 created,
                 modified: mtime,
                 accessed,
-            });
+            })
         } else {
             send(Job::HashLoose {
                 path: path.to_path_buf(),
@@ -301,14 +303,34 @@ pub(crate) fn walk(
                 created,
                 modified: mtime,
                 accessed,
-            });
+            })
+        };
+        if !sent {
+            return;
         }
     }
+}
+
+/// Set by the pipeline so the writer can tell "the walk finished" from "everything died".
+///
+/// The results channel closes on BOTH, so closure alone cannot be read as success — committing on
+/// an abort would durably persist a partial scan and then sweep every unreported file to `missing`.
+#[derive(Default)]
+pub(crate) struct PipelineStatus {
+    /// The walk ran to completion (set before the jobs channel is closed).
+    pub walk_completed: AtomicBool,
+    /// A worker died without finishing its jobs (set by its drop-guard, before its sender drops).
+    pub aborted: AtomicBool,
 }
 
 /// Drain every result into the catalogue inside one batched transaction, then run the missing-sweep.
 /// The single writer: only this function writes to SQLite during a scan. `db_write` timing is
 /// charged here. On any DB error it aborts and the caller rolls back.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each parameter is an independent scan input; grouping them into a struct would add \
+        indirection without reducing real complexity"
+)]
 pub(crate) fn write_results(
     cat: &Catalog,
     results: Receiver<ScanResult>,
@@ -317,6 +339,7 @@ pub(crate) fn write_results(
     now: i64,
     metrics: &ScanMetrics,
     progress: Option<&dyn Progress>,
+    status: &PipelineStatus,
 ) -> anyhow::Result<ScanSummary> {
     let mut summary = ScanSummary::default();
     let mut in_batch = 0usize;
@@ -386,6 +409,18 @@ pub(crate) fn write_results(
         crate::scanner::rotate_batch(cat, &mut in_batch)?;
     }
 
+    // The channel closing does NOT mean the scan succeeded — it also closes when a worker panics or
+    // the walker bails, because that drops the senders. Committing here on an abort would make a
+    // partial scan durable and then sweep every file the walk never reached to `missing`: on a
+    // 1.8M-file drive, an abort late in a long scan would silently un-`active` a large part of the
+    // register. The pre-parallel scan could not do this — it held one transaction and rolled back.
+    if !status.walk_completed.load(Ordering::SeqCst) {
+        anyhow::bail!("scan did not complete its walk; no results were committed");
+    }
+    if status.aborted.load(Ordering::SeqCst) {
+        anyhow::bail!("a scan worker died; no results were committed");
+    }
+
     {
         let _t = metrics.timer(Phase::DbWrite);
         cat.conn.execute_batch("COMMIT")?;
@@ -403,6 +438,16 @@ mod tests {
     use crate::scan_metrics::ScanMetrics;
     use crate::volume::VolumeIdentity;
 
+    /// Default archive limits for tests that do not care about the bomb caps.
+    fn test_limits() -> ArchiveLimits {
+        ArchiveLimits {
+            max_depth: 8,
+            entry_max_bytes: 2 * 1024 * 1024 * 1024,
+            ratio_cap: 200,
+            total_buffer_bytes: 2 * 1024 * 1024 * 1024,
+        }
+    }
+
     fn ident() -> VolumeIdentity {
         VolumeIdentity {
             volume_id: "v1".into(),
@@ -415,7 +460,7 @@ mod tests {
     fn walk_to_vec(cat: &Catalog, root: &std::path::Path, force: bool) -> Vec<Job> {
         let (tx, rx) = crossbeam_channel::unbounded();
         let m = ScanMetrics::new();
-        walk(cat, root, &ident(), force, 100, &m, &tx);
+        walk(cat, root, &ident(), force, &m, &tx);
         drop(tx);
         rx.into_iter().collect()
     }
@@ -528,7 +573,9 @@ mod tests {
         drop(tx);
 
         let m = ScanMetrics::new();
-        let summary = write_results(&cat, rx, &ident(), 100, 100, &m, None).unwrap();
+        let status = PipelineStatus::default();
+        status.walk_completed.store(true, Ordering::SeqCst);
+        let summary = write_results(&cat, rx, &ident(), 100, 100, &m, None, &status).unwrap();
 
         assert_eq!(summary.hashed, 1);
         assert_eq!(summary.errors, 1);
@@ -538,6 +585,127 @@ mod tests {
         assert_eq!(hits[0].content_hash, "H");
         // The error was logged.
         assert!(cat.volume_has_scan_errors("v1").unwrap());
+    }
+
+    /// Seed a volume with one catalogued, currently-active file.
+    fn cat_with_active_file(t: &tempfile::TempDir) -> Catalog {
+        let cat = Catalog::open(&t.path().join("c.db")).unwrap();
+        cat.upsert_volume(&crate::catalog::models::Volume {
+            volume_id: "v1".into(),
+            label: "D".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
+        cat.upsert_file(
+            &crate::catalog::models::NewFile {
+                volume_id: "v1".into(),
+                relative_path: "present.txt".into(),
+                filename: "present.txt".into(),
+                extension: "txt".into(),
+                size_bytes: 1,
+                content_hash: "H".into(),
+                created_time: None,
+                modified_time: Some(1),
+                accessed_time: None,
+                category: crate::category::Category::Other,
+                container_chain: None,
+            },
+            50,
+        )
+        .unwrap();
+        cat
+    }
+
+    #[test]
+    fn an_incomplete_walk_commits_nothing_and_sweeps_nothing() {
+        // The results channel closes when the walk finishes AND when everything dies. If the writer
+        // treats closure as success it commits a partial scan and then sweeps every file the walk
+        // never reached to `missing` -- on a 1.8M-file drive, an abort late in a long scan would
+        // silently un-`active` a large part of the register. The pre-parallel scan could not do
+        // this: it held one transaction and rolled back.
+        let t = tempfile::tempdir().unwrap();
+        let cat = cat_with_active_file(&t);
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        drop(tx); // channel closes with walk_completed still false
+        let m = ScanMetrics::new();
+        let status = PipelineStatus::default(); // walk_completed = false
+
+        let res = write_results(&cat, rx, &ident(), 100, 100, &m, None, &status);
+        assert!(res.is_err(), "an incomplete walk must not report success");
+        let _ = cat.conn.execute_batch("ROLLBACK");
+
+        let status_now: String = cat
+            .conn
+            .query_row(
+                "SELECT status FROM files WHERE relative_path='present.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status_now, "active",
+            "a file that is still on disk must not be swept to missing by an aborted scan"
+        );
+    }
+
+    #[test]
+    fn a_dead_worker_prevents_the_commit() {
+        // Same protection, via the other abort path: the walk finished but a worker died before
+        // reporting its files.
+        let t = tempfile::tempdir().unwrap();
+        let cat = cat_with_active_file(&t);
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        drop(tx);
+        let m = ScanMetrics::new();
+        let status = PipelineStatus::default();
+        status.walk_completed.store(true, Ordering::SeqCst);
+        status.aborted.store(true, Ordering::SeqCst);
+
+        let res = write_results(&cat, rx, &ident(), 100, 100, &m, None, &status);
+        assert!(res.is_err(), "a dead worker must not report success");
+        let _ = cat.conn.execute_batch("ROLLBACK");
+
+        let status_now: String = cat
+            .conn
+            .query_row(
+                "SELECT status FROM files WHERE relative_path='present.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status_now, "active");
+    }
+
+    #[test]
+    fn a_completed_walk_does_commit_and_sweep() {
+        // The guard must not be so strict that a normal scan stops sweeping: a file that really is
+        // gone still has to become `missing`.
+        let t = tempfile::tempdir().unwrap();
+        let cat = cat_with_active_file(&t);
+
+        let (tx, rx) = crossbeam_channel::unbounded();
+        drop(tx);
+        let m = ScanMetrics::new();
+        let status = PipelineStatus::default();
+        status.walk_completed.store(true, Ordering::SeqCst);
+
+        // scan_started_at = 100 > the row's last_seen_at of 50, so the sweep should catch it.
+        let summary = write_results(&cat, rx, &ident(), 100, 100, &m, None, &status).unwrap();
+        assert_eq!(summary.marked_missing, 1);
+
+        let status_now: String = cat
+            .conn
+            .query_row(
+                "SELECT status FROM files WHERE relative_path='present.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status_now, "missing");
     }
 
     #[test]
@@ -571,7 +739,9 @@ mod tests {
         drop(tx);
 
         let m = ScanMetrics::new();
-        let summary = write_results(&cat, rx, &ident(), 100, 100, &m, None).unwrap();
+        let status = PipelineStatus::default();
+        status.walk_completed.store(true, Ordering::SeqCst);
+        let summary = write_results(&cat, rx, &ident(), 100, 100, &m, None, &status).unwrap();
         assert_eq!(summary.errors, 2);
 
         let paths: Vec<String> = cat
@@ -616,6 +786,7 @@ mod tests {
                 accessed: None,
             },
             "v1",
+            &test_limits(),
             &m,
         );
 
@@ -624,7 +795,9 @@ mod tests {
             tx.send(r).unwrap();
         }
         drop(tx);
-        write_results(&cat, rx, &ident(), 100, 100, &m, None).unwrap();
+        let status = PipelineStatus::default();
+        status.walk_completed.store(true, Ordering::SeqCst);
+        write_results(&cat, rx, &ident(), 100, 100, &m, None, &status).unwrap();
 
         let paths: Vec<String> = cat
             .conn
@@ -662,7 +835,7 @@ mod tests {
             modified: Some(2),
             accessed: None,
         };
-        let out = run_job(job, "v1", &m);
+        let out = run_job(job, "v1", &test_limits(), &m);
         assert_eq!(out.len(), 1);
         match &out[0] {
             ScanResult::Upsert(nf) => {
@@ -694,7 +867,7 @@ mod tests {
             modified: None,
             accessed: None,
         };
-        let out = run_job(job, "v1", &m);
+        let out = run_job(job, "v1", &test_limits(), &m);
         assert_eq!(out.len(), 1);
         assert!(matches!(&out[0], ScanResult::Error { rel, .. } if rel == "gone.txt"));
     }
@@ -708,6 +881,7 @@ mod tests {
                 is_archive: true,
             },
             "v1",
+            &test_limits(),
             &m,
         );
         assert!(matches!(&t[0], ScanResult::Touch { rel, is_archive: true } if rel == "x"));
@@ -717,6 +891,7 @@ mod tests {
                 reason: "bad".into(),
             },
             "v1",
+            &test_limits(),
             &m,
         );
         assert!(matches!(&e[0], ScanResult::Error { rel, .. } if rel == "y"));
@@ -747,7 +922,7 @@ mod tests {
             modified: Some(99),
             accessed: None,
         };
-        let out = run_job(job, "v1", &m);
+        let out = run_job(job, "v1", &test_limits(), &m);
         // First result: the zip's own loose row. Second: its entries.
         assert_eq!(out.len(), 2);
         assert!(matches!(&out[0], ScanResult::Upsert(nf) if nf.relative_path == "bundle.zip"));

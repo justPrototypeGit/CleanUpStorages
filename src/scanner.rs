@@ -57,6 +57,27 @@ pub(crate) fn rotate_batch(cat: &Catalog, in_batch: &mut usize) -> anyhow::Resul
     Ok(())
 }
 
+/// Flags the pipeline as aborted unless disarmed — how a worker panic reaches the writer.
+///
+/// Without this, a panicking worker simply drops its sender, the results channel closes, and the
+/// writer cannot distinguish that from a completed walk: it would commit the partial scan and then
+/// sweep every unreported file to `missing`.
+struct AbortOnDrop<'a>(&'a crate::scan_pipeline::PipelineStatus);
+
+impl AbortOnDrop<'_> {
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for AbortOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0
+            .aborted
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Recursively scan `root`, hashing new/changed files and skipping (but re-touching) unchanged
 /// ones, then sweep any previously-active file not seen this pass into `missing`.
 ///
@@ -82,10 +103,26 @@ pub fn scan_volume_with_progress(
     metrics: &crate::scan_metrics::ScanMetrics,
     jobs: usize,
 ) -> anyhow::Result<ScanSummary> {
-    use crate::scan_pipeline::{run_job, walk, write_results};
+    use crate::scan_pipeline::{run_job, walk, write_results, PipelineStatus};
 
     let jobs = jobs.max(1);
     let db_path = cat.path.clone();
+
+    // Resolved once, not per archive: `Config::default_paths` does a directory lookup and a
+    // create_dir_all, which would otherwise be a filesystem syscall per archive job, issued
+    // concurrently and charged to the archive phase we are trying to measure.
+    let mut limits =
+        crate::archive::ArchiveLimits::from_config(&crate::config::Config::default_paths()?);
+    // #18 capped how much nested-archive data the SCAN holds at once. With N workers each running
+    // its own descent, a per-descent cap would multiply by N (4 workers x 2 GiB = 8 GiB), so divide
+    // it: the process-wide ceiling stays what it was however many workers there are.
+    limits.total_buffer_bytes = (limits.total_buffer_bytes / jobs as u64).max(1);
+
+    // The results channel closes on success AND on every abort path, so the writer needs an explicit
+    // signal to tell them apart before it commits.
+    let status = PipelineStatus::default();
+    // Shadow with a reference so the `move` closures below capture the borrow, not the value.
+    let status = &status;
 
     // Bounded channels give backpressure: the walker blocks when workers are saturated, so the walk
     // cannot run millions of paths ahead of the hashing and blow up memory.
@@ -101,7 +138,7 @@ pub fn scan_volume_with_progress(
         let writer_path = db_path.clone();
         let writer = scope.spawn(move || -> anyhow::Result<ScanSummary> {
             let wcat = Catalog::open(&writer_path)?;
-            match write_results(&wcat, res_rx, identity, now, now, metrics, progress) {
+            match write_results(&wcat, res_rx, identity, now, now, metrics, progress, status) {
                 Ok(s) => Ok(s),
                 Err(e) => {
                     let _ = wcat.conn.execute_batch("ROLLBACK");
@@ -117,17 +154,25 @@ pub fn scan_volume_with_progress(
             let jr = job_rx.clone();
             let rt = res_tx.clone();
             let vid = volume_id.clone();
+            let lim = &limits;
+            let st = status;
             worker_handles.push(scope.spawn(move || {
                 let _ = thread_priority::set_current_thread_priority(
                     thread_priority::ThreadPriority::Min,
                 );
+                // Declared as a body local so that on a panic it drops — and sets the flag — BEFORE
+                // the captured sender drops. The writer only reads the flag after the channel
+                // closes, which cannot happen until every sender is gone, so it always sees a true
+                // value here rather than committing a partial scan.
+                let guard = AbortOnDrop(st);
                 for job in jr {
-                    for result in run_job(job, &vid, metrics) {
+                    for result in run_job(job, &vid, lim, metrics) {
                         if rt.send(result).is_err() {
-                            return; // writer gone; stop
+                            return; // writer gone; its own error is the one that matters
                         }
                     }
                 }
+                guard.disarm();
             }));
         }
         // The parent's handles must go, or the channels never close: each worker holds its own
@@ -137,7 +182,12 @@ pub fn scan_volume_with_progress(
 
         // Walker: its own read-only connection for the skip-check.
         let rocat = Catalog::open_readonly(&db_path)?;
-        walk(&rocat, root, identity, force, now, metrics, &job_tx);
+        walk(&rocat, root, identity, force, metrics, &job_tx);
+        // Set BEFORE closing the channel: the writer must never see a closed channel without also
+        // seeing the final value of this flag. A panic in walk() skips this, leaving it false.
+        status
+            .walk_completed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         drop(job_tx); // no more jobs -> workers drain and exit
 
         for h in worker_handles {
@@ -213,15 +263,8 @@ pub fn run_scan(
     // measured before it died.
     let metrics = crate::scan_metrics::ScanMetrics::new();
     let result = scan_volume_with_progress(
-        cat, mount_root, &identity, force, now, progress, &metrics, 1,
+        cat, mount_root, &identity, force, now, progress, &metrics, jobs,
     );
-
-    if result.is_err() {
-        // The scan bailed with its BEGIN still open; end it so the metrics UPDATE below is its
-        // own transaction and survives. Nothing durable is lost -- it would have been rolled
-        // back at connection close anyway.
-        let _ = cat.conn.execute_batch("ROLLBACK");
-    }
 
     if let Some(id) = run_id {
         let finished_at = crate::commands::now_secs();
