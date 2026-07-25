@@ -11,6 +11,9 @@ use std::path::Path;
 /// An open handle to the catalog database.
 pub struct Catalog {
     pub conn: Connection,
+    /// Where this catalog lives. A `Connection` is `Send` but not `Sync`, so the scan pipeline
+    /// cannot share one across threads — it opens its own per-role connections from this path.
+    pub path: std::path::PathBuf,
 }
 
 impl Catalog {
@@ -24,7 +27,10 @@ impl Catalog {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         schema::apply(&conn)?;
-        Ok(Catalog { conn })
+        Ok(Catalog {
+            conn,
+            path: path.to_path_buf(),
+        })
     }
 
     /// Open the catalog READ-ONLY (no directory creation, no schema DDL, no WAL switch).
@@ -32,7 +38,10 @@ impl Catalog {
     pub fn open_readonly(path: &Path) -> anyhow::Result<Catalog> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        Ok(Catalog { conn })
+        Ok(Catalog {
+            conn,
+            path: path.to_path_buf(),
+        })
     }
 
     /// Run PRAGMA integrity_check; true if the DB reports "ok".

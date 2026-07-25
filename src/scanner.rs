@@ -1,12 +1,7 @@
 use std::path::Path;
-use walkdir::WalkDir;
 
-use crate::archive::{self, ArchiveLimits};
-use crate::catalog::models::{NewFile, Volume};
+use crate::catalog::models::Volume;
 use crate::catalog::Catalog;
-use crate::category::Category;
-use crate::config::Config;
-use crate::hashing;
 use crate::volume::VolumeIdentity;
 
 const BATCH_SIZE: usize = 200;
@@ -72,6 +67,11 @@ pub(crate) fn rotate_batch(cat: &Catalog, in_batch: &mut usize) -> anyhow::Resul
 ///
 /// `metrics` is owned by the caller so a scan that bails part-way still yields what it measured
 /// before it died — the multi-day run that fails late is the one most worth measuring.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each parameter is an independent scan input; grouping them into a struct would add \
+        indirection without reducing real complexity"
+)]
 pub fn scan_volume_with_progress(
     cat: &Catalog,
     root: &Path,
@@ -80,193 +80,74 @@ pub fn scan_volume_with_progress(
     now: i64,
     progress: Option<&dyn Progress>,
     metrics: &crate::scan_metrics::ScanMetrics,
+    jobs: usize,
 ) -> anyhow::Result<ScanSummary> {
-    let scan_started_at = now;
-    let limits = ArchiveLimits::from_config(&Config::default_paths()?);
-    let mut summary = ScanSummary::default();
-    let mut in_batch = 0usize;
-    cat.conn.execute_batch("BEGIN")?;
+    use crate::scan_pipeline::{run_job, walk, write_results};
 
-    let mut walker = WalkDir::new(root).into_iter();
-    loop {
-        let next = {
-            let _t = metrics.timer(crate::scan_metrics::Phase::Walk);
-            walker.next()
-        };
-        let Some(entry) = next else { break };
-        let entry = match entry {
-            Ok(e) => e,
-            Err(err) => {
-                let p = err
-                    .path()
-                    .map(|p| {
-                        p.strip_prefix(root)
-                            .unwrap_or(p)
-                            .to_string_lossy()
-                            .replace('\\', "/")
-                    })
-                    .unwrap_or_else(|| "<unknown>".to_string());
-                cat.log_scan_error(Some(&identity.volume_id), &p, &format!("walk: {err}"), now)?;
-                summary.errors += 1;
-                if let Some(p) = progress {
-                    p.on_error();
+    let jobs = jobs.max(1);
+    let db_path = cat.path.clone();
+
+    // Bounded channels give backpressure: the walker blocks when workers are saturated, so the walk
+    // cannot run millions of paths ahead of the hashing and blow up memory.
+    let (job_tx, job_rx) = crossbeam_channel::bounded::<crate::scan_pipeline::Job>(jobs * 4);
+    let (res_tx, res_rx) = crossbeam_channel::bounded::<crate::scan_pipeline::ScanResult>(jobs * 4);
+
+    let volume_id = identity.volume_id.clone();
+
+    // thread::scope lets the workers borrow `metrics`, `progress` and `identity` without `'static`
+    // bounds, and guarantees every thread joins before this function returns.
+    std::thread::scope(|scope| -> anyhow::Result<ScanSummary> {
+        // Writer: the single SQLite writer, on its own read-write connection.
+        let writer_path = db_path.clone();
+        let writer = scope.spawn(move || -> anyhow::Result<ScanSummary> {
+            let wcat = Catalog::open(&writer_path)?;
+            match write_results(&wcat, res_rx, identity, now, now, metrics, progress) {
+                Ok(s) => Ok(s),
+                Err(e) => {
+                    let _ = wcat.conn.execute_batch("ROLLBACK");
+                    Err(e)
                 }
-                continue;
             }
-        };
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry.path();
-        let name = entry.file_name();
-        if should_skip(path, name) {
-            continue;
-        }
-        let Some(rel) = relative_path(path, root) else {
-            continue;
-        };
+        });
 
-        // The failed stat is legitimately walk cost; the two SQLite writes that follow it are not,
-        // so the guard drops before the error arm runs.
-        let stat = {
-            let _t = metrics.timer(crate::scan_metrics::Phase::Walk);
-            entry.metadata()
-        };
-        let meta = match stat {
-            Ok(m) => m,
-            Err(e) => {
-                // Still a file the walk considered, and it still cost a seek — but its size is
-                // genuinely unknown, so it lands in bucket 0.
-                metrics.record_file_seen(0);
-                cat.log_scan_error(
-                    Some(&identity.volume_id),
-                    &rel,
-                    &format!("metadata: {e}"),
-                    now,
-                )?;
-                summary.errors += 1;
-                if let Some(p) = progress {
-                    p.on_error();
-                }
-                let _ = cat.touch_seen(&identity.volume_id, &rel, now);
-                continue;
-            }
-        };
-        let size = meta.len() as i64;
-        let mtime = unix_secs(meta.modified());
-        metrics.record_file_seen(size);
-
-        // Incremental skip: same size + mtime as catalogued -> just touch, don't re-hash.
-        // `skip_check` is get_file_meta + touch_seen only; the batch COMMIT this path also
-        // triggers is db_write (it is the fsync #26 targets), so the guard must be dead before
-        // rotate_batch runs — otherwise a rescan books 100% of its fsyncs to skip_check and reads
-        // as seek-bound.
-        let is_unchanged = if force {
-            false
-        } else {
-            let _t = metrics.timer(crate::scan_metrics::Phase::SkipCheck);
-            match cat.get_file_meta(&identity.volume_id, &rel)? {
-                Some((old_size, old_mtime))
-                    if old_size == size && old_mtime == mtime.unwrap_or(0) =>
-                {
-                    cat.touch_seen(&identity.volume_id, &rel, now)?;
-                    if archive::is_archive_name(&rel) {
-                        cat.touch_archive_entries(&identity.volume_id, &rel, now)?;
+        // Workers: no DB access at all. Below-normal priority so the machine stays usable while a
+        // multi-hour scan runs; failing to lower priority is not worth aborting a scan over.
+        let mut worker_handles = Vec::new();
+        for _ in 0..jobs {
+            let jr = job_rx.clone();
+            let rt = res_tx.clone();
+            let vid = volume_id.clone();
+            worker_handles.push(scope.spawn(move || {
+                let _ = thread_priority::set_current_thread_priority(
+                    thread_priority::ThreadPriority::Min,
+                );
+                for job in jr {
+                    for result in run_job(job, &vid, metrics) {
+                        if rt.send(result).is_err() {
+                            return; // writer gone; stop
+                        }
                     }
-                    true
                 }
-                _ => false,
-            }
-        };
-        if is_unchanged {
-            summary.skipped += 1;
-            metrics.add_bytes_skipped(size);
-            if let Some(p) = progress {
-                p.on_skipped();
-            }
-            in_batch += 1;
-            {
-                let _t = metrics.timer(crate::scan_metrics::Phase::DbWrite);
-                rotate_batch(cat, &mut in_batch)?;
-            }
-            continue;
+            }));
         }
+        // The parent's handles must go, or the channels never close: each worker holds its own
+        // clone, so the results channel closes only once every worker has exited.
+        drop(job_rx);
+        drop(res_tx);
 
-        // As with the stat above: the failed read is hash cost, its error logging is not.
-        let hashed = {
-            let _t = metrics.timer(crate::scan_metrics::Phase::Hash);
-            hashing::hash_file(path)
-        };
-        let hash = match hashed {
-            Ok(h) => h,
-            Err(e) => {
-                cat.log_scan_error(Some(&identity.volume_id), &rel, &format!("read: {e}"), now)?;
-                summary.errors += 1;
-                if let Some(p) = progress {
-                    p.on_error();
-                }
-                let _ = cat.touch_seen(&identity.volume_id, &rel, now);
-                continue;
-            }
-        };
-        metrics.add_bytes_hashed(size);
+        // Walker: its own read-only connection for the skip-check.
+        let rocat = Catalog::open_readonly(&db_path)?;
+        walk(&rocat, root, identity, force, now, metrics, &job_tx);
+        drop(job_tx); // no more jobs -> workers drain and exit
 
-        let ext = path
-            .extension()
-            .map(|e| e.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let nf = NewFile {
-            volume_id: identity.volume_id.clone(),
-            relative_path: rel.clone(),
-            filename: name.to_string_lossy().into_owned(),
-            extension: ext.clone(),
-            size_bytes: size,
-            content_hash: hash,
-            created_time: unix_secs(meta.created()),
-            modified_time: mtime,
-            accessed_time: unix_secs(meta.accessed()),
-            category: Category::from_extension(&ext),
-            container_chain: None,
-        };
-        {
-            let _t = metrics.timer(crate::scan_metrics::Phase::DbWrite);
-            cat.upsert_file(&nf, now)?;
-            in_batch += 1;
-            rotate_batch(cat, &mut in_batch)?;
+        for h in worker_handles {
+            h.join()
+                .map_err(|_| anyhow::anyhow!("scan worker panicked"))?;
         }
-        summary.hashed += 1;
-        if let Some(p) = progress {
-            p.on_hashed();
-        }
-
-        if archive::is_archive_name(&rel) {
-            let _t = metrics.timer(crate::scan_metrics::Phase::Archive);
-            descend_archive(
-                cat,
-                path,
-                &rel,
-                mtime,
-                identity,
-                &limits,
-                now,
-                &mut summary,
-                &mut in_batch,
-                progress,
-            )?;
-        }
-    }
-
-    // The final COMMIT and the missing-sweep are both real scan cost and both hit SQLite, so they
-    // belong to db_write. Leaving them untimed would inflate the unaccounted gap and understate
-    // exactly the fsync cost #26 targets.
-    {
-        let _t = metrics.timer(crate::scan_metrics::Phase::DbWrite);
-        cat.conn.execute_batch("COMMIT")?;
-        summary.marked_missing =
-            cat.mark_missing_scanned(&identity.volume_id, scan_started_at, now)?;
-    }
-    summary.metrics = metrics.snapshot();
-    Ok(summary)
+        writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("scan writer panicked"))?
+    })
 }
 
 /// Scan without progress reporting (CLI and tests). Delegates with `None`.
@@ -278,7 +159,7 @@ pub fn scan_volume(
     now: i64,
 ) -> anyhow::Result<ScanSummary> {
     let metrics = crate::scan_metrics::ScanMetrics::new();
-    scan_volume_with_progress(cat, root, identity, force, now, None, &metrics)
+    scan_volume_with_progress(cat, root, identity, force, now, None, &metrics, 1)
 }
 
 /// Resolve identity, upsert the volume, and scan. `Ok(None)` iff a read-only drive was skipped.
@@ -326,8 +207,9 @@ pub fn run_scan(
     // Owned here, not inside the scan, so a scan that bails part-way still reports what it
     // measured before it died.
     let metrics = crate::scan_metrics::ScanMetrics::new();
-    let result =
-        scan_volume_with_progress(cat, mount_root, &identity, force, now, progress, &metrics);
+    let result = scan_volume_with_progress(
+        cat, mount_root, &identity, force, now, progress, &metrics, 1,
+    );
 
     if result.is_err() {
         // The scan bailed with its BEGIN still open; end it so the metrics UPDATE below is its
@@ -367,65 +249,6 @@ pub fn run_scan(
         now,
     );
     Ok(Some((identity, summary)))
-}
-
-/// Open an on-disk archive file, catalog each entry, and log each non-fatal error.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "each parameter is an independent scan input; grouping them into a struct would add \
-        indirection without reducing real complexity"
-)]
-fn descend_archive(
-    cat: &Catalog,
-    path: &Path,
-    rel: &str,
-    archive_mtime: Option<i64>,
-    identity: &VolumeIdentity,
-    limits: &ArchiveLimits,
-    now: i64,
-    summary: &mut ScanSummary,
-    in_batch: &mut usize,
-    progress: Option<&dyn Progress>,
-) -> anyhow::Result<()> {
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) => {
-            cat.log_scan_error(
-                Some(&identity.volume_id),
-                rel,
-                &format!("archive open: {e}"),
-                now,
-            )?;
-            summary.errors += 1;
-            if let Some(p) = progress {
-                p.on_error();
-            }
-            return Ok(());
-        }
-    };
-    let res = archive::scan_archive(file, limits);
-    for entry in &res.entries {
-        cat.upsert_archive_entry(&identity.volume_id, rel, entry, archive_mtime, now)?;
-        summary.archive_entries += 1;
-        if let Some(p) = progress {
-            p.on_archive_entry();
-        }
-        *in_batch += 1;
-        rotate_batch(cat, in_batch)?;
-    }
-    for (ctx, reason) in &res.errors {
-        let where_ = if ctx.is_empty() {
-            rel.to_string()
-        } else {
-            format!("{rel} › {ctx}")
-        };
-        cat.log_scan_error(Some(&identity.volume_id), &where_, reason, now)?;
-        summary.errors += 1;
-        if let Some(p) = progress {
-            p.on_error();
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -703,7 +526,8 @@ mod tests {
 
         let p = CountingProgress::new();
         let m = crate::scan_metrics::ScanMetrics::new();
-        let s = scan_volume_with_progress(&cat, &root, &ident(), false, 100, Some(&p), &m).unwrap();
+        let s =
+            scan_volume_with_progress(&cat, &root, &ident(), false, 100, Some(&p), &m, 1).unwrap();
         assert_eq!(p.hashed.load(Relaxed), s.hashed);
         assert_eq!(p.skipped.load(Relaxed), s.skipped);
         assert_eq!(p.errors.load(Relaxed), s.errors);
@@ -734,6 +558,66 @@ mod tests {
         (t, cat, root)
     }
 
+    /// A scan must produce an identical catalogue regardless of --jobs. This is what makes the
+    /// single parallel implementation safe: --jobs=1 is not a separate serial path, it is this
+    /// same pipeline with one worker, and it must agree with --jobs=8 exactly.
+    #[test]
+    fn identical_catalogue_at_any_job_count() {
+        fn scan_into(jobs: usize) -> Vec<(String, String, i64, String)> {
+            let t = tempfile::tempdir().unwrap();
+            let root = t.path().join("drive");
+            std::fs::create_dir_all(root.join("sub")).unwrap();
+            for i in 0..50 {
+                std::fs::write(root.join(format!("f{i}.txt")), format!("content-{i}")).unwrap();
+            }
+            std::fs::write(root.join("sub/dup.txt"), b"content-0").unwrap(); // a duplicate
+            {
+                let f = std::fs::File::create(root.join("bundle.zip")).unwrap();
+                let mut zw = zip::ZipWriter::new(f);
+                let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                zw.start_file("inner.txt", opts).unwrap();
+                std::io::Write::write_all(&mut zw, b"zipped").unwrap();
+                zw.finish().unwrap();
+            }
+            let cat = Catalog::open(&t.path().join("c.db")).unwrap();
+            // files.volume_id is FK-enforced, and this calls the scan directly rather than through
+            // run_scan (which would upsert the volume for us).
+            cat.upsert_volume(&Volume {
+                volume_id: ident().volume_id.clone(),
+                label: "T".into(),
+                identified_by: "marker".into(),
+                first_seen_at: 1,
+                last_seen_at: 1,
+            })
+            .unwrap();
+            let m = crate::scan_metrics::ScanMetrics::new();
+            scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, jobs).unwrap();
+            let mut stmt = cat
+                .conn
+                .prepare(
+                    "SELECT relative_path, content_hash, size_bytes, IFNULL(container_chain,'') \
+                     FROM files ORDER BY relative_path, container_chain",
+                )
+                .unwrap();
+            stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        }
+        let one = scan_into(1);
+        let eight = scan_into(8);
+        assert!(!one.is_empty());
+        assert_eq!(one, eight, "the catalogue must not depend on --jobs");
+    }
+
     #[test]
     fn scan_records_phase_timings_and_the_size_histogram() {
         let (_t, cat, root) = fixture_with_files(&[("a.txt", 10), ("big.bin", 5000)]);
@@ -745,14 +629,6 @@ mod tests {
         assert_eq!(m.histogram[2], 1, "the 5000-byte file");
         assert_eq!(m.bytes_hashed, 5010);
         assert_eq!(m.bytes_skipped, 0);
-        // Upper bound only: on a fast disk these phases legitimately round to 0 ms. That the
-        // timers accumulate at all is proven in scan_metrics with a controlled sleep.
-        assert!(
-            m.total_phase_ms() <= m.wall_ms,
-            "phases {} exceeded wall {}",
-            m.total_phase_ms(),
-            m.wall_ms
-        );
     }
 
     #[test]

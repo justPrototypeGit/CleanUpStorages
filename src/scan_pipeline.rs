@@ -1,11 +1,6 @@
 //! The scan pipeline: a walker produces jobs, workers read+hash them, a single writer persists the
 //! results. Workers never touch SQLite — the writer is the sole writer. See the design spec.
 
-// The pipeline is built bottom-up (worker, walker, writer) and only wired into `scanner` by the
-// orchestrator task, so these are legitimately unused until then. REMOVE this attribute when the
-// orchestrator lands — after that, dead code here is a real defect.
-#![allow(dead_code)]
-
 use crate::catalog::models::NewFile;
 use crate::catalog::Catalog;
 use crate::category::Category;
