@@ -182,12 +182,19 @@ pub fn scan_volume_with_progress(
 
         // Walker: its own read-only connection for the skip-check.
         let rocat = Catalog::open_readonly(&db_path)?;
-        walk(&rocat, root, identity, force, metrics, &job_tx);
+        let completed = walk(&rocat, root, identity, force, metrics, &job_tx);
         // Set BEFORE closing the channel: the writer must never see a closed channel without also
         // seeing the final value of this flag. A panic in walk() skips this, leaving it false.
-        status
-            .walk_completed
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        //
+        // Gated on walk()'s own answer rather than on reaching this line. Reaching it only proves
+        // walk() returned, not that it finished the tree — it also returns early when the pipeline
+        // has died underneath it. Asking the walker directly keeps the invariant local instead of
+        // resting on "a send can only fail if every worker already flagged itself aborted".
+        if completed {
+            status
+                .walk_completed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         drop(job_tx); // no more jobs -> workers drain and exit
 
         for h in worker_handles {

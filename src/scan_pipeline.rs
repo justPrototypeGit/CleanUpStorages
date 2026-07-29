@@ -191,6 +191,11 @@ pub(crate) fn run_job(
 /// Walk `root`, stat + skip-check each file, and emit a `Job` per file. Never returns an error:
 /// walk and stat failures become `Job::Error`, matching the pre-parallel scan. Runs on its own
 /// thread with a read-only catalog connection; `walk`/`skip_check` timing is charged here.
+///
+/// Returns **true only if the whole tree was walked**. False means the pipeline died underneath it
+/// and the walk stopped early — the caller must not then tell the writer the walk completed, or the
+/// writer would commit a partial scan and sweep everything unreached to `missing`.
+#[must_use]
 pub(crate) fn walk(
     ro: &Catalog,
     root: &Path,
@@ -198,7 +203,7 @@ pub(crate) fn walk(
     force: bool,
     metrics: &ScanMetrics,
     jobs: &Sender<Job>,
-) {
+) -> bool {
     // A send only fails once the workers/writer are gone, i.e. the scan is already doomed. Returning
     // false makes the caller stop: otherwise the walker would keep stat-ing every remaining file on
     // a 20 TB drive — hours of seeking — just to throw each job away.
@@ -226,7 +231,7 @@ pub(crate) fn walk(
                     rel,
                     reason: format!("walk: {err}"),
                 }) {
-                    return;
+                    return false;
                 }
                 continue;
             }
@@ -255,7 +260,7 @@ pub(crate) fn walk(
                     rel,
                     reason: format!("metadata: {e}"),
                 }) {
-                    return;
+                    return false;
                 }
                 continue;
             }
@@ -274,7 +279,7 @@ pub(crate) fn walk(
                 if old_size == size && old_mtime == mtime.unwrap_or(0) {
                     metrics.add_bytes_skipped(size);
                     if !send(Job::Touch { rel, is_archive }) {
-                        return;
+                        return false;
                     }
                     continue;
                 }
@@ -306,9 +311,10 @@ pub(crate) fn walk(
             })
         };
         if !sent {
-            return;
+            return false;
         }
     }
+    true
 }
 
 /// Set by the pipeline so the writer can tell "the walk finished" from "everything died".
@@ -460,7 +466,12 @@ mod tests {
     fn walk_to_vec(cat: &Catalog, root: &std::path::Path, force: bool) -> Vec<Job> {
         let (tx, rx) = crossbeam_channel::unbounded();
         let m = ScanMetrics::new();
-        walk(cat, root, &ident(), force, &m, &tx);
+        // The receiver is alive for the whole walk here, so a complete walk is also the assertion
+        // that no send failed.
+        assert!(
+            walk(cat, root, &ident(), force, &m, &tx),
+            "the walk should run to completion in this fixture"
+        );
         drop(tx);
         rx.into_iter().collect()
     }
@@ -616,6 +627,43 @@ mod tests {
         )
         .unwrap();
         cat
+    }
+
+    #[test]
+    fn a_panicking_worker_sets_the_flag_before_its_sender_closes_the_channel() {
+        // The whole abort guarantee rests on a Rust drop-order detail: in a `move` closure, body
+        // locals drop during unwind BEFORE the captured variables do. The abort guard is a body
+        // local and the results sender is a capture, so a panicking worker flags itself while the
+        // channel is still open — the writer therefore cannot observe "channel closed" without
+        // also observing "aborted". If that ordering were ever reversed, the writer would commit a
+        // partial scan and sweep the volume. This pins the mechanism itself.
+        struct Guard<'a>(&'a AtomicBool);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let flag = std::sync::Arc::new(AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::unbounded::<u8>();
+
+        let f = flag.clone();
+        let h = std::thread::spawn(move || {
+            let _guard = Guard(&f); // body local
+            let _tx = tx; // capture, moved in; drops after body locals
+            panic!("worker died");
+        });
+        assert!(h.join().is_err(), "the worker must actually have panicked");
+
+        // The channel is closed now; the flag must already be true.
+        assert!(
+            rx.recv().is_err(),
+            "sender dropped, so the channel is closed"
+        );
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "the abort flag must be set no later than the channel closing"
+        );
     }
 
     #[test]
