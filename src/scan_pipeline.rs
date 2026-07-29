@@ -648,22 +648,28 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded::<u8>();
 
         let f = flag.clone();
+        // `tx` is captured and never rebound in the body — exactly how the worker holds `res_tx`.
         let h = std::thread::spawn(move || {
-            let _guard = Guard(&f); // body local
-            let _tx = tx; // capture, moved in; drops after body locals
+            let _guard = Guard(&f); // body local: drops first on unwind
+            let _use_tx = &tx; // keep the capture alive to the end of the body
             panic!("worker died");
         });
-        assert!(h.join().is_err(), "the worker must actually have panicked");
 
-        // The channel is closed now; the flag must already be true.
+        // Observe the channel closing WITHOUT joining first. Joining would let the thread finish
+        // unwinding completely, so the assertion would hold no matter what order things dropped in
+        // — which is what made an earlier version of this test prove nothing. Blocking on recv()
+        // wakes us at the instant the last sender drops, which is the moment that matters.
         assert!(
             rx.recv().is_err(),
             "sender dropped, so the channel is closed"
         );
         assert!(
             flag.load(Ordering::SeqCst),
-            "the abort flag must be set no later than the channel closing"
+            "the abort flag must already be set when the channel closes; if the guard dropped after \
+             the sender, the writer could observe a closed channel and commit a partial scan"
         );
+
+        assert!(h.join().is_err(), "the worker must actually have panicked");
     }
 
     #[test]

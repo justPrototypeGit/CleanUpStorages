@@ -111,8 +111,22 @@ pub fn scan_volume_with_progress(
     // Resolved once, not per archive: `Config::default_paths` does a directory lookup and a
     // create_dir_all, which would otherwise be a filesystem syscall per archive job, issued
     // concurrently and charged to the archive phase we are trying to measure.
-    let mut limits =
-        crate::archive::ArchiveLimits::from_config(&crate::config::Config::default_paths()?);
+    //
+    // Non-fatal, as it was per-job before: these are three tuning numbers, and failing to resolve
+    // the data dir must not abort a scan that is otherwise fine — that would stop the loose-file
+    // hashing too, over a value only archives use.
+    let mut limits = match crate::config::Config::default_paths() {
+        Ok(cfg) => crate::archive::ArchiveLimits::from_config(&cfg),
+        Err(e) => {
+            tracing::warn!("could not resolve config ({e}); using default archive limits");
+            crate::archive::ArchiveLimits {
+                max_depth: 8,
+                entry_max_bytes: 2 * 1024 * 1024 * 1024,
+                ratio_cap: 200,
+                total_buffer_bytes: 2 * 1024 * 1024 * 1024,
+            }
+        }
+    };
     // #18 capped how much nested-archive data the SCAN holds at once. With N workers each running
     // its own descent, a per-descent cap would multiply by N (4 workers x 2 GiB = 8 GiB), so divide
     // it: the process-wide ceiling stays what it was however many workers there are.
@@ -124,16 +138,22 @@ pub fn scan_volume_with_progress(
     // Shadow with a reference so the `move` closures below capture the borrow, not the value.
     let status = &status;
 
-    // Bounded channels give backpressure: the walker blocks when workers are saturated, so the walk
-    // cannot run millions of paths ahead of the hashing and blow up memory.
-    let (job_tx, job_rx) = crossbeam_channel::bounded::<crate::scan_pipeline::Job>(jobs * 4);
-    let (res_tx, res_rx) = crossbeam_channel::bounded::<crate::scan_pipeline::ScanResult>(jobs * 4);
-
     let volume_id = identity.volume_id.clone();
 
     // thread::scope lets the workers borrow `metrics`, `progress` and `identity` without `'static`
     // bounds, and guarantees every thread joins before this function returns.
     std::thread::scope(|scope| -> anyhow::Result<ScanSummary> {
+        // Bounded channels give backpressure: the walker blocks when workers are saturated, so the
+        // walk cannot run millions of paths ahead of the hashing and blow up memory.
+        //
+        // Declared INSIDE the scope on purpose. thread::scope must join every thread before it can
+        // propagate a panic, and the workers only exit once the jobs sender is gone. If `job_tx`
+        // lived in the outer frame it would still be alive while the scope unwound, so a panic in
+        // walk() would hang the scan forever instead of failing it.
+        let (job_tx, job_rx) = crossbeam_channel::bounded::<crate::scan_pipeline::Job>(jobs * 4);
+        let (res_tx, res_rx) =
+            crossbeam_channel::bounded::<crate::scan_pipeline::ScanResult>(jobs * 4);
+
         // Writer: the single SQLite writer, on its own read-write connection.
         let writer_path = db_path.clone();
         let writer = scope.spawn(move || -> anyhow::Result<ScanSummary> {
