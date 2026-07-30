@@ -201,7 +201,7 @@ impl ScanQueue {
                 crate::volume::ReadonlyMode::Fingerprint,
                 now,
                 Some(progress),
-                4, // web scans use the default worker count; --jobs is a CLI-only knob
+                1, // one reader at a time: concurrency measured slower on spinning drives
             )?;
             // snapshot the catalog after a successful scan (best-effort)
             if let Ok(cfg) = crate::config::Config::default_paths() {

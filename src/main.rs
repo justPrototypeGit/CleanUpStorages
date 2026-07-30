@@ -24,8 +24,12 @@ enum Command {
         /// How to handle read-only drives where the marker cannot be written.
         #[arg(long, value_enum, default_value = "ask")]
         readonly_fallback: commands::ReadonlyFallback,
-        /// Number of parallel read+hash workers (use 1 to disable parallelism).
-        #[arg(long, default_value_t = 4)]
+        /// Parallel read+hash workers. Default 1 (one file read at a time).
+        ///
+        /// Raising this was measured 1.8-2.0x SLOWER on an external spinning drive: concurrent
+        /// readers make the head seek between regions, and per-stream throughput collapsed ~7x.
+        /// Only raise it on SSD/NVMe, and measure before believing it helped.
+        #[arg(long, default_value_t = 1)]
         jobs: usize,
     },
     /// Search the catalog for files by name/path.

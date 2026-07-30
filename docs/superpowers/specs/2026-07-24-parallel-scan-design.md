@@ -1,9 +1,36 @@
 # Parallel scan pipeline — design
 
-**Status:** approved
+**Status:** implemented — but the core hypothesis was DISPROVED by measurement; see "Result" below
 **Date:** 2026-07-24
 **Closes:** #23 (parallelise the scan pipeline)
 **Epic:** #21 (scan performance — 20 TB must be practical)
+
+## Result (measured 2026-07-29/30, after implementation)
+
+**Concurrency made the scan slower on the target hardware, in both regimes.** Measured on the real
+external drive with `--force`:
+
+| corpus | `--jobs 1` | `--jobs 4` |
+| --- | --- | --- |
+| 172 large files (~32 GB, all >64 KB, 128 over 16 MB) | 4.3 min · 125.0 MB/s | 8.7 min · 61.5 MB/s (**2.03x slower**) |
+| 225,285 files (91% under 64 KB) + archives | 1.25 h · 28.3 MB/s | 2.29 h · 15.4 MB/s (**1.83x slower**) |
+
+The mechanism is unambiguous and visible *within* each run: per-stream throughput collapsed ~7x
+(31.1 -> 4.2 MB/s while hashing) with only 4 workers, so four readers delivered ~16.8 MB/s aggregate
+where one delivered 31.1. The archive phase suffered worst (7.6x). A single disk head is one physical
+resource; asking it for concurrent streams turns sequential reads into seek storms.
+
+The design's reasoning — "the scan is I/O-bound, therefore overlap I/O with hashing" — silently
+assumed the disk could serve concurrent requests productively. On a spinning USB drive it cannot.
+The seek-bound small-file corpus, predicted here to be the case that benefits, lost just as badly.
+
+**Consequence:** the default is **`--jobs 1`**. The pipeline ships, because at `--jobs 1` it performs
+one file read at a time (one worker) and the machinery is retained for SSD/NVMe, where overlap does
+work (measured 385% accounted on NVMe). Raising `--jobs` on a spinning drive is a footgun and the
+CLI help says so.
+
+This is the outcome #22 existed to make visible. Without it, `--jobs 4` would have shipped as the
+default and roughly doubled a 20 TB scan.
 
 ## Why
 
@@ -30,7 +57,7 @@ exclusion with zero code. That is documentation, tracked on #21; it is not part 
 | Scope | **Loose files *and* archives**, parallelised at **top-level-entry granularity** | A worker handles one whole loose file, or one whole `archive::scan_archive`. Different archives run concurrently; the nested descent inside a single archive is never threaded, so the #18 buffer budget stays a local `&mut`. |
 | Topology | **Three-stage pipeline**: walker → workers → writer | Each role is small and independently testable; the writer stays the sole owner of the transaction; workers are completely DB-free. |
 | Worker DB access | **None** | Workers only read bytes and hash. There is no concurrent-writer question — the single writer thread owns all SQLite writes. |
-| Concurrency | **Fixed `--jobs`, default 4** | The bottleneck is the disk. On a spinning HDD, 2–4 concurrent reads give the OS queue depth to order seeks; more risks seek-thrash. CPU-count is the wrong signal (cores idle). User-adjustable for SSD. |
+| Concurrency | ~~**Fixed `--jobs`, default 4**~~ → **default 1** | The reasoning below ("2–4 concurrent reads give the OS queue depth to order seeks") was the hypothesis, and measurement disproved it — see Result at the top. Concurrent reads made a spinning drive 1.8–2.0x slower in both regimes. |
 | Staying out of the way | **Below-normal worker thread priority** | Lets the OS scheduler yield to foreground apps automatically. Serves "don't hog the PC" without a load monitor. Adaptive load-based scaling is explicitly deferred (own issue + own measurement). |
 | Number of implementations | **One.** The pipeline is the only scan; `--jobs=1` runs a single worker | No separate serial path to drift. `--jobs=1` is the correctness anchor: it must produce a catalogue bit-identical to the pre-parallel scan. |
 

@@ -52,3 +52,17 @@ The incremental skip means a second scan of already-catalogued files exercises `
 
 Runs are persisted in the `scan_runs` table and survive restarts, so a multi-day scan's numbers are
 not lost. Note in the issue which condition each figure was taken under.
+
+## Measured result: parallel scanning is slower on a spinning drive
+
+Do not raise `--jobs` on an external HDD. Measured on the real drive with `--force`:
+
+- 172 large files (~32 GB): `--jobs 1` 4.3 min (125 MB/s) vs `--jobs 4` 8.7 min (61.5 MB/s) — **2.03x slower**
+- 225,285 files, 91% under 64 KB: `--jobs 1` 1.25 h (28.3 MB/s) vs `--jobs 4` 2.29 h (15.4 MB/s) — **1.83x slower**
+
+Per-stream throughput collapsed about sevenfold (31.1 -> 4.2 MB/s while hashing), so four concurrent
+readers moved *less total data* than one. One disk head is a single physical resource; concurrent
+streams turn sequential reads into seeking. This held in both the bandwidth-bound (large file) and
+seek-bound (small file) regimes.
+
+The default is `--jobs 1`. Raise it only on SSD/NVMe, and measure rather than assume.
