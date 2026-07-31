@@ -36,9 +36,6 @@ impl StopFlag {
     /// so mirroring would need a polling thread that outlives every scan and never exits. One
     /// extra atomic load on a path already doing file I/O costs nothing.
     ///
-    /// Unused until the CLI installs the signal handler; remove this attribute then, after which
-    /// dead code here is a real defect.
-    #[allow(dead_code)]
     fn watching_global() -> Self {
         Self {
             watch_global: true,
@@ -146,6 +143,157 @@ pub fn fmt_duration(secs: u64) -> String {
         s if s >= 3600 => format!("{}h {:02}m", s / 3600, (s % 3600) / 60),
         s if s >= 60 => format!("{}m {:02}s", s / 60, s % 60),
         s => format!("{s}s"),
+    }
+}
+
+/// Install a Ctrl+C handler that requests a graceful stop; a second press terminates.
+///
+/// The returned flag mirrors the global, so callers poll it like any other `StopFlag`.
+///
+/// **The handler stores to an atomic and does nothing else.** Signal handlers may only call
+/// async-signal-safe functions: an atomic store qualifies, and POSIX lists `signal()` as safe.
+/// Allocating, locking, or logging from a handler can deadlock the process.
+pub fn install_signal_handler() -> StopFlag {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+        unsafe extern "system" fn handler(_event: u32) -> i32 {
+            // Returning FALSE on the second press lets the default handler terminate us.
+            if CLI_STOP.swap(true, Ordering::SeqCst) {
+                0
+            } else {
+                1
+            }
+        }
+        SetConsoleCtrlHandler(Some(handler), 1);
+    }
+    #[cfg(not(windows))]
+    unsafe {
+        unsafe extern "C" fn handler(_sig: libc::c_int) {
+            CLI_STOP.store(true, Ordering::SeqCst);
+            // Restore the default disposition so a second Ctrl+C terminates immediately.
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+        }
+        libc::signal(libc::SIGINT, handler as libc::sighandler_t);
+    }
+    StopFlag::watching_global()
+}
+
+use std::sync::Mutex;
+
+/// Live progress for the CLI. Rewrites one line on a terminal; prints periodic lines when piped.
+pub struct CliProgress {
+    inner: Mutex<CliProgressState>,
+    is_tty: bool,
+}
+
+struct CliProgressState {
+    files: u64,
+    bytes: u64,
+    total_files: Option<u64>,
+    total_bytes: Option<u64>,
+    eta: EtaTracker,
+    last_paint: Instant,
+}
+
+impl CliProgress {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(CliProgressState {
+                files: 0,
+                bytes: 0,
+                total_files: None,
+                total_bytes: None,
+                eta: EtaTracker::new(),
+                last_paint: Instant::now() - std::time::Duration::from_secs(10),
+            }),
+            // Progress goes to stderr so redirecting stdout stays clean; carriage returns are only
+            // meaningful on a terminal.
+            is_tty: std::io::IsTerminal::is_terminal(&std::io::stderr()),
+        }
+    }
+
+    fn paint(&self, st: &mut CliProgressState) {
+        use std::io::Write;
+        if st.last_paint.elapsed() < std::time::Duration::from_secs(2) {
+            return;
+        }
+        st.last_paint = Instant::now();
+        let gb = |b: u64| b as f64 / 1_073_741_824.0;
+        let rate = st
+            .eta
+            .rate_bytes_per_sec()
+            .map(|r| format!("{:.1} MB/s", r / 1_048_576.0))
+            .unwrap_or_else(|| "—".into());
+        let line = match (st.total_files, st.total_bytes) {
+            (Some(tf), Some(tb)) if tb > 0 => {
+                let pct = (st.bytes as f64 / tb as f64 * 100.0).min(100.0);
+                let eta = st
+                    .eta
+                    .eta_seconds(tb.saturating_sub(st.bytes))
+                    .map(fmt_duration)
+                    .unwrap_or_else(|| "—".into());
+                format!(
+                    "Scanning {pct:>3.0}% · {}/{} files · {:.1}/{:.1} GB · {rate} · ETA {eta}",
+                    st.files,
+                    tf,
+                    gb(st.bytes),
+                    gb(tb)
+                )
+            }
+            _ => format!(
+                "Scanning · {} files · {:.1} GB · {rate}",
+                st.files,
+                gb(st.bytes)
+            ),
+        };
+        let mut err = std::io::stderr();
+        if self.is_tty {
+            let _ = write!(err, "\r\x1b[K{line}");
+        } else {
+            let _ = writeln!(err, "{line}");
+        }
+        let _ = err.flush();
+    }
+
+    /// Clear the progress line so following output starts clean.
+    pub fn finish(&self) {
+        use std::io::Write;
+        if self.is_tty {
+            let _ = write!(std::io::stderr(), "\r\x1b[K");
+            let _ = std::io::stderr().flush();
+        }
+    }
+}
+
+impl Default for CliProgress {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl crate::scanner::Progress for CliProgress {
+    fn on_hashed(&self) {
+        let mut st = self.inner.lock().unwrap();
+        st.files += 1;
+        self.paint(&mut st);
+    }
+    fn on_skipped(&self) {
+        let mut st = self.inner.lock().unwrap();
+        st.files += 1;
+        self.paint(&mut st);
+    }
+    fn on_error(&self) {}
+    fn on_archive_entry(&self) {}
+    fn on_total(&self, files: u64, bytes: u64) {
+        let mut st = self.inner.lock().unwrap();
+        st.total_files = Some(files);
+        st.total_bytes = Some(bytes);
+    }
+    fn on_bytes(&self, bytes: u64) {
+        let mut st = self.inner.lock().unwrap();
+        st.bytes += bytes;
+        st.eta.record(bytes);
     }
 }
 
