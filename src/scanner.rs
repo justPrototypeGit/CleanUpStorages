@@ -85,6 +85,9 @@ pub fn scan_volume_with_progress(
     let limits = ArchiveLimits::from_config(&Config::default_paths()?);
     let mut summary = ScanSummary::default();
     let mut in_batch = 0usize;
+    // Directories this pass could not enumerate. Their contents were never visited, so they must be
+    // held back from the missing-sweep below (#7) — unreadable is not the same as gone.
+    let mut unreadable_dirs: Vec<String> = Vec::new();
     cat.conn.execute_batch("BEGIN")?;
 
     let mut walker = WalkDir::new(root).into_iter();
@@ -108,8 +111,13 @@ pub fn scan_volume_with_progress(
                     .unwrap_or_else(|| "<unknown>".to_string());
                 cat.log_scan_error(Some(&identity.volume_id), &p, &format!("walk: {err}"), now)?;
                 summary.errors += 1;
-                if let Some(p) = progress {
-                    p.on_error();
+                if let Some(pr) = progress {
+                    pr.on_error();
+                }
+                // Only a known path can be scoped. An error with no path (rare) leaves the sweep
+                // unrestricted, which self-heals on the next successful scan.
+                if p != "<unknown>" {
+                    unreadable_dirs.push(p);
                 }
                 continue;
             }
@@ -263,7 +271,7 @@ pub fn scan_volume_with_progress(
         let _t = metrics.timer(crate::scan_metrics::Phase::DbWrite);
         cat.conn.execute_batch("COMMIT")?;
         summary.marked_missing =
-            cat.mark_missing_scanned(&identity.volume_id, scan_started_at, now)?;
+            cat.mark_missing_scanned(&identity.volume_id, scan_started_at, now, &unreadable_dirs)?;
     }
     summary.metrics = metrics.snapshot();
     Ok(summary)
