@@ -580,59 +580,78 @@ mod tests {
         (tmp, cat)
     }
 
-    #[test]
-    fn a_permission_error_is_recorded_with_its_phase_and_kind() {
-        // Rather than manufacture a real permission failure (which differs per OS and per CI
-        // runner), drive the catalogue call the scanner makes and assert the shape it stores.
-        let (tmp, cat) = setup();
-        let _ = tmp;
-        let e = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
-        cat.log_scan_error(
-            Some("vol-1"),
-            "locked/dir",
-            &format!("walk: {e}"),
-            "walk",
-            crate::catalog::scan_errors::classify_io(&e),
-            100,
-        )
-        .unwrap();
+    // A real scan over a file that genuinely fails to read, asserting the scanner itself (not the
+    // catalogue layer) records the correct `kind` for its `"read"` call site. Platform-gated because
+    // the honest way to make a read fail differs per OS, and CI runs both Windows and macOS.
 
-        let (phase, kind): (String, String) = cat
-            .conn
-            .query_row(
-                "SELECT phase, kind FROM scan_errors WHERE path='locked/dir'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(phase, "walk");
-        assert_eq!(kind, "permission");
-    }
-
+    #[cfg(windows)]
     #[test]
-    fn an_unreadable_file_records_the_read_phase() {
-        // A directory that exists where a file is expected makes read() fail on every platform.
+    fn a_locked_file_is_recorded_with_the_read_phase_and_locked_kind() {
+        use std::os::windows::fs::OpenOptionsExt;
+
         let (tmp, cat) = setup();
         let root = tmp.path().join("drive");
-        std::fs::create_dir_all(root.join("notafile.bin")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let victim = root.join("locked.bin");
+        std::fs::write(&victim, b"data").unwrap();
+
+        // Hold the file open with an exclusive share mode (share_mode(0) = no sharing at all), so
+        // the scanner's own open-for-hashing fails with ERROR_SHARING_VIOLATION (raw OS error 32)
+        // for the duration of the scan.
+        let _held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&victim)
+            .unwrap();
+
         let m = crate::scan_metrics::ScanMetrics::new();
         let stop = crate::scan_control::StopFlag::new();
         scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
 
-        // Directories are walked, not read, so nothing should be recorded as a file error here;
-        // this asserts the phase vocabulary is actually used rather than defaulted.
-        let phases: Vec<String> = cat
+        let (phase, kind): (String, String) = cat
             .conn
-            .prepare("SELECT DISTINCT IFNULL(phase,'<null>') FROM scan_errors")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
+            .query_row(
+                "SELECT phase, kind FROM scan_errors WHERE path='locked.bin'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
-        assert!(
-            !phases.iter().any(|p| p == "<null>"),
-            "every recorded error must carry a phase, got {phases:?}"
-        );
+        assert_eq!(phase, "read");
+        assert_eq!(kind, "locked");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_file_is_recorded_with_the_read_phase_and_permission_kind() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        let victim = root.join("noperm.bin");
+        std::fs::write(&victim, b"data").unwrap();
+        let orig_perms = std::fs::metadata(&victim).unwrap().permissions();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let stop = crate::scan_control::StopFlag::new();
+        let result = scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop);
+
+        // Restore permissions before any assertion can early-return/panic, so the tempdir can
+        // still be cleaned up regardless of outcome.
+        std::fs::set_permissions(&victim, orig_perms).unwrap();
+        result.unwrap();
+
+        let (phase, kind): (String, String) = cat
+            .conn
+            .query_row(
+                "SELECT phase, kind FROM scan_errors WHERE path='noperm.bin'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(phase, "read");
+        assert_eq!(kind, "permission");
     }
 
     #[test]
