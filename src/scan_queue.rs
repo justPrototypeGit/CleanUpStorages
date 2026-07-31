@@ -376,6 +376,30 @@ mod tests {
         worker.abort();
     }
 
+    #[test]
+    fn request_stop_flips_the_running_jobs_own_flag() {
+        // The deterministic half of the pair below: no wall-clock racing, so this one cannot go
+        // red on a loaded CI runner. It covers the wiring bug that matters -- request_stop()
+        // reaching the flag the worker actually handed to the scanner -- by installing a known
+        // flag as the running job and asserting that same flag comes back set.
+        let q = ScanQueue::new(std::path::PathBuf::from("unused.db"));
+        assert!(!q.request_stop(), "nothing running yet");
+
+        let stop = crate::scan_control::StopFlag::new();
+        q.inner.lock().unwrap().running = Some(Running {
+            path: "D:/drive".into(),
+            counters: Counters::new(),
+            stop: stop.clone(),
+        });
+
+        assert!(!stop.is_requested(), "clean before the request");
+        assert!(q.request_stop(), "a running job accepts a stop");
+        assert!(
+            stop.is_requested(),
+            "the request must reach the flag the scanner is holding, not a copy of it"
+        );
+    }
+
     #[tokio::test]
     async fn stop_request_ends_a_running_scan_before_it_finishes_the_tree() {
         // Enough files that the walk+hash takes measurably longer than the sub-millisecond poll

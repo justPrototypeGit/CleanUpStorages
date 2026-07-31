@@ -2462,6 +2462,10 @@ mod tests {
         assert!(body.contains("/api/scan"));
         assert!(body.contains("/api/detected-drives"));
         assert!(body.contains("/api/pick-folder"));
+        // The Stop button is the only way to end a scan from the browser; a page that renders
+        // without it leaves a multi-day scan unstoppable short of killing the process.
+        assert!(body.contains("/api/scan/stop"));
+        assert!(body.contains("stopscan"));
         assert!(!body.contains("http://") && !body.contains("https://"));
     }
 
