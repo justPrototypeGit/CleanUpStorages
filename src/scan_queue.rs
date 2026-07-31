@@ -201,6 +201,7 @@ impl ScanQueue {
                 crate::volume::ReadonlyMode::Fingerprint,
                 now,
                 Some(progress),
+                &crate::scan_control::StopFlag::new(),
             )?;
             // snapshot the catalog after a successful scan (best-effort)
             if let Ok(cfg) = crate::config::Config::default_paths() {

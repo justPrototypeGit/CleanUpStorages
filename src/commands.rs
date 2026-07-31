@@ -67,7 +67,15 @@ fn snapshot(cfg: &Config, now: i64) -> anyhow::Result<std::path::PathBuf> {
 pub fn cmd_scan(path: &Path, force: bool, fallback: ReadonlyFallback) -> anyhow::Result<()> {
     let (cfg, cat) = open_catalog_checked()?;
     let now = now_secs();
-    match scanner::run_scan(&cat, path, force, fallback.into(), now, None)? {
+    match scanner::run_scan(
+        &cat,
+        path,
+        force,
+        fallback.into(),
+        now,
+        None,
+        &crate::scan_control::StopFlag::new(),
+    )? {
         None => {
             println!("Skipped read-only drive at {}", path.display());
             return Ok(());
