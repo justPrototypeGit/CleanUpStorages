@@ -174,7 +174,9 @@ pub fn install_signal_handler() -> StopFlag {
             // Restore the default disposition so a second Ctrl+C terminates immediately.
             libc::signal(libc::SIGINT, libc::SIG_DFL);
         }
-        libc::signal(libc::SIGINT, handler as libc::sighandler_t);
+        // Via `*const ()`: clippy's `function_casts_as_integer` rejects casting a function item
+        // straight to an integer, and `sighandler_t` is one.
+        libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
     }
     StopFlag::watching_global()
 }
