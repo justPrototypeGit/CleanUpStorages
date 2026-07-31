@@ -639,6 +639,7 @@ dependencies = [
  "clap",
  "directories",
  "image",
+ "libc",
  "raw-window-handle",
  "rfd",
  "rusqlite",
