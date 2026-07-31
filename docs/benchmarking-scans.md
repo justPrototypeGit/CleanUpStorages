@@ -52,3 +52,25 @@ The incremental skip means a second scan of already-catalogued files exercises `
 
 Runs are persisted in the `scan_runs` table and survive restarts, so a multi-day scan's numbers are
 not lost. Note in the issue which condition each figure was taken under.
+
+## Parallel scanning was tried and abandoned (#23)
+
+A walker → workers → writer pipeline was fully built, reviewed and measured against this drive. It
+was **slower than the serial scan at every worker count**, so it was not merged:
+
+| same folder, 225,285 files | wall | overall | walk phase |
+| --- | --- | --- | --- |
+| serial scan (what ships) | **1.01 h** | **35.1 MB/s** | 247 s |
+| pipeline, `--jobs 1` | 1.25 h | 28.3 MB/s | 483 s |
+| pipeline, `--jobs 4` | 2.29 h | 15.4 MB/s | — |
+
+On a separate large-file corpus (172 files, ~32 GB) `--jobs 4` was 2.03x slower than `--jobs 1`.
+
+One disk head is a single physical resource: concurrent readers turn sequential reads into seeking,
+and per-stream throughput collapsed about sevenfold at 4 workers. Even one worker loses, because the
+walker and the hasher are already two competing consumers — the `walk` phase doubled on identical
+work.
+
+The code is preserved at git tag `experiment/parallel-scan` with the full reasoning in
+`docs/superpowers/specs/2026-07-24-parallel-scan-design.md`. Do not re-attempt this for spinning
+drives without new evidence. (It does help on NVMe, where overlap measured 385% accounted.)

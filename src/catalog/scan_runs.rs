@@ -98,35 +98,38 @@ impl Catalog {
                     db_write_ms, archive_ms, size_histogram
              FROM scan_runs ORDER BY started_at DESC, id DESC LIMIT ?1",
         )?;
+        // Read by column NAME, not position. Inserting one column into the SELECT above shifts
+        // every later index, which silently puts the wrong number in the wrong field — and no test
+        // catches it where two columns share a type. Names cannot drift that way.
         let rows = stmt.query_map(params![limit as i64], |r| {
             // Display data must never fail a read: a corrupt histogram degrades to zeroes.
             let histogram = r
-                .get::<_, Option<String>>(21)?
+                .get::<_, Option<String>>("size_histogram")?
                 .and_then(|s| serde_json::from_str::<[u64; BUCKET_COUNT]>(&s).ok())
                 .unwrap_or([0; BUCKET_COUNT]);
             Ok(ScanRun {
-                id: r.get(0)?,
-                volume_id: r.get(1)?,
-                root_path: r.get(2)?,
-                started_at: r.get(3)?,
-                finished_at: r.get(4)?,
-                forced: r.get::<_, i64>(5)? != 0,
-                status: r.get(6)?,
-                error_message: r.get(7)?,
-                hashed: r.get(9)?,
-                skipped: r.get(10)?,
-                errors: r.get(11)?,
-                archive_entries: r.get(12)?,
+                id: r.get("id")?,
+                volume_id: r.get("volume_id")?,
+                root_path: r.get("root_path")?,
+                started_at: r.get("started_at")?,
+                finished_at: r.get("finished_at")?,
+                forced: r.get::<_, i64>("forced")? != 0,
+                status: r.get("status")?,
+                error_message: r.get("error_message")?,
+                hashed: r.get("hashed")?,
+                skipped: r.get("skipped")?,
+                errors: r.get("errors")?,
+                archive_entries: r.get("archive_entries")?,
                 metrics: MetricsSnapshot {
-                    files_seen: r.get::<_, i64>(8)? as u64,
-                    bytes_hashed: r.get::<_, i64>(13)? as u64,
-                    bytes_skipped: r.get::<_, i64>(14)? as u64,
-                    wall_ms: r.get::<_, Option<i64>>(15)?.unwrap_or(0) as u64,
-                    walk_ms: r.get::<_, i64>(16)? as u64,
-                    skip_check_ms: r.get::<_, i64>(17)? as u64,
-                    hash_ms: r.get::<_, i64>(18)? as u64,
-                    db_write_ms: r.get::<_, i64>(19)? as u64,
-                    archive_ms: r.get::<_, i64>(20)? as u64,
+                    files_seen: r.get::<_, i64>("files_seen")? as u64,
+                    bytes_hashed: r.get::<_, i64>("bytes_hashed")? as u64,
+                    bytes_skipped: r.get::<_, i64>("bytes_skipped")? as u64,
+                    wall_ms: r.get::<_, Option<i64>>("wall_ms")?.unwrap_or(0) as u64,
+                    walk_ms: r.get::<_, i64>("walk_ms")? as u64,
+                    skip_check_ms: r.get::<_, i64>("skip_check_ms")? as u64,
+                    hash_ms: r.get::<_, i64>("hash_ms")? as u64,
+                    db_write_ms: r.get::<_, i64>("db_write_ms")? as u64,
+                    archive_ms: r.get::<_, i64>("archive_ms")? as u64,
                     histogram,
                 },
             })
