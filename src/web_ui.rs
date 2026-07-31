@@ -1025,6 +1025,7 @@ pub fn scan_page(csrf: &str) -> String {
 <div class="card" id="status-card">
   <div class="row" style="justify-content:space-between;align-items:flex-start">
     <div><h3 style="margin:0" id="status-title">Live status</h3><div class="mut" id="status-sub" style="font-size:12.5px;margin-top:2px">No scan running.</div></div>
+    <button class="btn" id="stopscan" hidden>Stop scan</button>
   </div>
   <div class="progressbar" id="pbar" style="margin:16px 0 0;display:none"><span style="width:40%"></span></div>
   <div class="statcols" id="tiles" style="display:none">
@@ -1083,17 +1084,38 @@ $("#scan").addEventListener("click",async()=>{
     poll();
   }catch(e){ $("#running").innerHTML='<span style="color:var(--red)">Scan error: '+esc(String(e))+'</span>'; }
 });
+$("#stopscan").addEventListener("click", async ()=>{
+  $("#stopscan").disabled = true;
+  try {
+    await apiPost("/api/scan/stop", {});
+    $("#running").textContent = "Stopping after the current file… nothing will be marked missing.";
+  } catch(e) { $("#running").innerHTML = '<span style="color:var(--red)">Could not stop: '+esc(String(e))+'</span>'; }
+  $("#stopscan").disabled = false;
+});
+// "1h 42m" / "3m 20s" / "45s" -- mirrors fmt_duration in scan_control.rs so the CLI and the web UI
+// read the same eta the same way.
+function fmtEta(s){ return s>=3600 ? `${Math.floor(s/3600)}h ${String(Math.floor(s%3600/60)).padStart(2,"0")}m`
+  : s>=60 ? `${Math.floor(s/60)}m ${String(s%60).padStart(2,"0")}s` : `${s}s`; }
 function setTiles(on){ $("#tiles").style.display=on?"grid":"none"; const p=$("#pbar"); p.style.display=on?"block":"none"; p.classList.toggle("run",on); }
 async function poll(){
   try{
     const s=await apiGet("/api/scan/status");
     if(s.running){ const r=s.running;
       $("#status-title").textContent="Active scan: "+baseName(r.path);
-      $("#status-sub").textContent="Recursive deep hash analysis in progress…";
+      // Percentage and ETA are both absent (not zero) until the counting pass has reported totals
+      // and the rate estimator has enough samples -- never show a number we can't back up.
+      const pct = (r.total_bytes && r.total_bytes > 0)
+        ? Math.min(100, Math.round(r.done_bytes * 100 / r.total_bytes)) : null;
+      const eta = r.eta_seconds != null ? fmtEta(r.eta_seconds) : null;
+      $("#status-sub").textContent =
+        (pct != null ? pct + "% · " : "") +
+        `${r.hashed} hashed · ${r.skipped} unchanged` +
+        (eta != null ? ` · ETA ${eta}` : "");
       $("#t-hashed").textContent=r.hashed.toLocaleString(); $("#t-skip").textContent=r.skipped.toLocaleString();
       $("#t-err").textContent=r.errors.toLocaleString(); $("#t-arch").textContent=r.archive_entries.toLocaleString();
       setTiles(true);
-    } else { $("#status-title").textContent="Live status"; $("#status-sub").textContent="No scan running."; setTiles(false); }
+      $("#stopscan").hidden = false;
+    } else { $("#status-title").textContent="Live status"; $("#status-sub").textContent="No scan running."; setTiles(false); $("#stopscan").hidden = true; }
     $("#queued").textContent = s.queued.length ? ("Queued: "+s.queued.join(", ")) : "";
     $("#recent").innerHTML = s.recent.length ? s.recent.map(r=>{
       const ok=!r.error_message;

@@ -176,6 +176,7 @@ mod tests {
             errors: 1,
             marked_missing: 0,
             archive_entries: 2,
+            stopped: false,
             metrics: MetricsSnapshot {
                 wall_ms: 1234,
                 walk_ms: 100,

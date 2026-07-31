@@ -64,10 +64,45 @@ fn snapshot(cfg: &Config, now: i64) -> anyhow::Result<std::path::PathBuf> {
     )
 }
 
-pub fn cmd_scan(path: &Path, force: bool, fallback: ReadonlyFallback) -> anyhow::Result<()> {
+pub fn cmd_scan(
+    path: &Path,
+    force: bool,
+    fallback: ReadonlyFallback,
+    no_count: bool,
+) -> anyhow::Result<()> {
     let (cfg, cat) = open_catalog_checked()?;
     let now = now_secs();
-    match scanner::run_scan(&cat, path, force, fallback.into(), now, None)? {
+    let stop = crate::scan_control::install_signal_handler();
+    let progress = crate::scan_control::CliProgress::new();
+
+    if !no_count {
+        eprintln!("Counting files…");
+        let totals = scanner::count_tree(path, &stop);
+        // A stop during counting leaves a partial total. Publishing it would show a percentage that
+        // is wrong rather than absent, so stop here instead: nothing has been scanned yet.
+        if stop.is_requested() {
+            println!("STOPPED while counting — nothing was scanned.");
+            return Ok(());
+        }
+        eprintln!(
+            "Counting… {} files ({:.1} GB)",
+            totals.files,
+            totals.bytes as f64 / 1_073_741_824.0
+        );
+        crate::scanner::Progress::on_total(&progress, totals.files, totals.bytes);
+    }
+
+    let outcome = scanner::run_scan(
+        &cat,
+        path,
+        force,
+        fallback.into(),
+        now,
+        Some(&progress),
+        &stop,
+    );
+    progress.finish();
+    match outcome? {
         None => {
             println!("Skipped read-only drive at {}", path.display());
             return Ok(());
@@ -79,6 +114,10 @@ pub fn cmd_scan(path: &Path, force: bool, fallback: ReadonlyFallback) -> anyhow:
                 identity.label,
                 identity.identified_by
             );
+            if s.stopped {
+                println!("STOPPED before the end of the tree — nothing was marked missing.");
+                println!("Re-run the same command to continue; catalogued files are skipped fast.");
+            }
             println!(
                 "Done: {} hashed, {} unchanged, {} errors, {} newly missing, {} archive entries.",
                 s.hashed, s.skipped, s.errors, s.marked_missing, s.archive_entries
