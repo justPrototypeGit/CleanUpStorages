@@ -81,6 +81,30 @@ Other verbs:
 
 Add `-v` for verbose logs; `RUST_LOG` overrides.
 
+### Make scans ~30% faster on Windows (worth doing before a big scan)
+
+Cataloguing hashes every byte on the drive, so Windows Defender inspects every file the scan opens.
+Measured on a real 4 TB external drive — the same 148,746 files, scanned twice with `--force`:
+
+| | wall | throughput |
+| --- | --- | --- |
+| Defender active | 73.1 min | 27.7 MB/s |
+| drive excluded | **51.4 min** | **39.4 MB/s** |
+
+**~30% faster, and the effect concentrates on the many-small-file phases** (hashing throughput nearly
+doubled), because Defender's cost is per *file opened*, not per byte. On a 20 TB target that is
+roughly two days saved.
+
+To exclude a drive: **Windows Security → Virus & threat protection → Manage settings →
+Exclusions → Add an exclusion → Folder**, then pick the drive or folder you scan.
+
+This is your own archival data on your own machine, and the tool only ever reads it — but it is your
+call, and you can remove the exclusion after the scan. Nothing else in this project needs it.
+
+> Scans are single-threaded on purpose. Parallel reading was built, measured, and abandoned: on a
+> spinning drive it was 1.8–2.0× *slower*, because one read head serving several streams seeks
+> instead of reading. See [docs/benchmarking-scans.md](docs/benchmarking-scans.md).
+
 ![Duplicates review](docs/screenshots/duplicates.png)
 
 The UI has six pages — Overview, Browse (tree view with duplicate highlighting), Duplicates,
