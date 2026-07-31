@@ -17,6 +17,11 @@ pub trait Progress: Send + Sync {
     fn on_skipped(&self);
     fn on_error(&self);
     fn on_archive_entry(&self);
+    /// Totals from the counting pass. Never called when counting is skipped, so a percentage is
+    /// absent rather than wrong.
+    fn on_total(&self, _files: u64, _bytes: u64) {}
+    /// Bytes of the file just finished, hashed or skipped. Drives the rate and the ETA.
+    fn on_bytes(&self, _bytes: u64) {}
 }
 
 /// Outcome of one `scan_volume` pass.
@@ -29,6 +34,9 @@ pub struct ScanSummary {
     pub archive_entries: usize,
     /// Where this scan's time went. Measured always; see `scan_metrics`.
     pub metrics: crate::scan_metrics::MetricsSnapshot,
+    /// True when the scan ended on a stop request rather than reaching the end of the tree.
+    /// A stopped scan must not run the missing-sweep.
+    pub stopped: bool,
 }
 
 /// Metadata timestamp (best-effort) as seconds since UNIX_EPOCH.
@@ -62,6 +70,39 @@ fn rotate_batch(cat: &Catalog, in_batch: &mut usize) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Files and bytes a scan of `root` would process.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct TreeTotals {
+    pub files: u64,
+    pub bytes: u64,
+}
+
+/// Count the tree without reading any file contents — `readdir` + `stat` only.
+///
+/// This is what makes a real percentage possible for a folder that has never been scanned, which is
+/// most of a first pass. It costs a metadata walk, so it scales with file count rather than with
+/// terabytes. Errors are ignored: this is an estimate, and a directory the scan cannot read is
+/// reported by the scan itself.
+pub fn count_tree(root: &Path, stop: &crate::scan_control::StopFlag) -> TreeTotals {
+    let mut totals = TreeTotals::default();
+    for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+        if stop.is_requested() {
+            break;
+        }
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if should_skip(entry.path(), entry.file_name()) {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            totals.files += 1;
+            totals.bytes += meta.len();
+        }
+    }
+    totals
+}
+
 /// Recursively scan `root`, hashing new/changed files and skipping (but re-touching) unchanged
 /// ones, then sweep any previously-active file not seen this pass into `missing`.
 ///
@@ -72,6 +113,11 @@ fn rotate_batch(cat: &Catalog, in_batch: &mut usize) -> anyhow::Result<()> {
 ///
 /// `metrics` is owned by the caller so a scan that bails part-way still yields what it measured
 /// before it died — the multi-day run that fails late is the one most worth measuring.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each parameter is an independent scan input; grouping them into a struct would add \
+        indirection without reducing real complexity"
+)]
 pub fn scan_volume_with_progress(
     cat: &Catalog,
     root: &Path,
@@ -80,6 +126,7 @@ pub fn scan_volume_with_progress(
     now: i64,
     progress: Option<&dyn Progress>,
     metrics: &crate::scan_metrics::ScanMetrics,
+    stop: &crate::scan_control::StopFlag,
 ) -> anyhow::Result<ScanSummary> {
     let scan_started_at = now;
     let limits = ArchiveLimits::from_config(&Config::default_paths()?);
@@ -97,6 +144,10 @@ pub fn scan_volume_with_progress(
             walker.next()
         };
         let Some(entry) = next else { break };
+        if stop.is_requested() {
+            summary.stopped = true;
+            break;
+        }
         let entry = match entry {
             Ok(e) => e,
             Err(err) => {
@@ -190,6 +241,9 @@ pub fn scan_volume_with_progress(
             summary.skipped += 1;
             metrics.add_bytes_skipped(size);
             if let Some(p) = progress {
+                p.on_bytes(size as u64);
+            }
+            if let Some(p) = progress {
                 p.on_skipped();
             }
             in_batch += 1;
@@ -218,6 +272,9 @@ pub fn scan_volume_with_progress(
             }
         };
         metrics.add_bytes_hashed(size);
+        if let Some(p) = progress {
+            p.on_bytes(size as u64);
+        }
 
         let ext = path
             .extension()
@@ -270,8 +327,16 @@ pub fn scan_volume_with_progress(
     {
         let _t = metrics.timer(crate::scan_metrics::Phase::DbWrite);
         cat.conn.execute_batch("COMMIT")?;
-        summary.marked_missing =
-            cat.mark_missing_scanned(&identity.volume_id, scan_started_at, now, &unreadable_dirs)?;
+        // THE rule: a scan that did not finish never sweeps. Every file the walk had not reached
+        // yet looks untouched, so sweeping here would mark present files as missing.
+        if !summary.stopped {
+            summary.marked_missing = cat.mark_missing_scanned(
+                &identity.volume_id,
+                scan_started_at,
+                now,
+                &unreadable_dirs,
+            )?;
+        }
     }
     summary.metrics = metrics.snapshot();
     Ok(summary)
@@ -286,7 +351,16 @@ pub fn scan_volume(
     now: i64,
 ) -> anyhow::Result<ScanSummary> {
     let metrics = crate::scan_metrics::ScanMetrics::new();
-    scan_volume_with_progress(cat, root, identity, force, now, None, &metrics)
+    scan_volume_with_progress(
+        cat,
+        root,
+        identity,
+        force,
+        now,
+        None,
+        &metrics,
+        &crate::scan_control::StopFlag::new(),
+    )
 }
 
 /// Resolve identity, upsert the volume, and scan. `Ok(None)` iff a read-only drive was skipped.
@@ -300,6 +374,7 @@ pub fn run_scan(
     fallback: crate::volume::ReadonlyMode,
     now: i64,
     progress: Option<&dyn Progress>,
+    stop: &crate::scan_control::StopFlag,
 ) -> anyhow::Result<Option<(VolumeIdentity, ScanSummary)>> {
     let identity = match crate::volume::resolve(mount_root, fallback)? {
         Some(id) => id,
@@ -334,8 +409,9 @@ pub fn run_scan(
     // Owned here, not inside the scan, so a scan that bails part-way still reports what it
     // measured before it died.
     let metrics = crate::scan_metrics::ScanMetrics::new();
-    let result =
-        scan_volume_with_progress(cat, mount_root, &identity, force, now, progress, &metrics);
+    let result = scan_volume_with_progress(
+        cat, mount_root, &identity, force, now, progress, &metrics, stop,
+    );
 
     if result.is_err() {
         // The scan bailed with its BEGIN still open; end it so the metrics UPDATE below is its
@@ -347,7 +423,14 @@ pub fn run_scan(
     if let Some(id) = run_id {
         let finished_at = crate::commands::now_secs();
         let outcome = match &result {
-            Ok(summary) => cat.finish_scan_run(id, finished_at, "completed", None, summary),
+            Ok(summary) => {
+                let status = if summary.stopped {
+                    "cancelled"
+                } else {
+                    "completed"
+                };
+                cat.finish_scan_run(id, finished_at, status, None, summary)
+            }
             Err(e) => {
                 let msg = e.to_string();
                 let partial = ScanSummary {
@@ -615,6 +698,7 @@ mod tests {
             crate::volume::ReadonlyMode::Fingerprint,
             100,
             None,
+            &crate::scan_control::StopFlag::new(),
         )
         .unwrap();
         let (identity, summary) = out.expect("not skipped");
@@ -667,6 +751,7 @@ mod tests {
             crate::volume::ReadonlyMode::Fingerprint,
             100,
             None,
+            &crate::scan_control::StopFlag::new(),
         )
         .unwrap();
         let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
@@ -691,6 +776,7 @@ mod tests {
             crate::volume::ReadonlyMode::Fingerprint,
             1234,
             None,
+            &crate::scan_control::StopFlag::new(),
         )
         .unwrap();
         assert!(n.is_some());
@@ -711,7 +797,17 @@ mod tests {
 
         let p = CountingProgress::new();
         let m = crate::scan_metrics::ScanMetrics::new();
-        let s = scan_volume_with_progress(&cat, &root, &ident(), false, 100, Some(&p), &m).unwrap();
+        let s = scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            Some(&p),
+            &m,
+            &crate::scan_control::StopFlag::new(),
+        )
+        .unwrap();
         assert_eq!(p.hashed.load(Relaxed), s.hashed);
         assert_eq!(p.skipped.load(Relaxed), s.skipped);
         assert_eq!(p.errors.load(Relaxed), s.errors);
@@ -786,6 +882,7 @@ mod tests {
             crate::volume::ReadonlyMode::Fingerprint,
             100,
             None,
+            &crate::scan_control::StopFlag::new(),
         )
         .unwrap();
         assert!(out.is_some());
@@ -819,6 +916,7 @@ mod tests {
             crate::volume::ReadonlyMode::Fingerprint,
             100,
             None,
+            &crate::scan_control::StopFlag::new(),
         );
         assert!(out.is_err(), "the induced trigger must fail the scan");
         drop(cat);
@@ -859,6 +957,7 @@ mod tests {
             crate::volume::ReadonlyMode::Fingerprint,
             100,
             None,
+            &crate::scan_control::StopFlag::new(),
         );
         assert!(
             out.is_ok(),
@@ -869,5 +968,91 @@ mod tests {
             1,
             "the scan still did its work"
         );
+    }
+
+    #[test]
+    fn count_tree_totals_files_and_bytes_and_skips_the_marker() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("drive");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.bin"), vec![b'x'; 100]).unwrap();
+        std::fs::write(root.join("sub/b.bin"), vec![b'y'; 250]).unwrap();
+        // The identity marker is skipped by the scan, so it must not be counted either.
+        std::fs::write(root.join(crate::volume::MARKER), b"vol-1").unwrap();
+
+        let totals = count_tree(&root, &crate::scan_control::StopFlag::new());
+        assert_eq!(totals.files, 2);
+        assert_eq!(totals.bytes, 350);
+    }
+
+    #[test]
+    fn count_tree_returns_promptly_when_stopped() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        for i in 0..200 {
+            std::fs::write(root.join(format!("f{i}.bin")), b"x").unwrap();
+        }
+        let stop = crate::scan_control::StopFlag::new();
+        stop.request(); // already requested before we start
+        let totals = count_tree(&root, &stop);
+        assert!(
+            totals.files < 200,
+            "counting should stop early, got {}",
+            totals.files
+        );
+    }
+
+    #[test]
+    fn a_stopped_scan_sweeps_nothing_and_reports_stopped() {
+        // THE rule: a scan that did not finish must never mark files missing. Without the guard, every
+        // file the walk had not reached yet would be flagged as gone.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+        std::fs::write(root.join("b.txt"), b"two").unwrap();
+
+        // First pass catalogues both files.
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let stop = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+        assert_eq!(cat.search("", None, None, Some("active")).unwrap().len(), 2);
+
+        // Second pass is stopped before it starts: nothing is re-seen, so an unguarded sweep would
+        // mark BOTH files missing.
+        let stop2 = crate::scan_control::StopFlag::new();
+        stop2.request();
+        let m2 = crate::scan_metrics::ScanMetrics::new();
+        let s = scan_volume_with_progress(&cat, &root, &ident(), false, 300, None, &m2, &stop2)
+            .unwrap();
+
+        assert!(s.stopped, "the summary must report that it was stopped");
+        assert_eq!(s.marked_missing, 0, "a stopped scan must not sweep");
+        assert_eq!(
+            cat.search("", None, None, Some("active")).unwrap().len(),
+            2,
+            "both files are still on disk and must stay active"
+        );
+    }
+
+    #[test]
+    fn an_unstopped_scan_still_sweeps() {
+        // The guard must not disable the feature: a genuinely deleted file still becomes missing.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("gone.txt"), b"bye").unwrap();
+
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let stop = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+
+        std::fs::remove_file(root.join("gone.txt")).unwrap();
+        let m2 = crate::scan_metrics::ScanMetrics::new();
+        let s =
+            scan_volume_with_progress(&cat, &root, &ident(), false, 300, None, &m2, &stop).unwrap();
+        assert!(!s.stopped);
+        assert_eq!(s.marked_missing, 1);
     }
 }

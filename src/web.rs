@@ -68,6 +68,7 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/purge-all", post(api_purge_all))
         .route("/api/scan", post(api_scan))
         .route("/api/scan/status", get(api_scan_status))
+        .route("/api/scan/stop", post(api_scan_stop))
         .route("/api/scan-runs", get(api_scan_runs))
         .route("/api/pick-folder", post(api_pick_folder))
         .route("/review", get(review))
@@ -999,6 +1000,19 @@ async fn api_scan_status(State(state): State<AppState>) -> Json<crate::scan_queu
     Json(state.scan_queue.status())
 }
 
+/// Ask the running scan to stop. Idempotent, and harmless when nothing is running.
+///
+/// `stopping: false` means there was nothing to stop, not that the request failed -- the CLI
+/// stop button treats that as a normal, non-error outcome.
+async fn api_scan_stop(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    check_csrf(&headers, &state)?;
+    let stopping = state.scan_queue.request_stop();
+    Ok(Json(serde_json::json!({ "stopping": stopping })))
+}
+
 #[derive(Deserialize, Default)]
 struct ScanRunsParams {
     limit: Option<usize>,
@@ -1901,6 +1915,39 @@ mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
+    /// The CSRF token `seed_dupes`'s `AppState` is fixed to; named so new tests don't have to
+    /// guess (or drift from) the literal every write-endpoint test already passes.
+    const TEST_TOKEN: &str = "T";
+
+    #[tokio::test]
+    async fn scan_stop_requires_csrf_and_answers_when_idle() {
+        let (_t, _db, state) = seed_dupes();
+        // Without a token the write endpoint must refuse, like every other write endpoint.
+        let app = build_router_with(state.clone());
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/scan/stop")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::FORBIDDEN);
+
+        // With a token, stopping while nothing runs is a no-op success, not an error.
+        let (code, v) = post_json(
+            state,
+            "/api/scan/stop",
+            Some(TEST_TOKEN),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(code, axum::http::StatusCode::OK);
+        assert_eq!(v["stopping"], false, "nothing was running");
+    }
+
     #[tokio::test]
     async fn quarantine_requires_csrf_token() {
         let (_t, _db, state) = seed_dupes();
@@ -2415,6 +2462,10 @@ mod tests {
         assert!(body.contains("/api/scan"));
         assert!(body.contains("/api/detected-drives"));
         assert!(body.contains("/api/pick-folder"));
+        // The Stop button is the only way to end a scan from the browser; a page that renders
+        // without it leaves a multi-day scan unstoppable short of killing the process.
+        assert!(body.contains("/api/scan/stop"));
+        assert!(body.contains("stopscan"));
         assert!(!body.contains("http://") && !body.contains("https://"));
     }
 
