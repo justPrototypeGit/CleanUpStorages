@@ -107,17 +107,37 @@ impl Catalog {
     }
 
     /// Flag active files (loose or archived) on this volume not touched by the current scan as missing.
+    /// `unreadable_prefixes` are directories this scan could not enumerate (permission denied, I/O
+    /// error). Files beneath them were never visited, so they look untouched — but they are almost
+    /// certainly still on disk. Sweeping them to `missing` says "your files are gone" about files
+    /// that are merely unreadable, which is alarming and wrong (#7). They are excluded instead.
     pub fn mark_missing_scanned(
         &self,
         volume_id: &str,
         scan_started_at: i64,
         _now: i64,
+        unreadable_prefixes: &[String],
     ) -> anyhow::Result<usize> {
-        let n = self.conn.execute(
+        let mut sql = String::from(
             "UPDATE files SET status='missing'
              WHERE volume_id=?1 AND status='active' AND last_seen_at < ?2",
-            params![volume_id, scan_started_at],
-        )?;
+        );
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(volume_id.to_string()), Box::new(scan_started_at)];
+        for prefix in unreadable_prefixes {
+            // The directory itself, and anything under it. LIKE metacharacters in real paths (`%`
+            // and `_` are legal filename characters) are escaped, or a path containing one would
+            // shield unrelated files from the sweep.
+            sql.push_str(" AND relative_path <> ? AND relative_path NOT LIKE ? ESCAPE '\\'");
+            let escaped = prefix
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            args.push(Box::new(prefix.clone()));
+            args.push(Box::new(format!("{escaped}/%")));
+        }
+        let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+        let n = self.conn.execute(&sql, refs.as_slice())?;
         Ok(n)
     }
 
@@ -823,7 +843,7 @@ mod tests {
         cat.upsert_file(&f, 1).unwrap();
         // Both rows have last_seen_at=1; a scan starting at 300 sweeps anything not seen this pass
         // (last_seen_at < 300) to missing. Signature: mark_missing_scanned(volume_id, scan_started_at, now).
-        cat.mark_missing_scanned("v", 300, 300).unwrap();
+        cat.mark_missing_scanned("v", 300, 300, &[]).unwrap();
         // active-only: no reviewable groups
         assert_eq!(cat.duplicate_totals(0).unwrap().groups_all, 0);
     }
@@ -879,10 +899,92 @@ mod tests {
         // new scan starts at t=300; only kept.txt is re-seen
         cat.upsert_file(&mk_file("vol-1", "kept.txt", "h2"), 300)
             .unwrap();
-        let n = cat.mark_missing_scanned("vol-1", 300, 300).unwrap();
+        let n = cat.mark_missing_scanned("vol-1", 300, 300, &[]).unwrap();
         assert_eq!(n, 1);
         let missing = cat.search("gone", None, None, Some("missing")).unwrap();
         assert_eq!(missing.len(), 1);
+    }
+
+    #[test]
+    fn an_unreadable_directory_shields_its_files_from_the_missing_sweep() {
+        // #7: a directory that fails to enumerate means its files are never re-seen, so the sweep
+        // would call them `missing` — telling the user their files are gone when they are merely
+        // unreadable this pass.
+        let (_t, cat) = open_tmp();
+        cat.upsert_file(&mk_file("vol-1", "locked/a.txt", "h1"), 200)
+            .unwrap();
+        cat.upsert_file(&mk_file("vol-1", "locked/deep/b.txt", "h2"), 200)
+            .unwrap();
+        cat.upsert_file(&mk_file("vol-1", "elsewhere/c.txt", "h3"), 200)
+            .unwrap();
+
+        // A later scan enumerated nothing: "locked" failed, and c.txt really was deleted.
+        let n = cat
+            .mark_missing_scanned("vol-1", 300, 300, &["locked".to_string()])
+            .unwrap();
+        assert_eq!(n, 1, "only the genuinely absent file is swept");
+
+        for still_active in ["locked/a.txt", "locked/deep/b.txt"] {
+            let s: String = cat
+                .conn
+                .query_row(
+                    "SELECT status FROM files WHERE relative_path=?1",
+                    [still_active],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(s, "active", "{still_active} is unreadable, not gone");
+        }
+        let s: String = cat
+            .conn
+            .query_row(
+                "SELECT status FROM files WHERE relative_path='elsewhere/c.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(s, "missing", "a readable directory still gets swept");
+    }
+
+    #[test]
+    fn a_percent_in_an_unreadable_path_does_not_shield_unrelated_files() {
+        // `%` and `_` are legal in filenames and are LIKE wildcards. Unescaped, a directory named
+        // "%" would match everything and silently disable the sweep for the whole volume.
+        // A directory literally named "%" is the discriminating case: unescaped it becomes
+        // LIKE '%/%', which matches EVERY path containing a slash and would silently disable the
+        // sweep for the whole volume. Escaped, it matches only the directory actually named "%".
+        let (_t, cat) = open_tmp();
+        cat.upsert_file(&mk_file("vol-1", "%/a.txt", "h1"), 200)
+            .unwrap();
+        cat.upsert_file(&mk_file("vol-1", "unrelated/b.txt", "h2"), 200)
+            .unwrap();
+
+        let n = cat
+            .mark_missing_scanned("vol-1", 300, 300, &["%".to_string()])
+            .unwrap();
+        assert_eq!(
+            n, 1,
+            "the unrelated file must still be swept; an unescaped wildcard would shield it"
+        );
+
+        let shielded: String = cat
+            .conn
+            .query_row(
+                "SELECT status FROM files WHERE relative_path='%/a.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(shielded, "active");
+        let swept: String = cat
+            .conn
+            .query_row(
+                "SELECT status FROM files WHERE relative_path='unrelated/b.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(swept, "missing");
     }
 
     #[test]
@@ -1026,7 +1128,7 @@ mod tests {
         // rescan at 300 re-sees only kept.jpg
         cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("kept.jpg", "h2"), None, 300)
             .unwrap();
-        let n = cat.mark_missing_scanned("vol-1", 300, 300).unwrap();
+        let n = cat.mark_missing_scanned("vol-1", 300, 300, &[]).unwrap();
         assert_eq!(n, 1);
         assert_eq!(
             cat.search("gone", None, None, Some("missing"))
@@ -1046,7 +1148,7 @@ mod tests {
         let touched = cat.touch_archive_entries("vol-1", "old.zip", 300).unwrap();
         assert_eq!(touched, 2);
         // after touch, a later sweep starting at 300 does NOT mark them missing
-        let n = cat.mark_missing_scanned("vol-1", 300, 300).unwrap();
+        let n = cat.mark_missing_scanned("vol-1", 300, 300, &[]).unwrap();
         assert_eq!(n, 0);
     }
 
@@ -1234,7 +1336,7 @@ mod tests {
         // rescan at 300 re-sees only a.jpg -> gone.jpg swept to missing
         cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("a.jpg", "h1"), None, 300)
             .unwrap();
-        cat.mark_missing_scanned("vol-1", 300, 300).unwrap();
+        cat.mark_missing_scanned("vol-1", 300, 300, &[]).unwrap();
         assert_eq!(
             cat.search("gone", None, None, Some("missing"))
                 .unwrap()
