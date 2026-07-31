@@ -119,6 +119,24 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
     ensure_column(conn, "volumes", "last_scanned_path", "TEXT")?;
     ensure_column(conn, "volumes", "display_name", "TEXT")?;
     ensure_column(conn, "volumes", "description", "TEXT")?;
+    ensure_column(conn, "scan_errors", "phase", "TEXT")?;
+    ensure_column(conn, "scan_errors", "kind", "TEXT")?;
+
+    // Until now every scan appended a fresh row for the same failing path, so an existing
+    // catalogue holds duplicates and CREATE UNIQUE INDEX would fail -- taking the whole catalogue
+    // offline, since this runs on open. Collapse to the newest row per path first.
+    conn.execute_batch(
+        r#"
+        DELETE FROM scan_errors WHERE id NOT IN (
+            SELECT MAX(id) FROM scan_errors GROUP BY volume_id, path
+        );
+        -- NULL volume_id rows are neither deduped nor constrained (SQLite treats NULLs as
+        -- distinct). The scanner always supplies a volume id, so this affects nothing real.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_errors_identity
+            ON scan_errors(volume_id, path);
+        CREATE INDEX IF NOT EXISTS idx_scan_errors_volume ON scan_errors(volume_id);
+        "#,
+    )?;
     Ok(())
 }
 
@@ -472,5 +490,63 @@ mod tests {
             .unwrap();
         assert_eq!(has_col, 1);
         assert!(cat.integrity_ok().unwrap());
+    }
+
+    #[test]
+    fn migration_dedupes_scan_errors_then_enforces_one_row_per_path() {
+        // A pre-existing catalogue has one row per failure per scan. The unique index cannot be
+        // created over that, so the migration must collapse them first -- keeping the newest.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("catalog.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE scan_errors (
+                    id INTEGER PRIMARY KEY, volume_id TEXT, path TEXT NOT NULL,
+                    reason TEXT NOT NULL, occurred_at INTEGER NOT NULL
+                );
+                INSERT INTO scan_errors(volume_id, path, reason, occurred_at)
+                     VALUES ('v','a/x.pst','read: old',100),
+                            ('v','a/x.pst','read: newer',200),
+                            ('v','a/x.pst','read: newest',300),
+                            ('v','b/y.jpg','read: other',150);
+                "#,
+            )
+            .unwrap();
+        }
+
+        let cat = Catalog::open(&db).unwrap();
+
+        let n: i64 = cat
+            .conn
+            .query_row("SELECT count(*) FROM scan_errors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2, "three rows for one path collapse to one");
+
+        let kept: String = cat
+            .conn
+            .query_row(
+                "SELECT reason FROM scan_errors WHERE path='a/x.pst'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, "read: newest", "the newest row survives");
+
+        // The columns exist and the constraint is live.
+        cat.conn
+            .execute(
+                "INSERT INTO scan_errors(volume_id,path,reason,occurred_at,phase,kind)
+                 VALUES ('v','c/z.bin','read: x',400,'read','io')",
+                [],
+            )
+            .unwrap();
+        let dup = cat.conn.execute(
+            "INSERT INTO scan_errors(volume_id,path,reason,occurred_at,phase,kind)
+             VALUES ('v','c/z.bin','read: again',500,'read','io')",
+            [],
+        );
+        assert!(dup.is_err(), "a second row for the same path is rejected");
     }
 }
