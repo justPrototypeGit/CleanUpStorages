@@ -1,6 +1,8 @@
 # Parallel scan pipeline — design
 
-**Status:** implemented — but the core hypothesis was DISPROVED by measurement; see "Result" below
+**Status:** NOT MERGED — implemented, measured, abandoned. The hypothesis was disproved, and the
+pipeline is slower than the serial scan it replaced at *every* worker count. Kept as the record of
+why. Tag: `experiment/parallel-scan`.
 **Date:** 2026-07-24
 **Closes:** #23 (parallelise the scan pipeline)
 **Epic:** #21 (scan performance — 20 TB must be practical)
@@ -15,6 +17,23 @@ external drive with `--force`:
 | 172 large files (~32 GB, all >64 KB, 128 over 16 MB) | 4.3 min · 125.0 MB/s | 8.7 min · 61.5 MB/s (**2.03x slower**) |
 | 225,285 files (91% under 64 KB) + archives | 1.25 h · 28.3 MB/s | 2.29 h · 15.4 MB/s (**1.83x slower**) |
 
+**Then the decisive one — this pipeline against the serial scan it replaced**, same folder, same
+225,285 files:
+
+| | wall | overall | while hashing | walk phase |
+| --- | --- | --- | --- | --- |
+| **`main` (serial loop)** | **1.01 h** | **35.1 MB/s** | 42.7 MB/s | 247 s |
+| this branch, `--jobs 1` | 1.25 h | 28.3 MB/s | 31.1 MB/s | 483 s |
+| this branch, `--jobs 4` | 2.29 h | 15.4 MB/s | 4.2 MB/s | — |
+
+**The pipeline is 24% slower than the serial scan even at one worker.** The `walk` phase alone nearly
+doubled (247 s → 483 s) on identical work, because at `--jobs 1` there are still *two* disk
+consumers: the walker doing `readdir`/`stat`, and the worker streaming file data. `accounted` states
+it exactly — `main` 99.9% (no overlap), this branch 112.8%. That 12.8% of overlap **costs 24% of wall
+time** in seek contention. The overlap is real, and counterproductive.
+
+On the 20 TB target: roughly 6.6 days (serial) versus 8.2 days (this pipeline at `--jobs 1`).
+
 The mechanism is unambiguous and visible *within* each run: per-stream throughput collapsed ~7x
 (31.1 -> 4.2 MB/s while hashing) with only 4 workers, so four readers delivered ~16.8 MB/s aggregate
 where one delivered 31.1. The archive phase suffered worst (7.6x). A single disk head is one physical
@@ -24,10 +43,13 @@ The design's reasoning — "the scan is I/O-bound, therefore overlap I/O with ha
 assumed the disk could serve concurrent requests productively. On a spinning USB drive it cannot.
 The seek-bound small-file corpus, predicted here to be the case that benefits, lost just as badly.
 
-**Consequence:** the default is **`--jobs 1`**. The pipeline ships, because at `--jobs 1` it performs
-one file read at a time (one worker) and the machinery is retained for SSD/NVMe, where overlap does
-work (measured 385% accounted on NVMe). Raising `--jobs` on a spinning drive is a footgun and the
-CLI help says so.
+**Consequence: the branch is not merged.** Shipping it with `--jobs 1` as the default was considered
+and then rejected, once the third measurement landed: `--jobs 1` is not "the old behaviour", it is
+this pipeline with one worker, and it costs 24%. `main` already holds the faster implementation, so
+abandoning this required writing nothing and stops paying that 24% permanently.
+
+Overlap does work on NVMe (385% accounted, measured), so the idea is not universally wrong — it is
+wrong for this project's target hardware, which is external spinning drives.
 
 This is the outcome #22 existed to make visible. Without it, `--jobs 4` would have shipped as the
 default and roughly doubled a 20 TB scan.

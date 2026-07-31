@@ -65,4 +65,8 @@ readers moved *less total data* than one. One disk head is a single physical res
 streams turn sequential reads into seeking. This held in both the bandwidth-bound (large file) and
 seek-bound (small file) regimes.
 
-The default is `--jobs 1`. Raise it only on SSD/NVMe, and measure rather than assume.
+A third run settled it: the threaded pipeline is **24% slower than the plain serial scan even at
+`--jobs 1`** (1.01 h serial vs 1.25 h), because the walker thread and the hashing worker are two
+disk consumers competing for one head — the `walk` phase alone doubled on identical work. The
+parallel scan was therefore **abandoned, not shipped**; the scan on `main` is the serial one. See
+`docs/superpowers/specs/2026-07-24-parallel-scan-design.md` and git tag `experiment/parallel-scan`.
