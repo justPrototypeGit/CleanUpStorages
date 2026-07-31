@@ -1249,4 +1249,75 @@ mod tests {
             .unwrap();
         assert_eq!(n, 1, "a stopped scan never clears a walk error");
     }
+
+    #[test]
+    fn a_legacy_phase_null_error_clears_when_its_path_is_recatalogued() {
+        // Rows written before `phase` existed have phase IS NULL. The spec promises they "clear
+        // themselves on the next scan" -- same as any other file-path error, once re-seen.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+
+        // Raw insert, no phase/kind -- mirrors a row from before this feature existed.
+        cat.conn
+            .execute(
+                "INSERT INTO scan_errors(volume_id, path, reason, occurred_at)
+                 VALUES ('vol-1', 'a.txt', 'read: was locked', 50)",
+                [],
+            )
+            .unwrap();
+
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let stop = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+
+        let n: i64 = cat
+            .conn
+            .query_row(
+                "SELECT count(*) FROM scan_errors WHERE path='a.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "a legacy error clears once its path is re-catalogued");
+    }
+
+    #[test]
+    fn a_legacy_phase_null_error_survives_an_unreached_stopped_scan() {
+        // The relaxation that lets legacy rows clear must not reopen the false-complete hazard:
+        // a legacy row for a path a STOPPED scan never reached must still survive.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+
+        cat.conn
+            .execute(
+                "INSERT INTO scan_errors(volume_id, path, reason, occurred_at)
+                 VALUES ('vol-1', 'never/reached.bin', 'read: i/o', 50)",
+                [],
+            )
+            .unwrap();
+
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let stop = crate::scan_control::StopFlag::new();
+        stop.request(); // stopped before it starts
+        let s =
+            scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+        assert!(s.stopped);
+
+        let n: i64 = cat
+            .conn
+            .query_row(
+                "SELECT count(*) FROM scan_errors WHERE path='never/reached.bin'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            n, 1,
+            "a stopped scan must not clear a legacy error for an unreached path"
+        );
+    }
 }
