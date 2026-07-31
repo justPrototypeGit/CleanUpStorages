@@ -23,6 +23,17 @@ achieved — that is the point of the number.
 
 ### 1. Windows Defender
 
+**Measured result: excluding the drive is ~30% faster.** Same 148,746 files, `--force`, twice:
+
+| | wall | throughput |
+| --- | --- | --- |
+| Defender active | 73.1 min | 27.7 MB/s |
+| drive excluded | **51.4 min** | **39.4 MB/s** |
+
+Hashing throughput nearly doubled, and the `walk` phase halved — Defender's cost is per *file
+opened*, so it lands hardest on the many-small-file phases. The README tells users how to set the
+exclusion; the rest of this section is how to reproduce the measurement.
+
 Defender scans every file we open. On a corpus that is 88.3% files under 64 KB, that per-open tax
 can rival seek time — and from inside our process it is indistinguishable from slow I/O.
 
