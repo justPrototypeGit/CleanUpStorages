@@ -59,6 +59,13 @@ impl Catalog {
     /// * `walk` stores a directory and `archive_entry` stores a composite `archive › inner` path;
     ///   neither exists in `files`. Only a *completed* scan proves the location was visited and is
     ///   readable again, so those clear only when `completed` and not re-recorded this run.
+    ///
+    /// Legacy rows (written before `phase` existed) have `phase IS NULL`, i.e. `IFNULL(phase,'')
+    /// = ''`. They belong to *both* IN-lists below: since we don't know which kind of path they
+    /// hold, a legacy row clears under whichever rule fits it -- the file rule if its path turns
+    /// out to match a re-seen file, otherwise the completed-scan rule. Leaving `''` out of both
+    /// lists (as an earlier version of this function did) makes every legacy row immortal --
+    /// never delete without one of `''` or {phase already known to be one of the two buckets}.
     pub fn clear_resolved_scan_errors(
         &self,
         volume_id: &str,
@@ -68,7 +75,7 @@ impl Catalog {
         let mut removed = self.conn.execute(
             "DELETE FROM scan_errors
               WHERE volume_id=?1
-                AND IFNULL(phase,'') IN ('metadata','read','archive_open')
+                AND IFNULL(phase,'') IN ('metadata','read','archive_open','')
                 AND path IN (SELECT relative_path FROM files
                               WHERE volume_id=?1 AND last_seen_at >= ?2)",
             params![volume_id, scan_started_at],
@@ -79,7 +86,7 @@ impl Catalog {
             // was not re-recorded -- the directory opened cleanly this time.
             removed += self.conn.execute(
                 "DELETE FROM scan_errors
-                  WHERE volume_id=?1 AND IFNULL(phase,'') IN ('walk','archive_entry')
+                  WHERE volume_id=?1 AND IFNULL(phase,'') IN ('walk','archive_entry','')
                     AND occurred_at < ?2",
                 params![volume_id, scan_started_at],
             )?;
