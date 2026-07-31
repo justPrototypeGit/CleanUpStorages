@@ -47,7 +47,7 @@ documented and measured instead.
 | Progress total | **Metadata-only counting pass before hashing** | The only source of a true percentage for a folder never scanned before — which is most of the remaining 16 TB. Cost scales with *file count*, not bytes. |
 | ETA basis | **Bytes, on a rolling recent rate** | Throughput swings 28–125 MB/s with file size; a lifetime average would lag badly. A rolling rate self-corrects and is labelled an estimate. |
 | Live counters | **Always on, from the first second** | Independent of the counting pass, always correct, zero cost. Percentage and ETA appear once a total exists. |
-| Ctrl+C handling | **Add the `ctrlc` crate** (one small cross-platform dependency) | The CLI scan is synchronous, so `tokio::signal` does not apply; the alternative is per-platform `signal`/`SetConsoleCtrlHandler` code. A new dependency is a real cost and is called out rather than slipped in. |
+| Ctrl+C handling | **Hand-rolled, no new dependency** | `windows-sys` is already a direct dependency with existing FFI, and needs only the `Win32_System_Console` feature; `libc` is already in the tree. ~25 lines against one more crate, in a project that ships a single self-contained binary. |
 
 ## Architecture
 
@@ -67,9 +67,35 @@ impl StopFlag {
 Threaded into `scan_volume_with_progress` and `run_scan` as `stop: &StopFlag`. Checked at the top of
 each loop iteration, in both the counting pass and the hashing pass.
 
-- **CLI**: a `ctrlc` handler sets the flag; a second Ctrl+C aborts the process as usual. This adds the
-  `ctrlc` crate — small, widely used, no transitive weight. Worth naming explicitly: the project
-  compiles to a single self-contained binary and every dependency is a deliberate choice.
+- **CLI**: a platform signal handler sets a process-global `AtomicBool`, which the scan polls through
+  its `StopFlag`. A second Ctrl+C terminates immediately.
+
+  ```rust
+  // Windows — SetConsoleCtrlHandler; the OS invokes this on a thread it creates.
+  // Returning FALSE on the second press lets the default handler terminate us.
+  unsafe extern "system" fn on_console_ctrl(_event: u32) -> BOOL {
+      if STOP.swap(true, Ordering::SeqCst) { 0 } else { 1 }
+  }
+
+  // Unix — restore the default disposition so a second Ctrl+C kills immediately.
+  unsafe extern "C" fn on_sigint(_sig: libc::c_int) {
+      STOP.store(true, Ordering::SeqCst);
+      libc::signal(libc::SIGINT, libc::SIG_DFL);
+  }
+  ```
+
+  **The handler must do nothing but store to the atomic.** Signal handlers may only call
+  async-signal-safe functions: an atomic store qualifies, and POSIX lists `signal()` as safe.
+  Allocating, taking a lock, or logging from a handler can deadlock the process. This is written
+  down because "just log which signal arrived" is the obvious future mistake.
+
+  A process-global is acceptable here because a process runs at most one CLI scan; the web path never
+  uses it and drives its per-job `StopFlag` directly. Handlers are registered only by `cmd_scan`, so
+  library consumers and tests are unaffected.
+
+  Dependencies: `windows-sys` gains the `Win32_System_Console` feature (it is already a direct
+  dependency used for the DPI call in `main.rs`); `libc` becomes a direct non-Windows dependency and
+  is already present in the lockfile via `sysinfo`/`rfd`. **No new crate is added.**
 - **Web**: `POST /api/scan/stop` (CSRF-guarded, like every other write endpoint) sets the flag on the
   currently running job. Replaces the ineffective `worker.abort()`.
 
