@@ -93,7 +93,105 @@ impl Catalog {
         }
         Ok(removed)
     }
+
+    /// Per-volume answer to "is this catalogue complete, and what is missing?"
+    pub fn volume_completeness(&self, volume_id: &str) -> anyhow::Result<Completeness> {
+        let sql = format!(
+            "SELECT {BUCKET_SQL} AS bucket, count(*) FROM scan_errors e
+               LEFT JOIN files f
+                 ON f.volume_id=e.volume_id AND f.relative_path=e.path AND f.status='active'
+              WHERE e.volume_id=?1 GROUP BY bucket"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut out = Completeness::default();
+        let rows = stmt.query_map(params![volume_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (bucket, n) = row?;
+            match bucket.as_str() {
+                "absent" => out.absent = n,
+                "unverified" => out.unverified = n,
+                "unreadable_dir" => out.unreadable_dirs = n,
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
+    /// Bounded, deterministically-ordered list of scan errors for one volume, optionally filtered
+    /// by `bucket` (`"absent"` / `"unverified"` / `"unreadable_dir"`) and/or `kind`.
+    pub fn volume_scan_errors(
+        &self,
+        volume_id: &str,
+        bucket: Option<&str>,
+        kind: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<Vec<ScanErrorRow>> {
+        let sql = format!(
+            "SELECT e.path, e.reason, e.kind, e.phase, e.occurred_at, {BUCKET_SQL} AS bucket
+               FROM scan_errors e
+               LEFT JOIN files f
+                 ON f.volume_id=e.volume_id AND f.relative_path=e.path AND f.status='active'
+              WHERE e.volume_id=?1
+                AND (?2 IS NULL OR bucket = ?2)
+                AND (?3 IS NULL OR IFNULL(e.kind,'') = ?3)
+              ORDER BY e.path LIMIT ?4 OFFSET ?5"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params![volume_id, bucket, kind, limit as i64, offset as i64],
+            |r| {
+                Ok(ScanErrorRow {
+                    path: r.get(0)?,
+                    reason: r.get(1)?,
+                    kind: r.get(2)?,
+                    phase: r.get(3)?,
+                    occurred_at: r.get(4)?,
+                    bucket: r.get(5)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
 }
+
+/// Per-volume answer to "is this catalogue complete, and what is missing?"
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct Completeness {
+    /// Files with no catalogue row: invisible to search and dedup. The real hole.
+    pub absent: i64,
+    /// Files with a row from an earlier scan that this scan could not re-read, so the stored hash
+    /// may be stale -- which can pair the wrong files during duplicate review.
+    pub unverified: i64,
+    /// Directories the walk could not open. Never counted as one missing file: the number of files
+    /// beneath an unopenable directory is unknown, and printing 1 would make a denied folder of
+    /// 40,000 photos look like a denied `System Volume Information`.
+    pub unreadable_dirs: i64,
+}
+
+impl Completeness {
+    pub fn is_complete(&self) -> bool {
+        self.absent == 0 && self.unverified == 0 && self.unreadable_dirs == 0
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScanErrorRow {
+    pub path: String,
+    pub reason: String,
+    pub kind: Option<String>,
+    pub phase: Option<String>,
+    pub occurred_at: i64,
+    pub bucket: String,
+}
+
+/// `IFNULL(phase,'')` throughout: rows written before classification have a NULL phase, and
+/// `phase <> 'walk'` is NULL for those -- which would drop them from *both* buckets and
+/// under-report the very thing this feature measures.
+const BUCKET_SQL: &str = "CASE WHEN IFNULL(e.phase,'')='walk' THEN 'unreadable_dir' \
+                               WHEN f.id IS NULL THEN 'absent' ELSE 'unverified' END";
 
 #[cfg(test)]
 mod tests {
@@ -148,5 +246,83 @@ mod tests {
         assert_eq!(reason, "read: i/o error", "the latest failure wins");
         assert_eq!(kind, "io");
         assert_eq!(at, 200);
+    }
+
+    #[test]
+    fn completeness_splits_absent_unverified_and_unreadable_directories() {
+        let t = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(&t.path().join("c.db")).unwrap();
+        cat.upsert_volume(&crate::catalog::models::Volume {
+            volume_id: "v".into(),
+            label: "V".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
+        // A file that IS catalogued but could not be re-read -> unverified (its hash may be stale).
+        cat.upsert_file(
+            &crate::catalog::models::NewFile {
+                volume_id: "v".into(),
+                relative_path: "have.pst".into(),
+                filename: "have.pst".into(),
+                extension: "pst".into(),
+                size_bytes: 10,
+                content_hash: "H".into(),
+                created_time: Some(1),
+                modified_time: Some(1),
+                accessed_time: Some(1),
+                // NOTE: Category lives in `crate::category`, not in `catalog::models`.
+                category: crate::category::Category::Other,
+                container_chain: None,
+            },
+            1,
+        )
+        .unwrap();
+
+        cat.log_scan_error(Some("v"), "have.pst", "read: locked", "read", "locked", 10)
+            .unwrap();
+        cat.log_scan_error(Some("v"), "gone.jpg", "read: i/o", "read", "io", 10)
+            .unwrap();
+        cat.log_scan_error(
+            Some("v"),
+            "sysvol",
+            "walk: denied",
+            "walk",
+            "permission",
+            10,
+        )
+        .unwrap();
+        // A legacy row from before classification existed: phase IS NULL. It must still be counted.
+        cat.conn
+            .execute(
+                "INSERT INTO scan_errors(volume_id,path,reason,occurred_at) VALUES ('v','old.bin','read: ?',5)",
+                [],
+            )
+            .unwrap();
+
+        let c = cat.volume_completeness("v").unwrap();
+        assert_eq!(c.unverified, 1, "have.pst is catalogued but unverified");
+        assert_eq!(c.absent, 2, "gone.jpg and the legacy old.bin are absent");
+        assert_eq!(
+            c.unreadable_dirs, 1,
+            "a walk error is never counted as a missing file"
+        );
+        assert!(!c.is_complete());
+
+        let rows = cat
+            .volume_scan_errors("v", Some("absent"), None, 50, 0)
+            .unwrap();
+        let paths: Vec<_> = rows.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, vec!["gone.jpg", "old.bin"], "ordered by path");
+    }
+
+    #[test]
+    fn a_volume_with_no_errors_is_complete() {
+        let t = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(&t.path().join("c.db")).unwrap();
+        let c = cat.volume_completeness("v").unwrap();
+        assert_eq!((c.absent, c.unverified, c.unreadable_dirs), (0, 0, 0));
+        assert!(c.is_complete(), "no errors means complete, not unknown");
     }
 }
