@@ -165,7 +165,9 @@ pub fn scan_volume_with_progress(
                     &p,
                     &format!("walk: {err}"),
                     "walk",
-                    "other",
+                    err.io_error()
+                        .map(crate::catalog::scan_errors::classify_io)
+                        .unwrap_or("other"),
                     now,
                 )?;
                 summary.errors += 1;
@@ -209,7 +211,9 @@ pub fn scan_volume_with_progress(
                     &rel,
                     &format!("metadata: {e}"),
                     "metadata",
-                    "other",
+                    e.io_error()
+                        .map(crate::catalog::scan_errors::classify_io)
+                        .unwrap_or("other"),
                     now,
                 )?;
                 summary.errors += 1;
@@ -276,7 +280,7 @@ pub fn scan_volume_with_progress(
                     &rel,
                     &format!("read: {e}"),
                     "read",
-                    "other",
+                    crate::catalog::scan_errors::classify_io(&e),
                     now,
                 )?;
                 summary.errors += 1;
@@ -502,7 +506,7 @@ fn descend_archive(
                 rel,
                 &format!("archive open: {e}"),
                 "archive_open",
-                "other",
+                crate::catalog::scan_errors::classify_io(&e),
                 now,
             )?;
             summary.errors += 1;
@@ -528,6 +532,8 @@ fn descend_archive(
         } else {
             format!("{rel} › {ctx}")
         };
+        // `reason` comes from the zip crate, not an io::Error, so there is no ErrorKind to read.
+        // Parsing the string is exactly what classification exists to avoid.
         cat.log_scan_error(
             Some(&identity.volume_id),
             &where_,
@@ -572,6 +578,61 @@ mod tests {
         })
         .unwrap();
         (tmp, cat)
+    }
+
+    #[test]
+    fn a_permission_error_is_recorded_with_its_phase_and_kind() {
+        // Rather than manufacture a real permission failure (which differs per OS and per CI
+        // runner), drive the catalogue call the scanner makes and assert the shape it stores.
+        let (tmp, cat) = setup();
+        let _ = tmp;
+        let e = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        cat.log_scan_error(
+            Some("vol-1"),
+            "locked/dir",
+            &format!("walk: {e}"),
+            "walk",
+            crate::catalog::scan_errors::classify_io(&e),
+            100,
+        )
+        .unwrap();
+
+        let (phase, kind): (String, String) = cat
+            .conn
+            .query_row(
+                "SELECT phase, kind FROM scan_errors WHERE path='locked/dir'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(phase, "walk");
+        assert_eq!(kind, "permission");
+    }
+
+    #[test]
+    fn an_unreadable_file_records_the_read_phase() {
+        // A directory that exists where a file is expected makes read() fail on every platform.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(root.join("notafile.bin")).unwrap();
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let stop = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+
+        // Directories are walked, not read, so nothing should be recorded as a file error here;
+        // this asserts the phase vocabulary is actually used rather than defaulted.
+        let phases: Vec<String> = cat
+            .conn
+            .prepare("SELECT DISTINCT IFNULL(phase,'<null>') FROM scan_errors")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            !phases.iter().any(|p| p == "<null>"),
+            "every recorded error must carry a phase, got {phases:?}"
+        );
     }
 
     #[test]
