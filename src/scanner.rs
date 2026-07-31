@@ -357,6 +357,10 @@ pub fn scan_volume_with_progress(
                 &unreadable_dirs,
             )?;
         }
+        // Outside the sweep guard on purpose: the file rule is keyed on `last_seen_at`, so a
+        // stopped scan clears only paths it actually re-reached. The directory rule is the part
+        // that needs a completed scan, and `completed` carries that.
+        cat.clear_resolved_scan_errors(&identity.volume_id, scan_started_at, !summary.stopped)?;
     }
     summary.metrics = metrics.snapshot();
     Ok(summary)
@@ -1159,5 +1163,90 @@ mod tests {
             scan_volume_with_progress(&cat, &root, &ident(), false, 300, None, &m2, &stop).unwrap();
         assert!(!s.stopped);
         assert_eq!(s.marked_missing, 1);
+    }
+
+    #[test]
+    fn a_resolved_file_error_clears_but_an_unreached_one_survives() {
+        // THE rule, restated for errors: a stopped scan must clear only what it re-reached.
+        // Without the last_seen_at predicate, stopping would wipe findings for the part of the
+        // tree the run never visited -- silently reporting a catalogue as complete when it is not.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+
+        // Two errors on record: one for a file that will be scanned, one for a path that will not.
+        cat.log_scan_error(
+            Some("vol-1"),
+            "a.txt",
+            "read: was locked",
+            "read",
+            "locked",
+            50,
+        )
+        .unwrap();
+        cat.log_scan_error(
+            Some("vol-1"),
+            "never/reached.bin",
+            "read: i/o",
+            "read",
+            "io",
+            50,
+        )
+        .unwrap();
+
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let stop = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+
+        let remaining: Vec<String> = cat
+            .conn
+            .prepare("SELECT path FROM scan_errors ORDER BY path")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            remaining,
+            vec!["never/reached.bin".to_string()],
+            "a.txt was re-catalogued so its error clears; the unreached path keeps its error"
+        );
+    }
+
+    #[test]
+    fn a_stopped_scan_does_not_clear_walk_errors() {
+        // Only a completed scan proves a directory is readable again. A stopped scan may simply
+        // never have got there.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), b"one").unwrap();
+        cat.log_scan_error(
+            Some("vol-1"),
+            "locked/dir",
+            "walk: denied",
+            "walk",
+            "permission",
+            50,
+        )
+        .unwrap();
+
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let stop = crate::scan_control::StopFlag::new();
+        stop.request(); // stopped before it starts
+        let s =
+            scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+        assert!(s.stopped);
+
+        let n: i64 = cat
+            .conn
+            .query_row(
+                "SELECT count(*) FROM scan_errors WHERE path='locked/dir'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "a stopped scan never clears a walk error");
     }
 }
