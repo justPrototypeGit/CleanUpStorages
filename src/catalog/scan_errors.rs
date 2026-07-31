@@ -187,9 +187,11 @@ pub struct ScanErrorRow {
     pub bucket: String,
 }
 
-/// `IFNULL(phase,'')` throughout: rows written before classification have a NULL phase, and
-/// `phase <> 'walk'` is NULL for those -- which would drop them from *both* buckets and
-/// under-report the very thing this feature measures.
+// IFNULL for consistency with the IN-list predicates in clear_resolved_scan_errors, where it
+// IS load-bearing: `NULL IN (...)` is NULL, so a legacy row would never match and could never
+// be cleared. Inside this CASE chain it is belt-and-braces -- SQL already falls through on a
+// NULL condition -- but the two must agree on how a NULL phase is read, or the audit and the
+// self-heal would disagree about the same row.
 const BUCKET_SQL: &str = "CASE WHEN IFNULL(e.phase,'')='walk' THEN 'unreadable_dir' \
                                WHEN f.id IS NULL THEN 'absent' ELSE 'unverified' END";
 
@@ -315,6 +317,65 @@ mod tests {
             .unwrap();
         let paths: Vec<_> = rows.iter().map(|r| r.path.as_str()).collect();
         assert_eq!(paths, vec!["gone.jpg", "old.bin"], "ordered by path");
+    }
+
+    /// The ordering trap the task calls out by name: a `walk` row whose path happens to also be a
+    /// catalogued file. Get the CASE branches the wrong way round and this silently reports an
+    /// unopenable directory as a merely-stale file instead.
+    #[test]
+    fn a_walk_error_is_unreadable_dir_even_when_its_path_is_also_a_catalogued_file() {
+        let t = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(&t.path().join("c.db")).unwrap();
+        cat.upsert_volume(&crate::catalog::models::Volume {
+            volume_id: "v".into(),
+            label: "V".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
+        // A files row sharing the exact path the walk error is recorded against.
+        cat.upsert_file(
+            &crate::catalog::models::NewFile {
+                volume_id: "v".into(),
+                relative_path: "coincidence".into(),
+                filename: "coincidence".into(),
+                extension: "".into(),
+                size_bytes: 10,
+                content_hash: "H".into(),
+                created_time: Some(1),
+                modified_time: Some(1),
+                accessed_time: Some(1),
+                category: crate::category::Category::Other,
+                container_chain: None,
+            },
+            1,
+        )
+        .unwrap();
+        cat.log_scan_error(
+            Some("v"),
+            "coincidence",
+            "walk: denied",
+            "walk",
+            "permission",
+            10,
+        )
+        .unwrap();
+
+        let c = cat.volume_completeness("v").unwrap();
+        assert_eq!(
+            c.unreadable_dirs, 1,
+            "walk always wins, regardless of a files match"
+        );
+        assert_eq!(
+            c.unverified, 0,
+            "must not be miscounted as a stale-hash file"
+        );
+        assert_eq!(c.absent, 0);
+
+        let rows = cat.volume_scan_errors("v", None, None, 50, 0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].bucket, "unreadable_dir");
     }
 
     #[test]
