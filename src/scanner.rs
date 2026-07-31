@@ -17,6 +17,11 @@ pub trait Progress: Send + Sync {
     fn on_skipped(&self);
     fn on_error(&self);
     fn on_archive_entry(&self);
+    /// Totals from the counting pass. Never called when counting is skipped, so a percentage is
+    /// absent rather than wrong.
+    fn on_total(&self, _files: u64, _bytes: u64) {}
+    /// Bytes of the file just finished, hashed or skipped. Drives the rate and the ETA.
+    fn on_bytes(&self, _bytes: u64) {}
 }
 
 /// Outcome of one `scan_volume` pass.
@@ -236,6 +241,9 @@ pub fn scan_volume_with_progress(
             summary.skipped += 1;
             metrics.add_bytes_skipped(size);
             if let Some(p) = progress {
+                p.on_bytes(size as u64);
+            }
+            if let Some(p) = progress {
                 p.on_skipped();
             }
             in_batch += 1;
@@ -264,6 +272,9 @@ pub fn scan_volume_with_progress(
             }
         };
         metrics.add_bytes_hashed(size);
+        if let Some(p) = progress {
+            p.on_bytes(size as u64);
+        }
 
         let ext = path
             .extension()
