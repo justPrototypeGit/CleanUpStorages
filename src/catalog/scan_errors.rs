@@ -47,6 +47,45 @@ impl Catalog {
         )?;
         Ok(())
     }
+
+    /// Drop errors this scan resolved. Returns how many rows went.
+    ///
+    /// Two rules, because two kinds of path:
+    ///
+    /// * `metadata`/`read`/`archive_open` store a real file path, so an error clears when that
+    ///   path was re-seen this scan. Keyed on `last_seen_at` -- the same predicate that makes the
+    ///   missing-file sweep safe -- so **a stopped scan cannot over-clear**: a path the walk never
+    ///   reached never had its stamp bumped.
+    /// * `walk` stores a directory and `archive_entry` stores a composite `archive › inner` path;
+    ///   neither exists in `files`. Only a *completed* scan proves the location was visited and is
+    ///   readable again, so those clear only when `completed` and not re-recorded this run.
+    pub fn clear_resolved_scan_errors(
+        &self,
+        volume_id: &str,
+        scan_started_at: i64,
+        completed: bool,
+    ) -> anyhow::Result<usize> {
+        let mut removed = self.conn.execute(
+            "DELETE FROM scan_errors
+              WHERE volume_id=?1
+                AND IFNULL(phase,'') IN ('metadata','read','archive_open')
+                AND path IN (SELECT relative_path FROM files
+                              WHERE volume_id=?1 AND last_seen_at >= ?2)",
+            params![volume_id, scan_started_at],
+        )?;
+
+        if completed {
+            // The upsert refreshes `occurred_at` to this scan's stamp, so anything still older
+            // was not re-recorded -- the directory opened cleanly this time.
+            removed += self.conn.execute(
+                "DELETE FROM scan_errors
+                  WHERE volume_id=?1 AND IFNULL(phase,'') IN ('walk','archive_entry')
+                    AND occurred_at < ?2",
+                params![volume_id, scan_started_at],
+            )?;
+        }
+        Ok(removed)
+    }
 }
 
 #[cfg(test)]
