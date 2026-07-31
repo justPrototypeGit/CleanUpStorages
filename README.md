@@ -68,7 +68,7 @@ Other verbs:
 
 | Command | What it does |
 | --- | --- |
-| `scan <path> [--force]` | Crawl a drive/folder, hash files, update the catalog |
+| `scan <path> [--force] [--no-count]` | Crawl a drive/folder, hash files, update the catalog |
 | `search <query> [--category] [--volume] [--status]` | Search the catalog (works for unplugged drives) |
 | `status` | Catalog summary |
 | `duplicates` | List duplicate groups, with ids to act on |
@@ -80,6 +80,33 @@ Other verbs:
 | `browse [--no-open]` | Local web UI |
 
 Add `-v` for verbose logs; `RUST_LOG` overrides.
+
+### Stopping and resuming a scan
+
+Cataloguing a full drive takes hours, so a scan can be stopped at any time — **Ctrl+C**, or the
+**Stop** button on the web UI's Scan page. It finishes the file it is on, commits what it has, and
+**never marks anything missing**. Re-run the same command to continue: already-catalogued files are
+skipped without re-reading them.
+
+There is no separate "resume" command and nothing to clean up. The skip is what makes this work — a
+re-run stats each file and checks one index, rather than re-hashing it:
+
+| same folder, 225,285 files / 124.2 GB | wall |
+| --- | --- |
+| first scan (hashes every byte) | **1.01 h** |
+| re-run over the same catalogued files | **25 s** |
+
+Roughly 145x cheaper than the scan it replaces — which is why there is no checkpoint file to go stale.
+
+Before hashing starts, the scan counts the tree so it can show a percentage and an ETA:
+
+```
+Counting… 148,746 files (121 GB)
+Scanning  38% · 56,412/148,746 files · 46.1/121 GB · 34.8 MB/s · ETA 1h 42m
+```
+
+Pass `--no-count` to skip that pass and start hashing immediately. You still get live counters and a
+rate; the percentage and ETA are simply absent rather than guessed.
 
 ### Make scans ~30% faster on Windows (worth doing before a big scan)
 

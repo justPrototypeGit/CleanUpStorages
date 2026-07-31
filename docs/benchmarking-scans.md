@@ -64,6 +64,52 @@ The incremental skip means a second scan of already-catalogued files exercises `
 Runs are persisted in the `scan_runs` table and survive restarts, so a multi-day scan's numbers are
 not lost. Note in the issue which condition each figure was taken under.
 
+## Stopping and resuming a scan (#5, #25)
+
+A scan can be stopped with Ctrl+C or the web UI's Stop button. Resuming is just re-running the same
+command — the incremental skip fast-forwards over what is already catalogued, which is why no walk
+position is checkpointed.
+
+Measured on the same folder used everywhere else in this document (225,285 files, 124.2 GB):
+
+| run | wall | what it did |
+| --- | --- | --- |
+| first scan, cold | **1.01 h** | hashed every byte |
+| re-run over catalogued files | **25 s** | 0 hashed, 225,285 unchanged |
+
+About **145x cheaper than the scan it replaces**. That gap is the whole argument against checkpointed
+resume: persisting a walk position would buy seconds while introducing a file that can disagree with
+reality (directory iteration order is not guaranteed stable between runs).
+
+### The counting pass is free warm and expensive cold
+
+The pre-scan counting pass (metadata only — `readdir` + `stat`, no file contents) is what makes the
+percentage and ETA possible. Its cost is entirely **trap #2 above**, and the difference is dramatic:
+
+| counting pass over 225,285 files | wall |
+| --- | --- |
+| warm (directory metadata cached) | **~1 s** |
+| cold, drive spun down, under concurrent load | **~8.6 min** (upper bound, see caveat) |
+
+Warm, it is free: an A/B of the same re-scan with and without `--no-count` came out 23.7 s vs 25.0 s
+— the run *with* counting was marginally faster, so the difference is noise, not signal.
+
+**Caveat on the cold figure:** it was taken while a separate process was recursing the same drive, so
+it is a contaminated upper bound, not a clean benchmark. Treat it as "a cold metadata traversal of a
+large tree on an external HDD costs minutes", not as a precise number. Measuring it properly needs a
+reboot or a remount between runs.
+
+The practical consequence, and the reason `--no-count` exists:
+
+- **First scan of a folder** — keep the counting pass. Even at the cold figure it is a single-digit
+  percentage of a multi-hour hashing run, and it buys a real percentage and ETA.
+- **Resuming, or any run that will mostly skip** — consider `--no-count`. The counting pass can cost
+  more than the fast-forward it is estimating.
+
+Note also that during a fast-forward the ETA is erratic by nature (observed swinging 1m 26s → 3m 05s
+→ 17s): skipped bytes complete in bursts at several GB/s, so the rolling rate has nothing steady to
+lock onto. The ETA is meaningful while hashing, which is the case it was built for.
+
 ## Parallel scanning was tried and abandoned (#23)
 
 A walker → workers → writer pipeline was fully built, reviewed and measured against this drive. It
