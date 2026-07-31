@@ -198,20 +198,6 @@ impl Catalog {
         Ok(n)
     }
 
-    pub fn log_scan_error(
-        &self,
-        volume_id: Option<&str>,
-        path: &str,
-        reason: &str,
-        now: i64,
-    ) -> anyhow::Result<()> {
-        self.conn.execute(
-            "INSERT INTO scan_errors(volume_id, path, reason, occurred_at) VALUES (?1,?2,?3,?4)",
-            params![volume_id, path, reason, now],
-        )?;
-        Ok(())
-    }
-
     /// The volume's last_seen_at (updated on every scan), if the volume exists.
     pub fn volume_last_seen(&self, volume_id: &str) -> anyhow::Result<Option<i64>> {
         let row = self.conn.query_row(
@@ -783,7 +769,7 @@ mod tests {
         assert_eq!(cat.volume_last_seen("v").unwrap(), Some(42));
         assert_eq!(cat.volume_last_seen("nope").unwrap(), None);
         assert!(!cat.volume_has_scan_errors("v").unwrap());
-        cat.log_scan_error(Some("v"), "some/path", "permission denied", 9)
+        cat.log_scan_error(Some("v"), "some/path", "permission denied", "read", "io", 9)
             .unwrap();
         assert!(cat.volume_has_scan_errors("v").unwrap());
     }

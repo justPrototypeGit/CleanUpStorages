@@ -160,7 +160,14 @@ pub fn scan_volume_with_progress(
                             .replace('\\', "/")
                     })
                     .unwrap_or_else(|| "<unknown>".to_string());
-                cat.log_scan_error(Some(&identity.volume_id), &p, &format!("walk: {err}"), now)?;
+                cat.log_scan_error(
+                    Some(&identity.volume_id),
+                    &p,
+                    &format!("walk: {err}"),
+                    "walk",
+                    "other",
+                    now,
+                )?;
                 summary.errors += 1;
                 if let Some(pr) = progress {
                     pr.on_error();
@@ -201,6 +208,8 @@ pub fn scan_volume_with_progress(
                     Some(&identity.volume_id),
                     &rel,
                     &format!("metadata: {e}"),
+                    "metadata",
+                    "other",
                     now,
                 )?;
                 summary.errors += 1;
@@ -262,7 +271,14 @@ pub fn scan_volume_with_progress(
         let hash = match hashed {
             Ok(h) => h,
             Err(e) => {
-                cat.log_scan_error(Some(&identity.volume_id), &rel, &format!("read: {e}"), now)?;
+                cat.log_scan_error(
+                    Some(&identity.volume_id),
+                    &rel,
+                    &format!("read: {e}"),
+                    "read",
+                    "other",
+                    now,
+                )?;
                 summary.errors += 1;
                 if let Some(p) = progress {
                     p.on_error();
@@ -485,6 +501,8 @@ fn descend_archive(
                 Some(&identity.volume_id),
                 rel,
                 &format!("archive open: {e}"),
+                "archive_open",
+                "other",
                 now,
             )?;
             summary.errors += 1;
@@ -510,7 +528,14 @@ fn descend_archive(
         } else {
             format!("{rel} › {ctx}")
         };
-        cat.log_scan_error(Some(&identity.volume_id), &where_, reason, now)?;
+        cat.log_scan_error(
+            Some(&identity.volume_id),
+            &where_,
+            reason,
+            "archive_entry",
+            "other",
+            now,
+        )?;
         summary.errors += 1;
         if let Some(p) = progress {
             p.on_error();
