@@ -205,12 +205,27 @@ impl CliProgress {
                 total_files: None,
                 total_bytes: None,
                 eta: EtaTracker::new(),
-                last_paint: Instant::now() - std::time::Duration::from_secs(10),
+                // Backdated so the first file paints immediately rather than after the interval.
+                // `checked_sub` because `Instant - Duration` panics when it would land before the
+                // platform's earliest instant — reachable only seconds after boot, but a panic in a
+                // constructor is not worth the shorter line.
+                last_paint: Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(10))
+                    .unwrap_or_else(Instant::now),
             }),
             // Progress goes to stderr so redirecting stdout stays clean; carriage returns are only
             // meaningful on a terminal.
             is_tty: std::io::IsTerminal::is_terminal(&std::io::stderr()),
         }
+    }
+
+    /// The state, recovered rather than propagated if a previous holder panicked.
+    ///
+    /// `unwrap()` here would let a panic while painting poison the lock and abort the *next* file,
+    /// killing a multi-day scan over a cosmetic counter. Progress is display data: it must never be
+    /// able to take down the work it is describing.
+    fn state(&self) -> std::sync::MutexGuard<'_, CliProgressState> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn paint(&self, st: &mut CliProgressState) {
@@ -274,24 +289,24 @@ impl Default for CliProgress {
 
 impl crate::scanner::Progress for CliProgress {
     fn on_hashed(&self) {
-        let mut st = self.inner.lock().unwrap();
+        let mut st = self.state();
         st.files += 1;
         self.paint(&mut st);
     }
     fn on_skipped(&self) {
-        let mut st = self.inner.lock().unwrap();
+        let mut st = self.state();
         st.files += 1;
         self.paint(&mut st);
     }
     fn on_error(&self) {}
     fn on_archive_entry(&self) {}
     fn on_total(&self, files: u64, bytes: u64) {
-        let mut st = self.inner.lock().unwrap();
+        let mut st = self.state();
         st.total_files = Some(files);
         st.total_bytes = Some(bytes);
     }
     fn on_bytes(&self, bytes: u64) {
-        let mut st = self.inner.lock().unwrap();
+        let mut st = self.state();
         st.bytes += bytes;
         st.eta.record(bytes);
     }
@@ -310,14 +325,32 @@ mod tests {
         assert!(a.is_requested(), "clones must observe the same flag");
     }
 
+    /// `CLI_STOP` is process-global, so the tests that write it must not run concurrently.
+    static GLOBAL_GUARD: Mutex<()> = Mutex::new(());
+
     #[test]
     fn a_plain_flag_ignores_the_cli_global() {
         // Only the CLI's flag watches the global; a web job must not be stopped by it.
+        let _g = GLOBAL_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let f = StopFlag::new();
         CLI_STOP.store(true, Ordering::SeqCst);
         let observed = f.is_requested();
         CLI_STOP.store(false, Ordering::SeqCst); // restore for other tests
         assert!(!observed, "a per-job flag must not honour the CLI global");
+    }
+
+    #[test]
+    fn the_cli_flag_honours_the_global_the_signal_handler_sets() {
+        // The signal handler can only reach an atomic, so this load is the entire path from Ctrl+C
+        // to the scan. Without this test, `watch_global: false` would pass every other test while
+        // making Ctrl+C silently do nothing for the length of a multi-day scan.
+        let _g = GLOBAL_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let f = StopFlag::watching_global();
+        assert!(!f.is_requested(), "clean before the handler fires");
+        CLI_STOP.store(true, Ordering::SeqCst);
+        let observed = f.is_requested();
+        CLI_STOP.store(false, Ordering::SeqCst); // restore for other tests
+        assert!(observed, "the CLI flag must observe the handler's store");
     }
 
     #[test]

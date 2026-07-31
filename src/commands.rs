@@ -78,6 +78,12 @@ pub fn cmd_scan(
     if !no_count {
         eprintln!("Counting files…");
         let totals = scanner::count_tree(path, &stop);
+        // A stop during counting leaves a partial total. Publishing it would show a percentage that
+        // is wrong rather than absent, so stop here instead: nothing has been scanned yet.
+        if stop.is_requested() {
+            println!("STOPPED while counting — nothing was scanned.");
+            return Ok(());
+        }
         eprintln!(
             "Counting… {} files ({:.1} GB)",
             totals.files,
