@@ -175,6 +175,37 @@ impl Completeness {
     pub fn is_complete(&self) -> bool {
         self.absent == 0 && self.unverified == 0 && self.unreadable_dirs == 0
     }
+
+    /// One line for the CLI. Prints even when clean: an absent warning only means something if
+    /// the user knows the check ran.
+    pub fn summary_line(&self) -> String {
+        if self.is_complete() {
+            return "Completeness: complete.".to_string();
+        }
+        let mut parts = Vec::new();
+        if self.absent > 0 {
+            parts.push(format!(
+                "{} file{} NOT catalogued",
+                self.absent,
+                if self.absent == 1 { "" } else { "s" }
+            ));
+        }
+        if self.unverified > 0 {
+            parts.push(format!("{} unverified", self.unverified));
+        }
+        if self.unreadable_dirs > 0 {
+            parts.push(format!(
+                "{} unreadable director{} (contents unknown)",
+                self.unreadable_dirs,
+                if self.unreadable_dirs == 1 {
+                    "y"
+                } else {
+                    "ies"
+                }
+            ));
+        }
+        format!("Completeness: {}.", parts.join(", "))
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -385,5 +416,35 @@ mod tests {
         let c = cat.volume_completeness("v").unwrap();
         assert_eq!((c.absent, c.unverified, c.unreadable_dirs), (0, 0, 0));
         assert!(c.is_complete(), "no errors means complete, not unknown");
+    }
+
+    #[test]
+    fn the_summary_line_states_completeness_positively_when_clean() {
+        // Silence is not reassurance: the clean case must say so, or a user cannot tell "checked and
+        // fine" from "not checked".
+        let c = Completeness::default();
+        assert_eq!(c.summary_line(), "Completeness: complete.");
+    }
+
+    #[test]
+    fn the_summary_line_names_each_bucket_it_has() {
+        let c = Completeness {
+            absent: 12,
+            unverified: 35,
+            unreadable_dirs: 2,
+        };
+        assert_eq!(
+            c.summary_line(),
+            "Completeness: 12 files NOT catalogued, 35 unverified, 2 unreadable directories (contents unknown)."
+        );
+        let only_absent = Completeness {
+            absent: 1,
+            unverified: 0,
+            unreadable_dirs: 0,
+        };
+        assert_eq!(
+            only_absent.summary_line(),
+            "Completeness: 1 file NOT catalogued."
+        );
     }
 }
