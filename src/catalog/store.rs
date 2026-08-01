@@ -212,16 +212,6 @@ impl Catalog {
         }
     }
 
-    /// True if this volume has any recorded scan error.
-    pub fn volume_has_scan_errors(&self, volume_id: &str) -> anyhow::Result<bool> {
-        let n: i64 = self.conn.query_row(
-            "SELECT count(*) FROM scan_errors WHERE volume_id=?1",
-            params![volume_id],
-            |r| r.get(0),
-        )?;
-        Ok(n > 0)
-    }
-
     /// For the given content hashes, those with >1 active copy in the catalog, mapped to their
     /// active copy count. Bounded by the passed hashes (indexed on content_hash).
     pub fn duplicate_counts(
@@ -756,7 +746,7 @@ mod tests {
     }
 
     #[test]
-    fn volume_last_seen_and_scan_errors() {
+    fn volume_last_seen() {
         let (_t, cat) = open_tmp();
         cat.upsert_volume(&crate::catalog::models::Volume {
             volume_id: "v".into(),
@@ -768,10 +758,6 @@ mod tests {
         .unwrap();
         assert_eq!(cat.volume_last_seen("v").unwrap(), Some(42));
         assert_eq!(cat.volume_last_seen("nope").unwrap(), None);
-        assert!(!cat.volume_has_scan_errors("v").unwrap());
-        cat.log_scan_error(Some("v"), "some/path", "permission denied", "read", "io", 9)
-            .unwrap();
-        assert!(cat.volume_has_scan_errors("v").unwrap());
     }
 
     #[test]

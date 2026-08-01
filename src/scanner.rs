@@ -658,6 +658,104 @@ mod tests {
         assert_eq!(kind, "permission");
     }
 
+    // Regression for the false-"complete" bug: a file catalogued by an earlier scan, then unreadable
+    // on a re-scan, must land in `unverified` -- not have its own fresh error silently deleted by
+    // the same scan's self-heal, which would leave the catalogue reporting "complete" over a file
+    // whose stored hash was never re-verified. Drives a real scan twice (not the catalogue layer
+    // directly) so the reproduction matches what actually happens in production: `touch_seen` bumps
+    // `last_seen_at` to `now` on the error path, which equals `scan_started_at`.
+
+    #[cfg(windows)]
+    #[test]
+    fn a_file_that_becomes_locked_after_being_catalogued_is_unverified_not_complete() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        let victim = root.join("locked.bin");
+        std::fs::write(&victim, b"data").unwrap();
+
+        // First scan: the file is readable, so it gets catalogued normally.
+        let m1 = crate::scan_metrics::ScanMetrics::new();
+        let stop1 = crate::scan_control::StopFlag::new();
+        let s1 = scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m1, &stop1)
+            .unwrap();
+        assert_eq!(s1.errors, 0);
+
+        // Second scan: the file is now locked, so the re-read fails. `force=true` so the unchanged
+        // fast-path (which never re-reads) doesn't hide the point of the test.
+        let _held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&victim)
+            .unwrap();
+        let m2 = crate::scan_metrics::ScanMetrics::new();
+        let stop2 = crate::scan_control::StopFlag::new();
+        let s2 =
+            scan_volume_with_progress(&cat, &root, &ident(), true, 200, None, &m2, &stop2).unwrap();
+        assert_eq!(s2.errors, 1, "the scan itself must count the failure");
+
+        let c = cat.volume_completeness("vol-1").unwrap();
+        assert_eq!(
+            c.unverified, 1,
+            "the error the scan just recorded must not be erased by its own self-heal"
+        );
+        assert_eq!(c.absent, 0);
+        assert_eq!(c.unreadable_dirs, 0);
+        assert_ne!(
+            c.summary_line(),
+            "Completeness: complete.",
+            "a catalogue holding an unverified file must never report complete"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_becomes_unreadable_after_being_catalogued_is_unverified_not_complete() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        let victim = root.join("noperm.bin");
+        std::fs::write(&victim, b"data").unwrap();
+
+        // First scan: the file is readable, so it gets catalogued normally.
+        let m1 = crate::scan_metrics::ScanMetrics::new();
+        let stop1 = crate::scan_control::StopFlag::new();
+        let s1 = scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m1, &stop1)
+            .unwrap();
+        assert_eq!(s1.errors, 0);
+
+        // Second scan: the file is now unreadable, so the re-read fails. `force=true` so the
+        // unchanged fast-path (which never re-reads) doesn't hide the point of the test.
+        let orig_perms = std::fs::metadata(&victim).unwrap().permissions();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let m2 = crate::scan_metrics::ScanMetrics::new();
+        let stop2 = crate::scan_control::StopFlag::new();
+        let result = scan_volume_with_progress(&cat, &root, &ident(), true, 200, None, &m2, &stop2);
+
+        // Restore permissions before any assertion can early-return/panic, so the tempdir can
+        // still be cleaned up regardless of outcome.
+        std::fs::set_permissions(&victim, orig_perms).unwrap();
+        let s2 = result.unwrap();
+        assert_eq!(s2.errors, 1, "the scan itself must count the failure");
+
+        let c = cat.volume_completeness("vol-1").unwrap();
+        assert_eq!(
+            c.unverified, 1,
+            "the error the scan just recorded must not be erased by its own self-heal"
+        );
+        assert_eq!(c.absent, 0);
+        assert_eq!(c.unreadable_dirs, 0);
+        assert_ne!(
+            c.summary_line(),
+            "Completeness: complete.",
+            "a catalogue holding an unverified file must never report complete"
+        );
+    }
+
     #[test]
     fn scans_hashes_and_reindex_skips() {
         let (tmp, cat) = setup();
