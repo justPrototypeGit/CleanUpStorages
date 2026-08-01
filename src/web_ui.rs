@@ -1028,7 +1028,7 @@ document.addEventListener('toggle', async e=>{
     body.innerHTML=d.rows.map(x=>`<div class="erow">
         <span class="tag">${esc(x.bucket==='unreadable_dir'?'folder':x.bucket)}</span>
         <span class="epath">${esc(x.path)}</span>
-        <span class="mut">${esc(x.kind||'recorded before classification')}</span>
+        <span class="mut" title="${esc(x.kind||'recorded before classification')}">${esc(x.reason||'recorded before classification')}</span>
       </div>`).join('')
       + (d.rows.length>=200?'<div class="mut">showing the first 200</div>':'');
   }catch(err){ body.textContent='Could not load the error list.'; }

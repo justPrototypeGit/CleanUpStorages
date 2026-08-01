@@ -66,6 +66,23 @@ impl Catalog {
     /// out to match a re-seen file, otherwise the completed-scan rule. Leaving `''` out of both
     /// lists (as an earlier version of this function did) makes every legacy row immortal --
     /// never delete without one of `''` or {phase already known to be one of the two buckets}.
+    ///
+    /// The file rule also requires `occurred_at < scan_started_at`. Without it, an error THIS scan
+    /// just recorded is indistinguishable from one it resolved: `metadata`/`read` errors call
+    /// `touch_seen`, and `archive_open` errors follow an `upsert_file` that already ran, so either
+    /// way `last_seen_at` is bumped to `now == scan_started_at` for the very path that just failed.
+    /// The unguarded rule would then delete the error it wrote seconds earlier, making the
+    /// `unverified` bucket unreachable and the catalogue report "complete" over a file whose stored
+    /// hash was never re-verified -- the exact false reassurance this feature exists to prevent. An
+    /// error re-recorded by this scan is a live problem, not a resolved one; only an error from
+    /// *before* this scan started, whose path was then re-seen, has actually been resolved.
+    ///
+    /// Known limitation, not fixed here: an error for a path that is never catalogued (so no
+    /// `files` row exists) and that the user then deletes or renames has no rule that can ever
+    /// clear it -- nothing re-walks a path that no longer exists, and the file rule only matches
+    /// paths present in `files`. It persists, over-reporting "not catalogued" forever, until
+    /// `forget`. That errs in the safe direction (never falsely complete) and fixing it would need
+    /// a filesystem check at clear time, so it is left as-is.
     pub fn clear_resolved_scan_errors(
         &self,
         volume_id: &str,
@@ -76,6 +93,7 @@ impl Catalog {
             "DELETE FROM scan_errors
               WHERE volume_id=?1
                 AND IFNULL(phase,'') IN ('metadata','read','archive_open','')
+                AND occurred_at < ?2
                 AND path IN (SELECT relative_path FROM files
                               WHERE volume_id=?1 AND last_seen_at >= ?2)",
             params![volume_id, scan_started_at],

@@ -130,8 +130,9 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
         DELETE FROM scan_errors WHERE id NOT IN (
             SELECT MAX(id) FROM scan_errors GROUP BY volume_id, path
         );
-        -- NULL volume_id rows are neither deduped nor constrained (SQLite treats NULLs as
-        -- distinct). The scanner always supplies a volume id, so this affects nothing real.
+        -- NULL volume_id rows ARE deduped above -- GROUP BY treats NULLs as equal -- but are not
+        -- constrained by the UNIQUE index below (SQLite treats NULLs as distinct there). The
+        -- scanner always supplies a volume id, so this affects nothing real.
         CREATE UNIQUE INDEX IF NOT EXISTS idx_scan_errors_identity
             ON scan_errors(volume_id, path);
         CREATE INDEX IF NOT EXISTS idx_scan_errors_volume ON scan_errors(volume_id);
