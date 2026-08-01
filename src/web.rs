@@ -2588,6 +2588,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drives_page_is_self_contained_and_wired() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let (_t, _db, state) = seed_dupes();
+        let app = build_router_with(state);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/drives")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(res.into_body(), 2_000_000)
+            .await
+            .unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+
+        // The panel is the only way to see WHICH files are missing; a page without it leaves the
+        // completeness answer unreachable from the browser.
+        assert!(body.contains("/api/volumes/"));
+        assert!(body.contains("completeness"));
+        // Self-contained: no CDN, no runtime font fetch. Asserted for every page in this project.
+        assert!(!body.contains("http://") && !body.contains("https://"));
+    }
+
+    #[tokio::test]
     async fn console_page_is_self_contained_and_maps_commands() {
         use axum::body::Body;
         use axum::http::Request;
