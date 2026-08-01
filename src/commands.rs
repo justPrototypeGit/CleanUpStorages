@@ -122,6 +122,10 @@ pub fn cmd_scan(
                 "Done: {} hashed, {} unchanged, {} errors, {} newly missing, {} archive entries.",
                 s.hashed, s.skipped, s.errors, s.marked_missing, s.archive_entries
             );
+            println!(
+                "{}",
+                cat.volume_completeness(&identity.volume_id)?.summary_line()
+            );
             print!("{}", s.metrics.report());
         }
     }
@@ -190,6 +194,13 @@ pub fn cmd_status() -> anyhow::Result<()> {
             bytes / (1024 * 1024),
             recoverable / (1024 * 1024)
         );
+        let c = cat.volume_completeness(&id)?;
+        if !c.is_complete() {
+            println!(
+                "     ⚠ {}",
+                c.summary_line().trim_start_matches("Completeness: ")
+            );
+        }
     }
     Ok(())
 }
