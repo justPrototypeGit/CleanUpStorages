@@ -617,6 +617,33 @@ mod tests {
         (tmp, cat)
     }
 
+    /// Build a stored (uncompressed) zip in memory, for tests that write archive bytes to disk.
+    fn make_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zw = zip::ZipWriter::new(&mut buf);
+            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, bytes) in files {
+                zw.start_file(*name, opts).unwrap();
+                std::io::Write::write_all(&mut zw, bytes).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    /// The status of the one archive entry with this filename, catalogued anywhere.
+    fn status_of(cat: &Catalog, name: &str) -> String {
+        cat.conn
+            .query_row(
+                "SELECT status FROM files WHERE filename=?1 AND container_chain IS NOT NULL",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
     // A real scan over a file that genuinely fails to read, asserting the scanner itself (not the
     // catalogue layer) records the correct `kind` for its `"read"` call site. Platform-gated because
     // the honest way to make a read fail differs per OS, and CI runs both Windows and macOS.
@@ -1565,36 +1592,11 @@ mod tests {
         // A plain "was the archive missing" boolean cannot tell gone.txt (removed BEFORE the
         // archive went missing) apart from a.txt (missing only because it went missing WITH the
         // archive) -- both revive. The floor must let only a.txt come back.
-        fn make_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
-            let mut buf = std::io::Cursor::new(Vec::new());
-            {
-                let mut zw = zip::ZipWriter::new(&mut buf);
-                let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
-                    .compression_method(zip::CompressionMethod::Stored);
-                for (name, bytes) in files {
-                    zw.start_file(*name, opts).unwrap();
-                    std::io::Write::write_all(&mut zw, bytes).unwrap();
-                }
-                zw.finish().unwrap();
-            }
-            buf.into_inner()
-        }
-
         let (tmp, cat) = setup();
         let root = tmp.path().join("drive");
         std::fs::create_dir_all(&root).unwrap();
         let bundle_path = root.join("bundle.zip");
         let parked_path = tmp.path().join("bundle.zip.parked");
-
-        let status_of = |name: &str| -> String {
-            cat.conn
-                .query_row(
-                    "SELECT status FROM files WHERE filename=?1 AND container_chain IS NOT NULL",
-                    [name],
-                    |r| r.get(0),
-                )
-                .unwrap()
-        };
 
         // t=100: both entries present.
         std::fs::write(
@@ -1605,8 +1607,8 @@ mod tests {
         let m1 = crate::scan_metrics::ScanMetrics::new();
         let stop1 = crate::scan_control::StopFlag::new();
         scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m1, &stop1).unwrap();
-        assert_eq!(status_of("a.txt"), "active");
-        assert_eq!(status_of("gone.txt"), "active");
+        assert_eq!(status_of(&cat, "a.txt"), "active");
+        assert_eq!(status_of(&cat, "gone.txt"), "active");
 
         // t=200: rewritten without gone.txt -- a real content change, so it redescends (the size
         // differs, which alone fails the skip check regardless of mtime resolution).
@@ -1614,9 +1616,9 @@ mod tests {
         let m2 = crate::scan_metrics::ScanMetrics::new();
         let stop2 = crate::scan_control::StopFlag::new();
         scan_volume_with_progress(&cat, &root, &ident(), false, 200, None, &m2, &stop2).unwrap();
-        assert_eq!(status_of("a.txt"), "active");
+        assert_eq!(status_of(&cat, "a.txt"), "active");
         assert_eq!(
-            status_of("gone.txt"),
+            status_of(&cat, "gone.txt"),
             "missing",
             "gone.txt was genuinely removed from the archive's content"
         );
@@ -1626,8 +1628,8 @@ mod tests {
         let m3 = crate::scan_metrics::ScanMetrics::new();
         let stop3 = crate::scan_control::StopFlag::new();
         scan_volume_with_progress(&cat, &root, &ident(), false, 300, None, &m3, &stop3).unwrap();
-        assert_eq!(status_of("a.txt"), "missing");
-        assert_eq!(status_of("gone.txt"), "missing");
+        assert_eq!(status_of(&cat, "a.txt"), "missing");
+        assert_eq!(status_of(&cat, "gone.txt"), "missing");
 
         // t=400: moved back byte-identical (same size, same mtime since it's the same underlying
         // file, never rewritten) -- the skip path fires and touches the archive's entries.
@@ -1637,15 +1639,90 @@ mod tests {
         scan_volume_with_progress(&cat, &root, &ident(), false, 400, None, &m4, &stop4).unwrap();
 
         assert_eq!(
-            status_of("a.txt"),
+            status_of(&cat, "a.txt"),
             "active",
             "a.txt went missing together with the archive, so it must revive with it"
         );
         assert_eq!(
-            status_of("gone.txt"),
+            status_of(&cat, "gone.txt"),
             "missing",
             "gone.txt was removed from the archive BEFORE the archive went missing -- reviving it \
              would assert the archive contains a file it demonstrably does not"
+        );
+    }
+
+    #[test]
+    fn the_revive_floor_still_separates_after_a_second_round_trip() {
+        // Adapted from a salvaged review attack: the archive goes missing and returns TWICE, with a
+        // legitimate removal happening between the two round-trips. Does the floor correctly
+        // separate "removed before the SECOND disappearance" from "present at the second
+        // disappearance", given that the same entry (gone.txt) already lived through one revival
+        // earlier in its history?
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        let bundle_path = root.join("bundle.zip");
+        let parked_path = tmp.path().join("bundle.zip.parked");
+
+        // t=100: a.txt + gone.txt present.
+        std::fs::write(
+            &bundle_path,
+            make_zip(&[("a.txt", b"alpha"), ("gone.txt", b"beta")]),
+        )
+        .unwrap();
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let s = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &s).unwrap();
+
+        // t=200/300: archive vanishes (round-trip #1) and returns unchanged -- both entries revive
+        // together (this is the ordinary, already-tested case).
+        std::fs::rename(&bundle_path, &parked_path).unwrap();
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let s = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 200, None, &m, &s).unwrap();
+        std::fs::rename(&parked_path, &bundle_path).unwrap();
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let s = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 300, None, &m, &s).unwrap();
+        assert_eq!(status_of(&cat, "a.txt"), "active");
+        assert_eq!(
+            status_of(&cat, "gone.txt"),
+            "active",
+            "revived together at round-trip #1"
+        );
+
+        // t=400: gone.txt is now genuinely removed via a real descend (size changes).
+        std::fs::write(&bundle_path, make_zip(&[("a.txt", b"alpha")])).unwrap();
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let s = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 400, None, &m, &s).unwrap();
+        assert_eq!(
+            status_of(&cat, "gone.txt"),
+            "missing",
+            "genuinely removed this time"
+        );
+
+        // t=500/600: archive vanishes AGAIN (round-trip #2) and returns unchanged.
+        std::fs::rename(&bundle_path, &parked_path).unwrap();
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let s = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 500, None, &m, &s).unwrap();
+        std::fs::rename(&parked_path, &bundle_path).unwrap();
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let s = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 600, None, &m, &s).unwrap();
+
+        assert_eq!(
+            status_of(&cat, "a.txt"),
+            "active",
+            "a.txt was present at round-trip #2's disappearance, must revive"
+        );
+        assert_eq!(
+            status_of(&cat, "gone.txt"),
+            "missing",
+            "ATTACK: gone.txt was removed BEFORE round-trip #2's disappearance (at t=400), so the \
+             SECOND round-trip must not revive it either, even though it WAS revived by the FIRST \
+             round-trip"
         );
     }
 }
