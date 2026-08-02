@@ -60,6 +60,7 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/detected-drives", get(api_detected_drives))
         .route("/api/duplicates", get(api_duplicates))
         .route("/api/copies", get(api_copies))
+        .route("/api/volumes/:id/errors", get(api_volume_errors))
         .route("/api/preview/:id", get(api_preview))
         .route("/api/quarantine", post(api_quarantine))
         .route("/api/repack", post(api_repack))
@@ -228,6 +229,9 @@ struct DriveDto {
     quarantined_bytes: i64, // actual: bytes sitting in `_ToDelete`, i.e. what "Purge" deletes
     last_seen_at: Option<i64>,
     has_errors: bool,
+    absent: i64,
+    unverified: i64,
+    unreadable_dirs: i64,
 }
 
 /// Human summary for one audit row. `details` is the JSON stored by the engine; parse best-effort
@@ -453,13 +457,20 @@ async fn api_drives(
             None => (None, None),
         };
         let (display_name, description) = cat.volume_meta(&volume_id).map_err(err500)?;
+        let completeness = cat.volume_completeness(&volume_id).map_err(err500)?;
+        // Derived, so the pill stops latching: self-heal removes the rows, the count drops to
+        // zero, and the drive stops claiming an error it no longer has.
+        let has_errors = !completeness.is_complete();
         out.push(DriveDto {
             connected: mount_path.is_some(),
             mount_path: mount_path.map(|p| p.display().to_string()),
             reclaimable_bytes: reclaim.get(&volume_id).copied().unwrap_or(0),
             quarantined_bytes: cat.recoverable_bytes(&volume_id).map_err(err500)?,
             last_seen_at: cat.volume_last_seen(&volume_id).map_err(err500)?,
-            has_errors: cat.volume_has_scan_errors(&volume_id).map_err(err500)?,
+            has_errors,
+            absent: completeness.absent,
+            unverified: completeness.unverified,
+            unreadable_dirs: completeness.unreadable_dirs,
             volume_id,
             label,
             display_name,
@@ -526,6 +537,45 @@ struct MemberDto {
 #[derive(Deserialize)]
 struct CopiesParams {
     hash: String,
+}
+
+#[derive(Deserialize)]
+struct VolumeErrorParams {
+    bucket: Option<String>,
+    kind: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct VolumeErrorsDto {
+    totals: crate::catalog::scan_errors::Completeness,
+    rows: Vec<crate::catalog::scan_errors::ScanErrorRow>,
+}
+
+// NOTE: `axum::extract::Path` is imported in this file as `AxPath` (web.rs:6), because
+// `std::path::PathBuf` is also in scope. Use `AxPath` -- writing `Path` here will not compile.
+async fn api_volume_errors(
+    State(state): State<AppState>,
+    AxPath(volume_id): AxPath<String>,
+    Query(p): Query<VolumeErrorParams>,
+) -> Result<Json<VolumeErrorsDto>, (StatusCode, String)> {
+    let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
+    // Bounded by default: a badly failing drive can hold a lot of rows, and the totals are the
+    // headline anyway.
+    let limit = p.limit.unwrap_or(200).min(1000);
+    Ok(Json(VolumeErrorsDto {
+        totals: cat.volume_completeness(&volume_id).map_err(err500)?,
+        rows: cat
+            .volume_scan_errors(
+                &volume_id,
+                p.bucket.as_deref(),
+                p.kind.as_deref(),
+                limit,
+                p.offset.unwrap_or(0),
+            )
+            .map_err(err500)?,
+    }))
 }
 
 /// Every active copy of one content hash, wherever it lives — including on drives that are not
@@ -1545,6 +1595,45 @@ mod tests {
         assert!(arr[0]["reclaimable_bytes"].as_i64().unwrap() >= 0);
     }
 
+    #[tokio::test]
+    async fn volume_errors_endpoint_reports_buckets_and_filters() {
+        let (_t, db, _state) = seed_dupes();
+        {
+            let cat = Catalog::open(&db).unwrap();
+            cat.log_scan_error(Some("vol-1"), "gone.jpg", "read: i/o", "read", "io", 10)
+                .unwrap();
+            cat.log_scan_error(
+                Some("vol-1"),
+                "sysvol",
+                "walk: denied",
+                "walk",
+                "permission",
+                10,
+            )
+            .unwrap();
+        }
+        let v = get_json(&db, "/api/volumes/vol-1/errors").await;
+        assert_eq!(v["totals"]["absent"], 1);
+        assert_eq!(v["totals"]["unreadable_dirs"], 1);
+        assert_eq!(v["rows"].as_array().unwrap().len(), 2);
+
+        let only = get_json(&db, "/api/volumes/vol-1/errors?bucket=unreadable_dir").await;
+        let rows = only["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["path"], "sysvol");
+        assert_eq!(rows[0]["kind"], "permission");
+    }
+
+    #[tokio::test]
+    async fn a_clean_volume_reports_complete() {
+        let (_t, db, _state) = seed_dupes();
+        let v = get_json(&db, "/api/volumes/vol-1/errors").await;
+        assert_eq!(v["totals"]["absent"], 0);
+        assert_eq!(v["totals"]["unverified"], 0);
+        assert_eq!(v["totals"]["unreadable_dirs"], 0);
+        assert!(v["rows"].as_array().unwrap().is_empty());
+    }
+
     /// End-to-end of the review flow's visibility rules (the scenario reported by the user):
     /// quarantining a duplicate keeps the drive's "Purge" affordance alive (quarantined_bytes),
     /// even though reclaimable-from-duplicates has dropped to 0; the quarantined row is browsable at
@@ -2495,6 +2584,10 @@ mod tests {
         assert!(body.contains("/api/forget-drive"));
         assert!(body.contains("/api/purge-all"));
         assert!(body.contains("/api/rename-drive"), "drives page can rename");
+        // The completeness panel is the only way to see WHICH files are missing; a page without it
+        // leaves that answer unreachable from the browser.
+        assert!(body.contains("/api/volumes/"));
+        assert!(body.contains("completeness"));
         assert!(!body.contains("http://") && !body.contains("https://"));
     }
 

@@ -122,6 +122,19 @@ pub fn cmd_scan(
                 "Done: {} hashed, {} unchanged, {} errors, {} newly missing, {} archive entries.",
                 s.hashed, s.skipped, s.errors, s.marked_missing, s.archive_entries
             );
+            if s.stopped {
+                // A scan stopped early has only assessed a fraction of the tree; claiming
+                // completeness (even "complete") from that fraction would assert about the whole
+                // volume from a partial walk. Say nothing was concluded, not that it is fine.
+                println!(
+                    "Completeness: not assessed — the scan stopped before the end of the tree."
+                );
+            } else {
+                println!(
+                    "{}",
+                    cat.volume_completeness(&identity.volume_id)?.summary_line()
+                );
+            }
             print!("{}", s.metrics.report());
         }
     }
@@ -189,6 +202,12 @@ pub fn cmd_status() -> anyhow::Result<()> {
             "  {label} [{id}]: {count} files, {} MiB (recoverable: {} MiB in _ToDelete)",
             bytes / (1024 * 1024),
             recoverable / (1024 * 1024)
+        );
+        let c = cat.volume_completeness(&id)?;
+        let marker = if c.is_complete() { " " } else { "⚠" };
+        println!(
+            "     {marker} {}",
+            c.summary_line().trim_start_matches("Completeness: ")
         );
     }
     Ok(())

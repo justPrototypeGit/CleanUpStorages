@@ -252,6 +252,9 @@ details.drive>summary:hover,details.folder>summary:hover{background:var(--line);
 .sec-label{font-size:11px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--mut);margin:26px 0 12px;}
 .sec-label:first-child{margin-top:4px;}
 .drivegrid{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
+/* Drives page only: one card per row. Half-width cards left the completeness table too narrow to
+   read a path in. The Scan page's detected-drives grid keeps two columns -- those cards are small. */
+.drivegrid.onecol{grid-template-columns:1fr;}
 .dcard{cursor:pointer;transition:border-color .12s,box-shadow .12s;}
 .dcard:hover{border-color:var(--line-strong);}
 .dcard.sel{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent) inset;}
@@ -289,6 +292,22 @@ details.drive>summary:hover,details.folder>summary:hover{background:var(--line);
 .q-alert .q-ico{width:40px;height:40px;border-radius:50%;flex:none;display:flex;align-items:center;justify-content:center;background:var(--red-bg);color:var(--red);}
 .q-alert .qtxt strong{color:var(--red);display:block;font-size:13.5px;}
 .q-alert .qtxt span{font-size:12px;color:var(--mut);}
+.completeness{margin-top:14px;padding-top:14px;border-top:1px solid var(--line);font-size:12.5px;}
+.completeness summary{cursor:pointer;color:var(--mut);user-select:none;}
+/* Grid on the CONTAINER, with rows as display:contents, so every row's cells share the same
+   three tracks. A per-row flexbox sizes each row independently, which is why nothing lined up. */
+.completeness .cbody{margin-top:8px;max-height:260px;overflow-y:auto;overflow-x:hidden;
+  display:grid;grid-template-columns:max-content minmax(0,1.6fr) minmax(0,1fr);gap:3px 12px;align-items:baseline;}
+.erow{display:contents;}
+.cnote{grid-column:1/-1;color:var(--mut);}
+/* One line per row by default: an unbounded wrap turns a long path into a paragraph and destroys
+   the alignment the grid just bought. Full text is in title=, and clicking the row reveals it. */
+.epath,.ereason{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;}
+.epath{font-family:var(--font-mono);}
+.epath b{font-weight:600;}
+.ereason{color:var(--mut);}
+.erow.open .epath,.erow.open .ereason{white-space:normal;word-break:break-all;}
+.completeness .cbody .erow>span{cursor:pointer;padding:1px 0;}
 .sumgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;}
 .sumcard{margin:0;}
 .sumcard .k{font-size:11px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--mut);}
@@ -906,7 +925,7 @@ pub fn drives_page(csrf: &str) -> String {
   <div><h1 class="page-h">Drives</h1><div class="page-sub" style="margin:0">Manage and monitor your catalogued storage volumes. Nothing here deletes files on your drives.</div></div>
   <div id="quarantine-alert"></div>
 </div>
-<div id="drives" class="drivegrid"><span class="mut">Loading drives…</span></div>
+<div id="drives" class="drivegrid onecol"><span class="mut">Loading drives…</span></div>
 <div class="sumgrid" id="summary" style="margin-top:20px"></div>
 <div class="mut" id="msg" style="margin-top:12px;min-height:1.4em"></div>"##;
     let script = r##"
@@ -919,7 +938,13 @@ function bar(d){
     <div class="progressbar"><span style="width:${pct}%;background:${col}"></span></div>`;
 }
 function statusLine(d){
-  if(d.has_errors) return `<span class="sdot" style="background:var(--red)"></span><span style="color:var(--red)">Error · scan had errors</span>`;
+  if(d.has_errors){
+    const bits=[];
+    if(d.absent) bits.push(`${d.absent} not catalogued`);
+    if(d.unverified) bits.push(`${d.unverified} unverified`);
+    if(d.unreadable_dirs) bits.push(`${d.unreadable_dirs} unreadable folder${d.unreadable_dirs>1?'s':''}`);
+    return `<span class="sdot" style="background:var(--red)"></span><span style="color:var(--red)">${bits.join(' · ')}</span>`;
+  }
   if(d.connected) return `<span class="sdot" style="background:var(--green)"></span>Active · connected`;
   return `<span class="sdot" style="background:var(--gray)"></span>Offline`;
 }
@@ -940,6 +965,10 @@ async function load(){
       <button class="btn edit"><span class="material-symbols-outlined">edit</span>Edit</button>
       <button class="btn btn-danger iconbtn forget" title="Forget this drive"><span class="material-symbols-outlined">delete</span></button>
     </div>
+    <details class="completeness" data-vid="${esc(d.volume_id)}">
+      <summary>Completeness</summary>
+      <div class="cbody mut">loading…</div>
+    </details>
     <div class="edit-form" style="display:none;margin-top:14px;padding-top:14px;border-top:1px solid var(--line)">
       <input class="ef-name" type="text" placeholder="Custom name (blank = detected)" style="width:100%;margin-bottom:8px" value="${esc(d.display_name||'')}">
       <input class="ef-desc" type="text" placeholder="Short description" style="width:100%;margin-bottom:10px" value="${esc(d.description||'')}">
@@ -999,6 +1028,37 @@ async function purgeAll(){
     $("#msg").textContent=m; load(); }
   catch(e){ $("#msg").textContent="Error: "+e; }
 }
+// Fetched only when opened: a drive with thousands of failures should not cost anything on
+// page load, and the counts on the card already answer the common question.
+document.addEventListener('toggle', async e=>{
+  const el=e.target;
+  if(!el.matches('details.completeness') || !el.open || el.dataset.loaded) return;
+  el.dataset.loaded='1';
+  const body=el.querySelector('.cbody');
+  try{
+    const r=await fetch(`/api/volumes/${encodeURIComponent(el.dataset.vid)}/errors`);
+    const d=await r.json();
+    if(!d.rows.length){ body.innerHTML='<span class="cnote">Complete — every file was catalogued.</span>'; return; }
+    // The last segment is what identifies the file; the rest is context. Emphasising it keeps the
+    // useful part readable when the ellipsis eats the middle of a deeply nested archive path.
+    const leaf=p=>{ const s=String(p).split(/[\/›]/); return s[s.length-1].trim()||p; };
+    body.innerHTML=d.rows.map(x=>{
+      const reason=x.reason||'recorded before classification';
+      const head=esc(x.path.slice(0,x.path.length-leaf(x.path).length));
+      return `<div class="erow" title="Click to show the full path and reason">
+        <span class="tag">${esc(x.bucket==='unreadable_dir'?'folder':x.bucket)}</span>
+        <span class="epath" title="${esc(x.path)}">${head}<b>${esc(leaf(x.path))}</b></span>
+        <span class="ereason" title="${esc(reason)}">${esc(reason)}</span>
+      </div>`;
+    }).join('')
+      + (d.rows.length>=200?'<span class="cnote">showing the first 200</span>':'');
+  }catch(err){ body.innerHTML='<span class="cnote">Could not load the error list.</span>'; }
+}, true);
+// Rows are display:contents, so there is no row box to click — toggle via the cell's parent.
+document.addEventListener('click', e=>{
+  const cell=e.target.closest('.cbody > .erow > span');
+  if(cell) cell.parentElement.classList.toggle('open');
+});
 load().catch(e=>{$("#drives").textContent="Error: "+e;});"##;
     shell("drives", csrf, "Drives", main, script)
 }
