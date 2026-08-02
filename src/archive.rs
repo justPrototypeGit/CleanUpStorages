@@ -35,8 +35,38 @@ impl ArchiveLimits {
     }
 }
 
-/// True if `name` looks like a zip archive (by extension, case-insensitive).
-pub fn is_archive_name(name: &str) -> bool {
+/// True if these leading bytes carry a zip signature.
+///
+/// By content, not by extension: `._Video.zip` is a macOS AppleDouble sidecar that merely borrows
+/// the name, and a zip renamed to `.bak` is still a zip. The extension lies in both directions.
+pub fn looks_like_zip(prefix: &[u8]) -> bool {
+    matches!(
+        prefix,
+        [b'P', b'K', 0x03, 0x04, ..] | [b'P', b'K', 0x05, 0x06, ..] | [b'P', b'K', 0x07, 0x08, ..]
+    )
+}
+
+/// Read up to 4 leading bytes from a non-seekable stream, reporting whether they look like a zip.
+/// The bytes are returned so the caller can chain them back -- dropping them would silently
+/// truncate the content hash.
+fn peek4<R: Read>(r: &mut R) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut buf = [0u8; 4];
+    let mut filled = 0;
+    while filled < 4 {
+        match r.read(&mut buf[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    let head = buf[..filled].to_vec();
+    let is_zip = looks_like_zip(&head);
+    Ok((head, is_zip))
+}
+
+/// TEMPORARY SHIM -- extension-based check kept only so `src/scanner.rs` (its two callers at the
+/// top-level, pre-open stage) still compiles. Task 3 rewrites those call sites to use content-based
+/// detection like `looks_like_zip`/`peek4` above; delete this shim then. Do not add new callers.
+pub(crate) fn is_archive_name_by_extension_shim(name: &str) -> bool {
     name.rsplit('.')
         .next()
         .map(|e| e.eq_ignore_ascii_case("zip"))
@@ -183,7 +213,17 @@ fn scan_level<R: Read + Seek>(
         let filename = name.rsplit('/').next().unwrap_or(&name).to_string();
         let extension = entry_extension(&name);
 
-        if is_archive_name(&name) {
+        let (head, is_zip) = match peek4(&mut entry) {
+            Ok(v) => v,
+            Err(e) => {
+                result.errors.push((chain, format!("read error: {e}")));
+                continue;
+            }
+        };
+        // Chain the peeked bytes back in front, so both branches below see the entire entry.
+        let mut entry = std::io::Cursor::new(head).chain(entry);
+
+        if is_zip {
             // Nested archive: buffer it (bounded) so we can BOTH hash it and re-open it with Seek
             // to recurse. Only archives are buffered — large leaf files stream (see else branch).
             // Cap this buffer by whatever the whole descent has left, not just the per-entry limit.
@@ -280,16 +320,6 @@ mod tests {
     use std::io::{Cursor, Write};
 
     #[test]
-    fn detects_zip_names() {
-        assert!(is_archive_name("old.zip"));
-        assert!(is_archive_name("OLD.ZIP"));
-        assert!(is_archive_name("a.b.Zip"));
-        assert!(!is_archive_name("notes.txt"));
-        assert!(!is_archive_name("zip")); // no extension dot
-        assert!(!is_archive_name("archive.zipx"));
-    }
-
-    #[test]
     fn limits_from_config() {
         let cfg = Config::default_paths().unwrap();
         let l = ArchiveLimits::from_config(&cfg);
@@ -331,6 +361,65 @@ mod tests {
             zw.finish().unwrap();
         }
         buf.into_inner()
+    }
+
+    #[test]
+    fn zip_signatures_are_recognised_by_content_not_name() {
+        assert!(looks_like_zip(b"PK\x03\x04rest"));
+        assert!(looks_like_zip(b"PK\x05\x06")); // empty archive
+        assert!(looks_like_zip(b"PK\x07\x08")); // spanned
+        assert!(!looks_like_zip(b"\x00\x05\x16\x07")); // AppleDouble magic
+        assert!(!looks_like_zip(b"PK")); // too short to be a signature
+        assert!(!looks_like_zip(b""));
+    }
+
+    #[test]
+    fn an_applesdouble_sidecar_named_zip_is_treated_as_a_leaf() {
+        // ._Video.zip is macOS metadata about Video.zip. Probing it as an archive is what produced
+        // "invalid Zip archive: Could not find EOCD" against a file that was never a zip.
+        let sidecar = b"\x00\x05\x16\x07\x00\x02\x00\x00Mac OS X        ";
+        let zip = make_zip(&[("._Video.zip", sidecar)]);
+        let res = scan_archive(Cursor::new(zip), &limits());
+        assert_eq!(
+            res.errors,
+            Vec::<(String, String)>::new(),
+            "it is not an archive, so no archive error"
+        );
+        assert_eq!(res.entries.len(), 1, "it is catalogued as an ordinary file");
+        assert_eq!(res.entries[0].filename, "._Video.zip");
+        assert_eq!(res.entries[0].size_bytes, sidecar.len() as i64);
+    }
+
+    #[test]
+    fn a_zip_renamed_to_another_extension_is_still_descended_into() {
+        // Missed entirely today: the extension check says no, so its contents were never catalogued.
+        let inner = make_zip(&[("inner.txt", b"hello")]);
+        let outer = make_zip(&[("backup.bak", &inner)]);
+        let res = scan_archive(Cursor::new(outer), &limits());
+        let names: Vec<&str> = res.entries.iter().map(|e| e.filename.as_str()).collect();
+        assert!(
+            names.contains(&"inner.txt"),
+            "expected to descend into the renamed zip, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn peeking_does_not_change_an_entrys_hash() {
+        // The peeked bytes must be chained back, or every entry that survives detection hashes
+        // four bytes short -- silently wrong content hashes, which is unrecoverable at dedup time.
+        let body = b"the quick brown fox jumps over the lazy dog";
+        let zip = make_zip(&[("plain.txt", body)]);
+        let res = scan_archive(Cursor::new(zip), &limits());
+        let expected = {
+            let mut r: &[u8] = body;
+            hashing::hash_reader(&mut r).unwrap()
+        };
+        assert_eq!(res.entries.len(), 1);
+        assert_eq!(
+            res.entries[0].content_hash, expected,
+            "hash must cover the whole entry"
+        );
+        assert_eq!(res.entries[0].size_bytes, body.len() as i64);
     }
 
     #[test]
