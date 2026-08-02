@@ -5,25 +5,32 @@ use std::io::{Read, Seek};
 use crate::config::Config;
 use crate::hashing;
 
-/// Tunable safety limits for archive descent.
+/// Tunable limits for archive descent, grouped by what each one actually protects.
 #[derive(Debug, Clone)]
 pub struct ArchiveLimits {
+    /// Recursion bound.
     pub max_depth: usize,
-    pub entry_max_bytes: u64,
-    pub ratio_cap: u64,
-    /// Ceiling on nested-archive bytes held in memory *at once* across the whole descent.
-    /// `entry_max_bytes` alone bounds a single level; a deep chain keeps every ancestor's buffer
-    /// alive simultaneously, so without this the worst case is `max_depth × entry_max_bytes`.
+    /// MEMORY: the most one nested archive may hold in RAM. Nested archives must be buffered so
+    /// they can be both hashed and re-opened with `Seek` to recurse, so this is a real bound.
+    pub buffer_max_bytes: u64,
+    /// MEMORY: bytes of nested-archive buffer live at once across a whole descent.
     pub total_buffer_bytes: u64,
+    /// CATALOGUE: the largest leaf file we will record. `None` is unlimited, and safe: leaves are
+    /// stream-hashed in 64 KiB chunks, so their size costs no memory.
+    pub entry_max_bytes: Option<u64>,
+    /// TIME: declared uncompressed/compressed. With a generous leaf ceiling this is what stops a
+    /// genuine bomb streaming for a long time before its size cap trips.
+    pub ratio_cap: u64,
 }
 
 impl ArchiveLimits {
     pub fn from_config(cfg: &Config) -> ArchiveLimits {
         ArchiveLimits {
             max_depth: cfg.max_archive_depth,
+            buffer_max_bytes: cfg.archive_buffer_max_bytes,
+            total_buffer_bytes: cfg.archive_total_buffer_bytes,
             entry_max_bytes: cfg.archive_entry_max_bytes,
             ratio_cap: cfg.archive_ratio_cap,
-            total_buffer_bytes: cfg.archive_total_buffer_bytes,
         }
     }
 }
@@ -158,17 +165,9 @@ fn scan_level<R: Read + Seek>(
         let uncompressed = entry.size();
         let compressed = entry.compressed_size().max(1);
 
-        // Zip-bomb guards (declared sizes).
-        if uncompressed > limits.entry_max_bytes {
-            result.errors.push((
-                chain,
-                format!(
-                    "zip bomb: {uncompressed} bytes exceeds cap {}",
-                    limits.entry_max_bytes
-                ),
-            ));
-            continue;
-        }
+        // Ratio is checked for both branches: it is the cheap pre-filter that stops us buffering
+        // or streaming something absurd. Declared sizes can lie, which is why `read_capped` and
+        // `hash_capped` re-check the real byte counts downstream.
         if uncompressed / compressed > limits.ratio_cap {
             result.errors.push((
                 chain,
@@ -188,7 +187,7 @@ fn scan_level<R: Read + Seek>(
             // Nested archive: buffer it (bounded) so we can BOTH hash it and re-open it with Seek
             // to recurse. Only archives are buffered — large leaf files stream (see else branch).
             // Cap this buffer by whatever the whole descent has left, not just the per-entry limit.
-            let cap = limits.entry_max_bytes.min(*budget);
+            let cap = limits.buffer_max_bytes.min(*budget);
             if cap == 0 {
                 result.errors.push((
                     chain,
@@ -204,7 +203,7 @@ fn scan_level<R: Read + Seek>(
                 Err(reason) => {
                     // Budget pressure from legitimate ancestors is not a bomb; saying so would
                     // send the user hunting for a hostile file that does not exist.
-                    let reason = if cap < limits.entry_max_bytes {
+                    let reason = if cap < limits.buffer_max_bytes {
                         format!(
                             "nested archive skipped: only {cap} of the {} byte buffer budget \
                              remained (ancestor archives hold the rest)",
@@ -254,7 +253,10 @@ fn scan_level<R: Read + Seek>(
             *budget += held;
         } else {
             // Leaf file: stream-hash with an actual-byte cap (declared size may lie); record the TRUE length.
-            match hash_capped(&mut entry, limits.entry_max_bytes) {
+            // `u64::MAX` when unlimited: `hash_capped` still counts real bytes, so a lying header
+            // cannot escape -- there is simply no ceiling to trip.
+            let cap = limits.entry_max_bytes.unwrap_or(u64::MAX);
+            match hash_capped(&mut entry, cap) {
                 Ok((content_hash, actual)) => {
                     result.entries.push(ArchiveEntry {
                         container_chain: chain,
@@ -292,10 +294,9 @@ mod tests {
         let cfg = Config::default_paths().unwrap();
         let l = ArchiveLimits::from_config(&cfg);
         assert_eq!(l.max_depth, 8);
-        assert_eq!(l.entry_max_bytes, 2 * 1024 * 1024 * 1024);
-        assert_eq!(l.ratio_cap, 200);
-        // The whole descent may buffer no more than one entry's worth, so the old worst case of
-        // max_depth x entry_max_bytes (8 x 2 GiB) is now 2 GiB.
+        assert_eq!(l.buffer_max_bytes, 2 * 1024 * 1024 * 1024);
+        assert_eq!(l.entry_max_bytes, Some(64 * 1024 * 1024 * 1024));
+        assert_eq!(l.ratio_cap, 10_000);
         assert_eq!(l.total_buffer_bytes, 2 * 1024 * 1024 * 1024);
     }
 
@@ -315,11 +316,94 @@ mod tests {
         buf.into_inner()
     }
 
+    // Deflated, so entries have a real compression ratio. `make_zip` stores uncompressed, which
+    // pins every ratio at 1 and makes ratio-cap tests silently unable to fail.
+    fn make_zip_deflated(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = Cursor::new(Vec::new());
+        {
+            let mut zw = zip::ZipWriter::new(&mut buf);
+            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            for (name, bytes) in files {
+                zw.start_file(*name, opts).unwrap();
+                zw.write_all(bytes).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    #[test]
+    fn a_highly_compressible_file_is_catalogued_not_rejected() {
+        // 400 KB of zeros deflates to a few hundred bytes -- a ratio in the high hundreds, which
+        // is what a Vivado bitstream or an MRI export actually looks like. Under the old cap of
+        // 200 every one of these was silently dropped from the catalogue.
+        let zip = make_zip_deflated(&[("bitstream.bit", &vec![0u8; 400 * 1024])]);
+        let res = scan_archive(Cursor::new(zip), &limits());
+        assert_eq!(
+            res.errors,
+            Vec::<(String, String)>::new(),
+            "no entry should be refused"
+        );
+        assert_eq!(res.entries.len(), 1);
+        assert_eq!(res.entries[0].filename, "bitstream.bit");
+        assert_eq!(res.entries[0].size_bytes, 400 * 1024);
+    }
+
+    #[test]
+    fn an_absurd_ratio_is_still_refused() {
+        // The cap still has a job: with a generous leaf ceiling it is what stops a real bomb
+        // streaming for a long time. A tiny cap proves the check is reachable at all.
+        let zip = make_zip_deflated(&[("bomb.bin", &vec![0u8; 400 * 1024])]);
+        let tight = ArchiveLimits {
+            ratio_cap: 2,
+            ..limits()
+        };
+        let res = scan_archive(Cursor::new(zip), &tight);
+        assert!(res.entries.is_empty(), "the entry must not be catalogued");
+        assert_eq!(res.errors.len(), 1);
+        assert!(
+            res.errors[0].1.contains("ratio"),
+            "got {:?}",
+            res.errors[0].1
+        );
+    }
+
+    #[test]
+    fn a_leaf_file_larger_than_the_buffer_bound_is_still_catalogued() {
+        // The leaf path streams in constant memory, so the nested-archive buffer bound must not
+        // apply to it. This is the 34 GB rejection, in miniature.
+        let zip = make_zip(&[("big.mov", &vec![7u8; 64 * 1024])]);
+        let small_buffer = ArchiveLimits {
+            buffer_max_bytes: 1024, // far smaller than the entry
+            total_buffer_bytes: 1024,
+            entry_max_bytes: None, // unlimited leaf ceiling
+            ..limits()
+        };
+        let res = scan_archive(Cursor::new(zip), &small_buffer);
+        assert_eq!(res.errors, Vec::<(String, String)>::new());
+        assert_eq!(res.entries.len(), 1);
+        assert_eq!(res.entries[0].size_bytes, 64 * 1024);
+    }
+
+    #[test]
+    fn a_leaf_ceiling_when_set_is_enforced() {
+        let zip = make_zip(&[("big.mov", &vec![7u8; 64 * 1024])]);
+        let capped = ArchiveLimits {
+            entry_max_bytes: Some(1024),
+            ..limits()
+        };
+        let res = scan_archive(Cursor::new(zip), &capped);
+        assert!(res.entries.is_empty());
+        assert_eq!(res.errors.len(), 1);
+    }
+
     fn limits() -> ArchiveLimits {
         ArchiveLimits {
             max_depth: 8,
-            entry_max_bytes: 2 * 1024 * 1024 * 1024,
-            ratio_cap: 200,
+            buffer_max_bytes: 2 * 1024 * 1024 * 1024,
+            entry_max_bytes: Some(64 * 1024 * 1024 * 1024),
+            ratio_cap: 10_000,
             total_buffer_bytes: 2 * 1024 * 1024 * 1024,
         }
     }
@@ -346,10 +430,8 @@ mod tests {
         // entry_max_bytes tiny -> the entry is skipped and logged, not hashed.
         let zip = make_zip(&[("big.bin", b"0123456789")]);
         let small = ArchiveLimits {
-            max_depth: 8,
-            entry_max_bytes: 4,
-            ratio_cap: 200,
-            total_buffer_bytes: 2 * 1024 * 1024 * 1024,
+            entry_max_bytes: Some(4),
+            ..limits()
         };
         let res = scan_archive(Cursor::new(zip), &small);
         assert!(res.entries.is_empty());
@@ -413,10 +495,9 @@ mod tests {
         let top = nest_zip("level2.zip", level2, &[]);
 
         let generous = ArchiveLimits {
-            max_depth: 8,
-            entry_max_bytes: 64 * 1024,
-            ratio_cap: 200,
+            buffer_max_bytes: 64 * 1024,
             total_buffer_bytes: 64 * 1024,
+            ..limits()
         };
         let ok = scan_archive(Cursor::new(top.clone()), &generous);
         assert!(
@@ -428,10 +509,9 @@ mod tests {
         // Same per-entry cap, but the descent may only hold the outermost buffer at once.
         let held = level2_len(&top);
         let tight = ArchiveLimits {
-            max_depth: 8,
-            entry_max_bytes: 64 * 1024,
-            ratio_cap: 200,
+            buffer_max_bytes: 64 * 1024,
             total_buffer_bytes: held, // exactly enough for level2.zip, nothing left for level3.zip
+            ..limits()
         };
         let res = scan_archive(Cursor::new(top), &tight);
         assert!(
@@ -460,10 +540,9 @@ mod tests {
         let top = nest_zip("inner.zip", inner, &[]);
         let held = level2_len_named(&top, "inner.zip");
         let tight = ArchiveLimits {
-            max_depth: 8,
-            entry_max_bytes: 64 * 1024,
-            ratio_cap: 200,
+            buffer_max_bytes: 64 * 1024,
             total_buffer_bytes: held - 1, // one byte short of the nested archive
+            ..limits()
         };
         let res = scan_archive(Cursor::new(top), &tight);
         assert!(!res.entries.iter().any(|e| e.filename == "leaf.txt"));
@@ -496,9 +575,7 @@ mod tests {
         // max_depth = 1: the top archive's direct entries are scanned, but mid.zip is not descended.
         let shallow = ArchiveLimits {
             max_depth: 1,
-            entry_max_bytes: 2 * 1024 * 1024 * 1024,
-            ratio_cap: 200,
-            total_buffer_bytes: 2 * 1024 * 1024 * 1024,
+            ..limits()
         };
         let res = scan_archive(Cursor::new(outer), &shallow);
         assert!(res.entries.iter().any(|e| e.container_chain == "mid.zip")); // still catalogued as a file
