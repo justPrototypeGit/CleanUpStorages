@@ -238,18 +238,20 @@ pub fn scan_volume_with_progress(
         } else {
             let _t = metrics.timer(crate::scan_metrics::Phase::SkipCheck);
             match cat.get_file_meta(&identity.volume_id, &rel)? {
-                Some((old_size, old_mtime, has_archive_entries, was_missing))
+                Some((old_size, old_mtime, has_archive_entries, revive_floor))
                     if old_size == size && old_mtime == mtime.unwrap_or(0) =>
                 {
                     cat.touch_seen(&identity.volume_id, &rel, now)?;
                     // From the catalogue, not from the filename: a renamed zip has entries too,
                     // and missing them here would let the sweep mark present files missing.
                     if has_archive_entries {
-                        // Revive missing entries only if the archive itself was ALSO missing a
-                        // moment ago -- i.e. the whole archive vanished and came back. If the
-                        // archive was continuously present, a missing entry is one a real descend
-                        // found genuinely gone from its content, and must stay missing.
-                        cat.touch_archive_entries(&identity.volume_id, &rel, now, was_missing)?;
+                        // revive_floor is Some(last_seen_at) only if the archive's own row was
+                        // ALSO missing a moment ago -- i.e. the whole archive vanished and came
+                        // back. Only entries that were still present at that same moment (their own
+                        // last_seen_at >= the floor) revive; an entry removed from the archive's
+                        // real content by an earlier descend has a smaller last_seen_at and stays
+                        // missing even though the archive returned.
+                        cat.touch_archive_entries(&identity.volume_id, &rel, now, revive_floor)?;
                     }
                     true
                 }
@@ -1547,6 +1549,103 @@ mod tests {
         assert_eq!(
             inner_catalogued, 1,
             "a prefixed zip's entries must be catalogued, not skipped as a leaf"
+        );
+    }
+
+    #[test]
+    fn a_revive_floor_does_not_resurrect_an_entry_removed_before_the_archive_went_missing() {
+        // THE Finding-2 regression, reproduced end to end through the real scanner rather than the
+        // store API directly:
+        //
+        //   t=100  bundle.zip = a.txt + gone.txt      -> both active
+        //   t=200  rewritten without gone.txt         -> gone.txt correctly swept 'missing'
+        //   t=300  archive moved out of the tree      -> archive row + a.txt swept 'missing'
+        //   t=400  moved back, identical, same mtime  -> skip path, revive_floor = Some(...)
+        //
+        // A plain "was the archive missing" boolean cannot tell gone.txt (removed BEFORE the
+        // archive went missing) apart from a.txt (missing only because it went missing WITH the
+        // archive) -- both revive. The floor must let only a.txt come back.
+        fn make_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut zw = zip::ZipWriter::new(&mut buf);
+                let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                for (name, bytes) in files {
+                    zw.start_file(*name, opts).unwrap();
+                    std::io::Write::write_all(&mut zw, bytes).unwrap();
+                }
+                zw.finish().unwrap();
+            }
+            buf.into_inner()
+        }
+
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        let bundle_path = root.join("bundle.zip");
+        let parked_path = tmp.path().join("bundle.zip.parked");
+
+        let status_of = |name: &str| -> String {
+            cat.conn
+                .query_row(
+                    "SELECT status FROM files WHERE filename=?1 AND container_chain IS NOT NULL",
+                    [name],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+
+        // t=100: both entries present.
+        std::fs::write(
+            &bundle_path,
+            make_zip(&[("a.txt", b"alpha"), ("gone.txt", b"beta")]),
+        )
+        .unwrap();
+        let m1 = crate::scan_metrics::ScanMetrics::new();
+        let stop1 = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m1, &stop1).unwrap();
+        assert_eq!(status_of("a.txt"), "active");
+        assert_eq!(status_of("gone.txt"), "active");
+
+        // t=200: rewritten without gone.txt -- a real content change, so it redescends (the size
+        // differs, which alone fails the skip check regardless of mtime resolution).
+        std::fs::write(&bundle_path, make_zip(&[("a.txt", b"alpha")])).unwrap();
+        let m2 = crate::scan_metrics::ScanMetrics::new();
+        let stop2 = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 200, None, &m2, &stop2).unwrap();
+        assert_eq!(status_of("a.txt"), "active");
+        assert_eq!(
+            status_of("gone.txt"),
+            "missing",
+            "gone.txt was genuinely removed from the archive's content"
+        );
+
+        // t=300: the archive itself leaves the tree -- its own row and a.txt's entry are swept.
+        std::fs::rename(&bundle_path, &parked_path).unwrap();
+        let m3 = crate::scan_metrics::ScanMetrics::new();
+        let stop3 = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 300, None, &m3, &stop3).unwrap();
+        assert_eq!(status_of("a.txt"), "missing");
+        assert_eq!(status_of("gone.txt"), "missing");
+
+        // t=400: moved back byte-identical (same size, same mtime since it's the same underlying
+        // file, never rewritten) -- the skip path fires and touches the archive's entries.
+        std::fs::rename(&parked_path, &bundle_path).unwrap();
+        let m4 = crate::scan_metrics::ScanMetrics::new();
+        let stop4 = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 400, None, &m4, &stop4).unwrap();
+
+        assert_eq!(
+            status_of("a.txt"),
+            "active",
+            "a.txt went missing together with the archive, so it must revive with it"
+        );
+        assert_eq!(
+            status_of("gone.txt"),
+            "missing",
+            "gone.txt was removed from the archive BEFORE the archive went missing -- reviving it \
+             would assert the archive contains a file it demonstrably does not"
         );
     }
 }
