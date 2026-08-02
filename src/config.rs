@@ -160,11 +160,15 @@ pub fn save_settings(path: &Path, s: &Settings) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Serializes tests that mutate `CLEANUPSTORAGES_DATA_DIR` (a process-global env var) so
+/// concurrent test threads in this binary -- including ones in `web.rs` -- never race on it and
+/// momentarily fall through to the real app-data directory.
+#[cfg(test)]
+pub(crate) static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn defaults_are_sane() {

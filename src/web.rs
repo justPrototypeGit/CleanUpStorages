@@ -72,6 +72,10 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/scan/stop", post(api_scan_stop))
         .route("/api/scan-runs", get(api_scan_runs))
         .route("/api/pick-folder", post(api_pick_folder))
+        .route(
+            "/api/settings",
+            get(api_settings_get).post(api_settings_post),
+        )
         .route("/review", get(review))
         .route("/scan", get(scan_page_h))
         .route("/drives", get(drives_page_h))
@@ -916,6 +920,94 @@ async fn api_repack(
         removed_entry: out.removed_entry,
         retained_entries: out.retained_entries,
     }))
+}
+
+#[derive(serde::Serialize)]
+struct SettingsDto {
+    max_archive_depth: usize,
+    archive_buffer_max_bytes: u64,
+    archive_total_buffer_bytes: u64,
+    archive_entry_max_bytes: Option<u64>,
+    archive_ratio_cap: u64,
+}
+
+/// The effective configuration, re-read from disk. Shared by both handlers so a write responds
+/// with what is actually in force rather than echoing the request back.
+fn effective_settings() -> Result<SettingsDto, (StatusCode, String)> {
+    let cfg = crate::config::Config::default_paths().map_err(err500)?;
+    Ok(SettingsDto {
+        max_archive_depth: cfg.max_archive_depth,
+        archive_buffer_max_bytes: cfg.archive_buffer_max_bytes,
+        archive_total_buffer_bytes: cfg.archive_total_buffer_bytes,
+        archive_entry_max_bytes: cfg.archive_entry_max_bytes,
+        archive_ratio_cap: cfg.archive_ratio_cap,
+    })
+}
+
+async fn api_settings_get() -> Result<Json<SettingsDto>, (StatusCode, String)> {
+    Ok(Json(effective_settings()?))
+}
+
+/// A quarter of RAM: the scan leans on the OS file cache, and `browse` runs the web server in this
+/// same process. Buffering more than this trades a working scan for a bigger buffer.
+fn memory_ceiling() -> Option<u64> {
+    use sysinfo::System;
+    let mut sys = System::new();
+    sys.refresh_memory();
+    match sys.total_memory() {
+        0 => None,
+        total => Some(total / 4),
+    }
+}
+
+fn validate(s: &crate::config::Settings) -> Result<(), String> {
+    if let Some(d) = s.max_archive_depth {
+        if d < 1 {
+            return Err("max_archive_depth must be at least 1".into());
+        }
+    }
+    if let Some(r) = s.archive_ratio_cap {
+        if r < 1 {
+            return Err("archive_ratio_cap must be at least 1".into());
+        }
+    }
+    if let (Some(per), Some(total)) = (s.archive_buffer_max_bytes, s.archive_total_buffer_bytes) {
+        if per > total {
+            return Err(
+                "archive_buffer_max_bytes cannot exceed archive_total_buffer_bytes: a per-archive \
+                 bound larger than the whole descent's budget has no effect"
+                    .into(),
+            );
+        }
+    }
+    if let Some(ceiling) = memory_ceiling() {
+        for (name, v) in [
+            ("archive_buffer_max_bytes", s.archive_buffer_max_bytes),
+            ("archive_total_buffer_bytes", s.archive_total_buffer_bytes),
+        ] {
+            if let Some(v) = v {
+                if v > ceiling {
+                    return Err(format!(
+                        "{name} of {v} bytes exceeds a quarter of system memory ({ceiling} bytes); \
+                         buffering that much would starve the file cache the scan depends on"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn api_settings_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<crate::config::Settings>,
+) -> Result<Json<SettingsDto>, (StatusCode, String)> {
+    check_csrf(&headers, &state)?;
+    validate(&body).map_err(|m| (StatusCode::BAD_REQUEST, m))?;
+    let cfg = crate::config::Config::default_paths().map_err(err500)?;
+    crate::config::save_settings(&cfg.settings_path(), &body).map_err(err500)?;
+    Ok(Json(effective_settings()?))
 }
 
 #[derive(Deserialize)]
@@ -2797,5 +2889,105 @@ mod tests {
         let (_t, db, _state) = seed_dupes();
         let v = get_json(&db, "/api/scan-runs?limit=100000").await;
         assert!(v.is_array(), "an absurd limit must not error: {v}");
+    }
+
+    /// `/api/settings` reads and writes via `Config::default_paths()`, which falls through to the
+    /// user's real app-data directory unless `CLEANUPSTORAGES_DATA_DIR` is set. This guard points
+    /// it at a throwaway tempdir for the test's duration and restores whatever was there before on
+    /// drop (even on panic), using the same mutex `config.rs` uses so the two never race on the
+    /// process-global env var.
+    struct ScopedDataDir {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _dir: tempfile::TempDir,
+        prev: Option<String>,
+    }
+    impl ScopedDataDir {
+        fn new() -> Self {
+            let lock = crate::config::ENV_GUARD
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let prev = std::env::var("CLEANUPSTORAGES_DATA_DIR").ok();
+            std::env::set_var("CLEANUPSTORAGES_DATA_DIR", dir.path());
+            ScopedDataDir {
+                _lock: lock,
+                _dir: dir,
+                prev,
+            }
+        }
+    }
+    impl Drop for ScopedDataDir {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("CLEANUPSTORAGES_DATA_DIR", v),
+                None => std::env::remove_var("CLEANUPSTORAGES_DATA_DIR"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_endpoint_returns_the_effective_limits() {
+        let _scope = ScopedDataDir::new();
+        let (_t, db, _state) = seed_dupes();
+        let v = get_json(&db, "/api/settings").await;
+        assert_eq!(v["archive_ratio_cap"], 10000);
+        assert_eq!(v["max_archive_depth"], 8);
+    }
+
+    #[tokio::test]
+    async fn posting_settings_without_a_csrf_token_is_refused() {
+        // Every write endpoint in this file is guarded; a settings write is no exception.
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let _scope = ScopedDataDir::new();
+        let (_t, _db, state) = seed_dupes();
+        let app = build_router_with(state);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/settings")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"archive_ratio_cap":5000}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_buffer_budget_is_refused_with_a_reason() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let _scope = ScopedDataDir::new();
+        let (_t, _db, state) = seed_dupes();
+        let token = state.csrf_token.clone();
+        let app = build_router_with(state);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/settings")
+                    .header("content-type", "application/json")
+                    .header("x-cleanup-token", token)
+                    .body(Body::from(
+                        r#"{"archive_total_buffer_bytes": 1000000000000000}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(res.into_body(), 100_000)
+            .await
+            .unwrap();
+        let msg = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            msg.to_lowercase().contains("memory"),
+            "the refusal must say why: {msg}"
+        );
     }
 }
