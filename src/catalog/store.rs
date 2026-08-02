@@ -41,17 +41,32 @@ impl Catalog {
         Ok(())
     }
 
-    /// (size_bytes, modified_time-or-0) for a loose file, if catalogued.
+    /// `(size_bytes, modified_time, has_archive_entries)` for a loose file, or None if unknown.
+    ///
+    /// The third field exists so the incremental-skip path never has to open a file to learn
+    /// whether it is an archive. Guessing from the filename would be wrong for a renamed zip, and
+    /// a skip path that fails to touch an archive's entries lets the sweep mark present files
+    /// missing.
     pub fn get_file_meta(
         &self,
         volume_id: &str,
         relative_path: &str,
-    ) -> anyhow::Result<Option<(i64, i64)>> {
+    ) -> anyhow::Result<Option<(i64, i64, bool)>> {
         let row = self.conn.query_row(
-            "SELECT size_bytes, IFNULL(modified_time,0) FROM files
-             WHERE volume_id=?1 AND relative_path=?2 AND container_chain IS NULL",
+            "SELECT size_bytes, IFNULL(modified_time,0),
+                    EXISTS(SELECT 1 FROM files e
+                            WHERE e.volume_id=?1 AND e.relative_path=?2
+                              AND e.container_chain IS NOT NULL)
+               FROM files
+              WHERE volume_id=?1 AND relative_path=?2 AND container_chain IS NULL",
             params![volume_id, relative_path],
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)? != 0,
+                ))
+            },
         );
         match row {
             Ok(v) => Ok(Some(v)),
@@ -1545,5 +1560,44 @@ mod tests {
         let rec = cat.get_file(id).unwrap().unwrap();
         assert_eq!(rec.content_hash, "NEW");
         assert_eq!(rec.size_bytes, 999);
+    }
+
+    #[test]
+    fn get_file_meta_reports_whether_the_file_has_archive_entries() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_volume(&crate::catalog::models::Volume {
+            volume_id: "v".into(),
+            label: "V".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
+        let mk = |rel: &str, chain: Option<&str>| crate::catalog::models::NewFile {
+            volume_id: "v".into(),
+            relative_path: rel.into(),
+            filename: rel.rsplit('/').next().unwrap().into(),
+            extension: "zip".into(),
+            size_bytes: 10,
+            content_hash: "H".into(),
+            created_time: Some(1),
+            modified_time: Some(5),
+            accessed_time: Some(1),
+            category: crate::category::Category::Other,
+            container_chain: chain.map(|c| c.to_string()),
+        };
+        cat.upsert_file(&mk("plain.bin", None), 1).unwrap();
+        cat.upsert_file(&mk("bundle.bak", None), 1).unwrap();
+        cat.upsert_file(&mk("bundle.bak", Some("inner.txt")), 1)
+            .unwrap();
+
+        let (_, _, plain_has) = cat.get_file_meta("v", "plain.bin").unwrap().unwrap();
+        let (_, _, bundle_has) = cat.get_file_meta("v", "bundle.bak").unwrap().unwrap();
+        assert!(!plain_has, "a loose file has no archive entries");
+        assert!(
+            bundle_has,
+            "an archive's own row must report that it has entries"
+        );
+        assert!(cat.get_file_meta("v", "absent.bin").unwrap().is_none());
     }
 }

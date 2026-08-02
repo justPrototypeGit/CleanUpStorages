@@ -238,11 +238,13 @@ pub fn scan_volume_with_progress(
         } else {
             let _t = metrics.timer(crate::scan_metrics::Phase::SkipCheck);
             match cat.get_file_meta(&identity.volume_id, &rel)? {
-                Some((old_size, old_mtime))
+                Some((old_size, old_mtime, has_archive_entries))
                     if old_size == size && old_mtime == mtime.unwrap_or(0) =>
                 {
                     cat.touch_seen(&identity.volume_id, &rel, now)?;
-                    if archive::is_archive_name_by_extension_shim(&rel) {
+                    // From the catalogue, not from the filename: a renamed zip has entries too,
+                    // and missing them here would let the sweep mark present files missing.
+                    if has_archive_entries {
                         cat.touch_archive_entries(&identity.volume_id, &rel, now)?;
                     }
                     true
@@ -324,7 +326,25 @@ pub fn scan_volume_with_progress(
             p.on_hashed();
         }
 
-        if archive::is_archive_name_by_extension_shim(&rel) {
+        // By content, not by name. Cheap here because the file has just been hashed, so it is warm
+        // in the OS cache -- unlike the skip path above, which must never open anything.
+        let is_archive = {
+            use std::io::Read;
+            std::fs::File::open(path)
+                .and_then(|mut f| {
+                    let mut head = [0u8; 4];
+                    let mut filled = 0;
+                    while filled < 4 {
+                        match f.read(&mut head[filled..])? {
+                            0 => break,
+                            n => filled += n,
+                        }
+                    }
+                    Ok(archive::looks_like_zip(&head[..filled]))
+                })
+                .unwrap_or(false)
+        };
+        if is_archive {
             let _t = metrics.timer(crate::scan_metrics::Phase::Archive);
             descend_archive(
                 cat,
@@ -1416,6 +1436,62 @@ mod tests {
         assert_eq!(
             n, 1,
             "a stopped scan must not clear a legacy error for an unreached path"
+        );
+    }
+
+    #[test]
+    fn a_renamed_zip_keeps_its_entries_active_across_an_unchanged_rescan() {
+        // THE regression for this task. Once archives are detected by content, a renamed zip has
+        // entries. If the skip path does not recognise it, those entries keep an old last_seen_at
+        // and the sweep marks present files missing -- silent data loss in the catalogue.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // A real zip, deliberately NOT named .zip.
+        let inner = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut zw = zip::ZipWriter::new(&mut buf);
+                let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                zw.start_file("inside.txt", opts).unwrap();
+                std::io::Write::write_all(&mut zw, b"payload").unwrap();
+                zw.finish().unwrap();
+            }
+            buf.into_inner()
+        };
+        std::fs::write(root.join("archive.bak"), &inner).unwrap();
+
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let stop = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+
+        let entries_active = || -> i64 {
+            cat.conn
+                .query_row(
+                    "SELECT count(*) FROM files WHERE container_chain IS NOT NULL AND status='active'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(-1)
+        };
+        assert_eq!(entries_active(), 1, "the renamed zip's entry is catalogued");
+
+        // Second scan, nothing changed on disk: the skip path runs, then the sweep.
+        let m2 = crate::scan_metrics::ScanMetrics::new();
+        let stop2 = crate::scan_control::StopFlag::new();
+        let s = scan_volume_with_progress(&cat, &root, &ident(), false, 300, None, &m2, &stop2)
+            .unwrap();
+
+        assert_eq!(
+            s.marked_missing, 0,
+            "nothing on disk changed, so nothing may be marked missing"
+        );
+        assert_eq!(
+            entries_active(),
+            1,
+            "the archive entry must still be active after an unchanged rescan"
         );
     }
 }

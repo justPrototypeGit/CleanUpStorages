@@ -63,17 +63,6 @@ fn peek4<R: Read>(r: &mut R) -> std::io::Result<(Vec<u8>, bool)> {
     Ok((head, is_zip))
 }
 
-/// TEMPORARY SHIM -- extension-based check kept only so `src/scanner.rs` (its two callers at the
-/// top-level, pre-open stage) still compiles. Task 3 rewrites those call sites to use content-based
-/// detection like `looks_like_zip`/`peek4` above; delete this shim then. Do not add new callers.
-pub(crate) fn is_archive_name_by_extension_shim(name: &str) -> bool {
-    name.rsplit('.')
-        .next()
-        .map(|e| e.eq_ignore_ascii_case("zip"))
-        .unwrap_or(false)
-        && name.contains('.')
-}
-
 /// One hashed leaf entry found while scanning an archive.
 #[derive(Debug, Clone)]
 pub struct ArchiveEntry {
