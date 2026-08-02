@@ -108,6 +108,18 @@ Scanning  38% · 56,412/148,746 files · 46.1/121 GB · 34.8 MB/s · ETA 1h 42m
 Pass `--no-count` to skip that pass and start hashing immediately. You still get live counters and a
 rate; the percentage and ETA are simply absent rather than guessed.
 
+After a scan the CLI reports whether the catalogue is complete:
+
+```
+Completeness: 12 files NOT catalogued, 35 unverified, 2 unreadable directories (contents unknown).
+```
+
+**Not catalogued** means the file is absent from the catalogue entirely — invisible to search and
+deduplication. **Unverified** means it is catalogued but this scan could not re-read it, so its hash
+may be stale. **Unreadable directories** are counted separately because the number of files inside
+one is unknown. The Drives page lists the paths and reasons. Fixing the cause and re-scanning clears
+them automatically.
+
 ### Make scans ~30% faster on Windows (worth doing before a big scan)
 
 Cataloguing hashes every byte on the drive, so Windows Defender inspects every file the scan opens.
