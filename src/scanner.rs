@@ -238,14 +238,18 @@ pub fn scan_volume_with_progress(
         } else {
             let _t = metrics.timer(crate::scan_metrics::Phase::SkipCheck);
             match cat.get_file_meta(&identity.volume_id, &rel)? {
-                Some((old_size, old_mtime, has_archive_entries))
+                Some((old_size, old_mtime, has_archive_entries, was_missing))
                     if old_size == size && old_mtime == mtime.unwrap_or(0) =>
                 {
                     cat.touch_seen(&identity.volume_id, &rel, now)?;
                     // From the catalogue, not from the filename: a renamed zip has entries too,
                     // and missing them here would let the sweep mark present files missing.
                     if has_archive_entries {
-                        cat.touch_archive_entries(&identity.volume_id, &rel, now)?;
+                        // Revive missing entries only if the archive itself was ALSO missing a
+                        // moment ago -- i.e. the whole archive vanished and came back. If the
+                        // archive was continuously present, a missing entry is one a real descend
+                        // found genuinely gone from its content, and must stay missing.
+                        cat.touch_archive_entries(&identity.volume_id, &rel, now, was_missing)?;
                     }
                     true
                 }
@@ -328,19 +332,26 @@ pub fn scan_volume_with_progress(
 
         // By content, not by name. Cheap here because the file has just been hashed, so it is warm
         // in the OS cache -- unlike the skip path above, which must never open anything.
+        //
+        // The head-magic check alone misses a prefixed/self-extracting zip (real readers locate the
+        // central directory from the END of the file, not the start). The extension is used as a
+        // HINT to do that extra tail read, never as the decision: `._Video.zip` (AppleDouble) also
+        // reaches the tail check, finds no EOCD signature, and is correctly left a leaf.
         let is_archive = {
-            use std::io::Read;
+            let ext_looks_like_zip = path
+                .extension()
+                .map(|e| e.eq_ignore_ascii_case("zip"))
+                .unwrap_or(false);
             std::fs::File::open(path)
                 .and_then(|mut f| {
-                    let mut head = [0u8; 4];
-                    let mut filled = 0;
-                    while filled < 4 {
-                        match f.read(&mut head[filled..])? {
-                            0 => break,
-                            n => filled += n,
-                        }
+                    let (_head, head_is_zip) = archive::peek4(&mut f)?;
+                    if head_is_zip {
+                        return Ok(true);
                     }
-                    Ok(archive::looks_like_zip(&head[..filled]))
+                    if ext_looks_like_zip {
+                        return archive::tail_has_eocd_signature(&mut f);
+                    }
+                    Ok(false)
                 })
                 .unwrap_or(false)
         };
@@ -1492,6 +1503,50 @@ mod tests {
             entries_active(),
             1,
             "the archive entry must still be active after an unchanged rescan"
+        );
+    }
+
+    #[test]
+    fn a_prefixed_zip_is_still_detected_and_descended_into() {
+        // A self-extracting stub (or anything else that prepends bytes) leaves a file that does not
+        // start with PK, yet is a perfectly valid zip: real readers locate the central directory
+        // from the END of the file. The head-only check alone would regress this to undetected.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let zip_bytes = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut zw = zip::ZipWriter::new(&mut buf);
+                let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                zw.start_file("inside.txt", opts).unwrap();
+                std::io::Write::write_all(&mut zw, b"payload").unwrap();
+                zw.finish().unwrap();
+            }
+            buf.into_inner()
+        };
+        // Prepend a fake self-extracting stub. The file is named .zip, but does not start with PK.
+        let mut prefixed = b"MZ this is a fake SFX stub, not a zip signature".to_vec();
+        prefixed.extend_from_slice(&zip_bytes);
+        std::fs::write(root.join("installer.zip"), &prefixed).unwrap();
+
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let stop = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+
+        let inner_catalogued: i64 = cat
+            .conn
+            .query_row(
+                "SELECT count(*) FROM files WHERE filename='inside.txt' AND container_chain IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            inner_catalogued, 1,
+            "a prefixed zip's entries must be catalogued, not skipped as a leaf"
         );
     }
 }
