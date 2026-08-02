@@ -2682,6 +2682,10 @@ mod tests {
         // without it leaves a multi-day scan unstoppable short of killing the process.
         assert!(body.contains("/api/scan/stop"));
         assert!(body.contains("stopscan"));
+        // The limits are only reachable from here; a page without the section leaves the user
+        // editing JSON by hand, which is what this feature exists to avoid.
+        assert!(body.contains("/api/settings"));
+        assert!(body.contains("archive_ratio_cap"));
         assert!(!body.contains("http://") && !body.contains("https://"));
     }
 
