@@ -119,7 +119,28 @@ pub fn load_settings(path: &Path) -> Settings {
             return Settings::default();
         }
     };
-    match serde_json::from_str(&raw) {
+    let value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                "{} is not valid settings JSON: {e}; using default limits",
+                path.display()
+            );
+            return Settings::default();
+        }
+    };
+    // A settings file must be a JSON object. Anything else (array, string, number, bool, null) is
+    // technically valid JSON that serde's struct deserializer would otherwise accept by silently
+    // assigning fields positionally (e.g. `[1,2,3]` -> max_archive_depth: 1, ...), which is not a
+    // parse error but is not what the user meant either. Treat it the same as corrupt JSON.
+    if !value.is_object() {
+        tracing::warn!(
+            "{} is not a JSON object (settings must be a top-level object); using default limits",
+            path.display()
+        );
+        return Settings::default();
+    }
+    match serde_json::from_value(value) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(
@@ -173,6 +194,37 @@ mod tests {
         std::fs::write(&p, b"{ this is not json at all ").unwrap();
         let s = load_settings(&p);
         assert!(s.archive_ratio_cap.is_none());
+    }
+
+    #[test]
+    fn a_top_level_array_yields_defaults_rather_than_positional_assignment() {
+        // Without an is_object() guard, serde's struct deserializer accepts a JSON array and
+        // assigns fields POSITIONALLY: [1,2,3] -> max_archive_depth: 1, archive_buffer_max_bytes: 2
+        // (TWO BYTES), archive_total_buffer_bytes: 3 (THREE BYTES). That is valid JSON and not a
+        // parse error, so it must be caught separately and treated like corrupt JSON.
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("settings.json");
+        std::fs::write(&p, b"[1,2,3]").unwrap();
+        let s = load_settings(&p);
+        assert_eq!(s, Settings::default());
+    }
+
+    #[test]
+    fn a_top_level_string_yields_defaults() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("settings.json");
+        std::fs::write(&p, br#""hello""#).unwrap();
+        let s = load_settings(&p);
+        assert_eq!(s, Settings::default());
+    }
+
+    #[test]
+    fn a_top_level_number_yields_defaults() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("settings.json");
+        std::fs::write(&p, b"42").unwrap();
+        let s = load_settings(&p);
+        assert_eq!(s, Settings::default());
     }
 
     #[test]
