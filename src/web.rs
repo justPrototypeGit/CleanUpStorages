@@ -960,7 +960,14 @@ fn memory_ceiling() -> Option<u64> {
     }
 }
 
-fn validate(s: &crate::config::Settings) -> Result<(), String> {
+/// `before` is the currently-EFFECTIVE config (defaults already resolved) that `s` would replace.
+/// The memory-ceiling check only fires for a field that is actually being RAISED above that
+/// baseline: F7 -- the compiled-in default `archive_buffer_max_bytes` (2 GiB) already exceeds
+/// RAM/4 on a machine with under 8 GiB, so checking every save unconditionally would refuse EVERY
+/// save on such a machine, including ones that only touch the ratio cap and leave the buffer
+/// fields untouched. A value that is unchanged, or lowered, cannot make memory pressure worse than
+/// it already was, so it must always be editable.
+fn validate(s: &crate::config::Settings, before: &crate::config::Config) -> Result<(), String> {
     if let Some(d) = s.max_archive_depth {
         if d < 1 {
             return Err("max_archive_depth must be at least 1".into());
@@ -970,6 +977,27 @@ fn validate(s: &crate::config::Settings) -> Result<(), String> {
         if r < 1 {
             return Err("archive_ratio_cap must be at least 1".into());
         }
+    }
+    // F4: zero is not a valid byte bound. `archive_buffer_max_bytes: 0` or
+    // `archive_total_buffer_bytes: 0` would buffer nothing, and `archive_entry_max_bytes: 0` would
+    // convert every present archive entry to `missing` on the next scan even though nothing on disk
+    // changed -- unlimited is spelled `null` (`Some(None)`), never `0`.
+    if let Some(v) = s.archive_buffer_max_bytes {
+        if v < 1 {
+            return Err("archive_buffer_max_bytes must be at least 1 byte".into());
+        }
+    }
+    if let Some(v) = s.archive_total_buffer_bytes {
+        if v < 1 {
+            return Err("archive_total_buffer_bytes must be at least 1 byte".into());
+        }
+    }
+    if let Some(Some(0)) = s.archive_entry_max_bytes {
+        return Err(
+            "archive_entry_max_bytes cannot be 0: use null for unlimited, not 0, which would \
+             reject every entry"
+                .into(),
+        );
     }
     if let (Some(per), Some(total)) = (s.archive_buffer_max_bytes, s.archive_total_buffer_bytes) {
         if per > total {
@@ -981,12 +1009,20 @@ fn validate(s: &crate::config::Settings) -> Result<(), String> {
         }
     }
     if let Some(ceiling) = memory_ceiling() {
-        for (name, v) in [
-            ("archive_buffer_max_bytes", s.archive_buffer_max_bytes),
-            ("archive_total_buffer_bytes", s.archive_total_buffer_bytes),
+        for (name, v, prev) in [
+            (
+                "archive_buffer_max_bytes",
+                s.archive_buffer_max_bytes,
+                before.archive_buffer_max_bytes,
+            ),
+            (
+                "archive_total_buffer_bytes",
+                s.archive_total_buffer_bytes,
+                before.archive_total_buffer_bytes,
+            ),
         ] {
             if let Some(v) = v {
-                if v > ceiling {
+                if v > ceiling && v > prev {
                     return Err(format!(
                         "{name} of {v} bytes exceeds a quarter of system memory ({ceiling} bytes); \
                          buffering that much would starve the file cache the scan depends on"
@@ -1039,8 +1075,9 @@ async fn api_settings_post(
     let merged = merge_settings(stored, body);
     // Validate the MERGED result, not the request alone: a request that omits
     // archive_total_buffer_bytes could otherwise slip an archive_buffer_max_bytes past the
-    // per-archive-vs-total rule by comparing it against nothing.
-    validate(&merged).map_err(|m| (StatusCode::BAD_REQUEST, m))?;
+    // per-archive-vs-total rule by comparing it against nothing. `cfg` is the config in effect
+    // BEFORE this write, so the memory-ceiling check in `validate` can tell a raise from a no-op.
+    validate(&merged, &cfg).map_err(|m| (StatusCode::BAD_REQUEST, m))?;
     crate::config::save_settings(&path, &merged).map_err(err500)?;
     Ok(Json(effective_settings()?))
 }
@@ -3027,6 +3064,100 @@ mod tests {
         assert!(
             msg.to_lowercase().contains("memory"),
             "the refusal must say why: {msg}"
+        );
+    }
+
+    /// A `Config` literal standing in for "the config in effect before this write" -- used to drive
+    /// `validate` directly, since the real memory ceiling (`sysinfo`) is not mockable and this needs
+    /// to hold regardless of how much RAM the test machine actually has.
+    fn config_with_buffer(buffer_bytes: u64, total_bytes: u64) -> crate::config::Config {
+        crate::config::Config {
+            catalog_path: std::path::PathBuf::from("unused/catalog.db"),
+            snapshot_retention: 10,
+            max_archive_depth: 8,
+            archive_buffer_max_bytes: buffer_bytes,
+            archive_total_buffer_bytes: total_bytes,
+            archive_entry_max_bytes: Some(64 * 1024 * 1024 * 1024),
+            archive_ratio_cap: 10_000,
+        }
+    }
+
+    #[test]
+    fn f4_zero_is_refused_for_every_byte_limit() {
+        // F4: zero converts present archive entries to `missing` on the next scan even though
+        // nothing on disk changed (archive_entry_max_bytes: 0 rejects every entry; the buffer
+        // fields at 0 buffer nothing). Unlimited is spelled `null`, never `0`.
+        let before = config_with_buffer(2 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
+        let zero_buffer = crate::config::Settings {
+            archive_buffer_max_bytes: Some(0),
+            ..Default::default()
+        };
+        assert!(
+            validate(&zero_buffer, &before).is_err(),
+            "0 must be refused for archive_buffer_max_bytes"
+        );
+
+        let zero_total = crate::config::Settings {
+            archive_total_buffer_bytes: Some(0),
+            ..Default::default()
+        };
+        assert!(
+            validate(&zero_total, &before).is_err(),
+            "0 must be refused for archive_total_buffer_bytes"
+        );
+
+        let zero_entry = crate::config::Settings {
+            archive_entry_max_bytes: Some(Some(0)),
+            ..Default::default()
+        };
+        assert!(
+            validate(&zero_entry, &before).is_err(),
+            "0 must be refused for archive_entry_max_bytes -- unlimited is null, not 0"
+        );
+
+        // Unlimited (null) must still be accepted.
+        let unlimited_entry = crate::config::Settings {
+            archive_entry_max_bytes: Some(None),
+            ..Default::default()
+        };
+        assert!(
+            validate(&unlimited_entry, &before).is_ok(),
+            "null (explicitly unlimited) must remain valid"
+        );
+    }
+
+    #[test]
+    fn f7_an_unchanged_oversized_buffer_is_not_refused() {
+        // F7: on a machine with under 8 GiB RAM, the compiled-in default archive_buffer_max_bytes
+        // (2 GiB) already exceeds RAM/4, so checking every save unconditionally would refuse EVERY
+        // save on such a machine -- including one that only edits the ratio cap and resends the
+        // buffer fields unchanged. A value larger than any real machine's RAM/4 is used here so the
+        // assertion holds regardless of the test machine's actual memory.
+        let absurdly_large = u64::MAX / 2;
+        let before = config_with_buffer(absurdly_large, absurdly_large);
+        let s = crate::config::Settings {
+            archive_buffer_max_bytes: Some(absurdly_large),
+            archive_total_buffer_bytes: Some(absurdly_large),
+            archive_ratio_cap: Some(4321),
+            ..Default::default()
+        };
+        assert!(
+            validate(&s, &before).is_ok(),
+            "an unchanged (or lowered) value must never be refused by the memory ceiling"
+        );
+    }
+
+    #[test]
+    fn f7_raising_the_buffer_past_the_ceiling_is_still_refused() {
+        // The other half of F7: the ceiling must still bite when a value is genuinely being raised.
+        let before = config_with_buffer(1, 1);
+        let s = crate::config::Settings {
+            archive_buffer_max_bytes: Some(u64::MAX / 2),
+            ..Default::default()
+        };
+        assert!(
+            validate(&s, &before).is_err(),
+            "raising a value past the memory ceiling must still be refused"
         );
     }
 

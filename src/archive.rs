@@ -37,19 +37,37 @@ impl ArchiveLimits {
     /// One line for the CLI, printed before a scan starts: these values decide what will and will
     /// not be catalogued, and a multi-day scan is a bad time to discover them.
     pub fn summary_line(&self) -> String {
-        let gb = |b: u64| format!("{:.0} GB", b as f64 / 1_073_741_824.0);
         let entry = match self.entry_max_bytes {
-            Some(b) => gb(b),
+            Some(b) => human_bytes(b),
             None => "unlimited".to_string(),
         };
         format!(
             "Archive limits: ratio cap {}, largest entry {}, nested buffer {} (total {}), depth {}",
             self.ratio_cap,
             entry,
-            gb(self.buffer_max_bytes),
-            gb(self.total_buffer_bytes),
+            human_bytes(self.buffer_max_bytes),
+            human_bytes(self.total_buffer_bytes),
             self.max_depth
         )
+    }
+}
+
+/// Format a byte count with whatever unit keeps it legible: F6 -- formatting everything as
+/// `{:.0} GB` made a 500 MB ceiling and a 0-byte ceiling both print `0 GB`, on the one line the
+/// user is meant to sanity-check before committing a multi-day scan.
+fn human_bytes(b: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let bf = b as f64;
+    if bf >= GB {
+        format!("{:.1} GB", bf / GB)
+    } else if bf >= MB {
+        format!("{:.1} MB", bf / MB)
+    } else if bf >= KB {
+        format!("{:.1} KB", bf / KB)
+    } else {
+        format!("{b} bytes")
     }
 }
 
@@ -355,7 +373,19 @@ mod tests {
 
     #[test]
     fn limits_from_config() {
-        let cfg = Config::default_paths().unwrap();
+        // F2: a `Config` literal, not `Config::default_paths()` -- that call reads whatever
+        // `settings.json` exists in the AMBIENT data directory (no ENV_GUARD, no scoped data dir),
+        // so this test would fail the moment the user saves any limit from the UI, and it would
+        // `create_dir_all` the real app-data directory as a side effect.
+        let cfg = Config {
+            catalog_path: std::path::PathBuf::from("unused/catalog.db"),
+            snapshot_retention: 10,
+            max_archive_depth: 8,
+            archive_buffer_max_bytes: 2 * 1024 * 1024 * 1024,
+            archive_total_buffer_bytes: 2 * 1024 * 1024 * 1024,
+            archive_entry_max_bytes: Some(64 * 1024 * 1024 * 1024),
+            archive_ratio_cap: 10_000,
+        };
         let l = ArchiveLimits::from_config(&cfg);
         assert_eq!(l.max_depth, 8);
         assert_eq!(l.buffer_max_bytes, 2 * 1024 * 1024 * 1024);
@@ -547,6 +577,28 @@ mod tests {
             u.contains("unlimited"),
             "an unlimited ceiling must say so rather than printing a huge number: {u}"
         );
+    }
+
+    #[test]
+    fn the_limits_summary_distinguishes_small_byte_values_from_zero() {
+        // F6: formatting every value as `{:.0} GB` made a 500 MB ceiling and a 0-byte ceiling both
+        // print `0 GB`, on the one line the user is meant to sanity-check before a multi-day scan.
+        let zero = ArchiveLimits {
+            entry_max_bytes: Some(0),
+            ..limits()
+        };
+        let half_gb = ArchiveLimits {
+            entry_max_bytes: Some(500 * 1024 * 1024),
+            ..limits()
+        };
+        let z = zero.summary_line();
+        let h = half_gb.summary_line();
+        assert_ne!(
+            z, h,
+            "a 0-byte ceiling and a 500 MB ceiling must not print identically"
+        );
+        assert!(z.contains("0 bytes"), "got {z}");
+        assert!(h.contains("MB"), "got {h}");
     }
 
     #[test]
