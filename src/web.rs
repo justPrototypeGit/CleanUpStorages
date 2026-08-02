@@ -998,15 +998,50 @@ fn validate(s: &crate::config::Settings) -> Result<(), String> {
     Ok(())
 }
 
+/// Merge a POST body onto the currently-stored settings: a field the request omits (`None`) keeps
+/// whatever is stored, a field it sets (`Some(..)`) overwrites -- including `Some(None)` on
+/// `archive_entry_max_bytes`, which means "explicitly unlimited" and must overwrite too, not be
+/// treated as absence.
+///
+/// Two different meanings of "absent" meet here: in the STORED file, `None` means "unset, use the
+/// compiled-in default"; in the REQUEST, `None` means "omitted, keep whatever is stored". Without
+/// this merge, a partial POST (e.g. one field from a `curl` call) would silently reset every other
+/// field to its hardcoded default -- exactly what Task 4's "every field is optional" contract was
+/// meant to prevent.
+fn merge_settings(
+    stored: crate::config::Settings,
+    req: crate::config::Settings,
+) -> crate::config::Settings {
+    crate::config::Settings {
+        max_archive_depth: req.max_archive_depth.or(stored.max_archive_depth),
+        archive_buffer_max_bytes: req
+            .archive_buffer_max_bytes
+            .or(stored.archive_buffer_max_bytes),
+        archive_total_buffer_bytes: req
+            .archive_total_buffer_bytes
+            .or(stored.archive_total_buffer_bytes),
+        archive_entry_max_bytes: req
+            .archive_entry_max_bytes
+            .or(stored.archive_entry_max_bytes),
+        archive_ratio_cap: req.archive_ratio_cap.or(stored.archive_ratio_cap),
+    }
+}
+
 async fn api_settings_post(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<crate::config::Settings>,
 ) -> Result<Json<SettingsDto>, (StatusCode, String)> {
     check_csrf(&headers, &state)?;
-    validate(&body).map_err(|m| (StatusCode::BAD_REQUEST, m))?;
     let cfg = crate::config::Config::default_paths().map_err(err500)?;
-    crate::config::save_settings(&cfg.settings_path(), &body).map_err(err500)?;
+    let path = cfg.settings_path();
+    let stored = crate::config::load_settings(&path);
+    let merged = merge_settings(stored, body);
+    // Validate the MERGED result, not the request alone: a request that omits
+    // archive_total_buffer_bytes could otherwise slip an archive_buffer_max_bytes past the
+    // per-archive-vs-total rule by comparing it against nothing.
+    validate(&merged).map_err(|m| (StatusCode::BAD_REQUEST, m))?;
+    crate::config::save_settings(&path, &merged).map_err(err500)?;
     Ok(Json(effective_settings()?))
 }
 
@@ -2988,6 +3023,117 @@ mod tests {
         assert!(
             msg.to_lowercase().contains("memory"),
             "the refusal must say why: {msg}"
+        );
+    }
+
+    /// POST `/api/settings` with the CSRF token attached, returning status and the raw body text
+    /// (a success body is JSON, a rejection body is plain text -- callers parse only what they need).
+    async fn post_settings(
+        state: AppState,
+        token: &str,
+        body: &str,
+    ) -> (axum::http::StatusCode, String) {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let app = build_router_with(state);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/settings")
+                    .header("content-type", "application/json")
+                    .header("x-cleanup-token", token)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), 100_000)
+            .await
+            .unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_partial_post_does_not_reset_the_fields_it_omits() {
+        // The reviewer's scenario: set one field, then POST only an unrelated one. The first
+        // field must survive -- Task 4's whole point was that every field is optional, so a
+        // partial write must not silently reset the rest to their compiled-in defaults.
+        let _scope = ScopedDataDir::new();
+        let (_t, _db, state) = seed_dupes();
+        let token = state.csrf_token.clone();
+
+        let (status, _) =
+            post_settings(state.clone(), &token, r#"{"archive_ratio_cap": 9999}"#).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+
+        let (status, _) = post_settings(state.clone(), &token, r#"{"max_archive_depth": 3}"#).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+
+        let v = get_json_state(state, "/api/settings").await;
+        assert_eq!(
+            v["archive_ratio_cap"], 9999,
+            "an earlier, unrelated field must survive a later partial POST"
+        );
+        assert_eq!(v["max_archive_depth"], 3);
+    }
+
+    #[tokio::test]
+    async fn an_explicit_null_still_sets_unlimited_not_omission() {
+        // `null` and "key absent" both look like Rust's `None`, but they must mean different
+        // things: absent keeps whatever is stored, null explicitly overwrites it to unlimited.
+        let _scope = ScopedDataDir::new();
+        let (_t, _db, state) = seed_dupes();
+        let token = state.csrf_token.clone();
+
+        let (status, _) = post_settings(
+            state.clone(),
+            &token,
+            r#"{"archive_entry_max_bytes": 12345}"#,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+
+        let (status, _) = post_settings(
+            state.clone(),
+            &token,
+            r#"{"archive_entry_max_bytes": null}"#,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+
+        let v = get_json_state(state, "/api/settings").await;
+        assert!(
+            v["archive_entry_max_bytes"].is_null(),
+            "an explicit null must mean unlimited, not 'leave it alone': {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn merged_validation_rejects_a_per_archive_bound_that_exceeds_the_stored_total() {
+        // Validating the request in isolation would miss this: the request only mentions
+        // archive_buffer_max_bytes, so a check against the request alone has nothing to compare
+        // it to. The stored archive_total_buffer_bytes must be part of what gets validated.
+        let _scope = ScopedDataDir::new();
+        let (_t, _db, state) = seed_dupes();
+        let token = state.csrf_token.clone();
+
+        let (status, _) = post_settings(
+            state.clone(),
+            &token,
+            r#"{"archive_total_buffer_bytes": 1000000}"#,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+
+        let (status, msg) =
+            post_settings(state, &token, r#"{"archive_buffer_max_bytes": 2000000}"#).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            msg.contains("archive_total_buffer_bytes"),
+            "the refusal must name the stored limit it was checked against: {msg}"
         );
     }
 }
