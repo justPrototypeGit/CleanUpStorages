@@ -33,6 +33,24 @@ impl ArchiveLimits {
             ratio_cap: cfg.archive_ratio_cap,
         }
     }
+
+    /// One line for the CLI, printed before a scan starts: these values decide what will and will
+    /// not be catalogued, and a multi-day scan is a bad time to discover them.
+    pub fn summary_line(&self) -> String {
+        let gb = |b: u64| format!("{:.0} GB", b as f64 / 1_073_741_824.0);
+        let entry = match self.entry_max_bytes {
+            Some(b) => gb(b),
+            None => "unlimited".to_string(),
+        };
+        format!(
+            "Archive limits: ratio cap {}, largest entry {}, nested buffer {} (total {}), depth {}",
+            self.ratio_cap,
+            entry,
+            gb(self.buffer_max_bytes),
+            gb(self.total_buffer_bytes),
+            self.max_depth
+        )
+    }
 }
 
 /// True if these leading bytes carry a zip signature.
@@ -511,6 +529,24 @@ mod tests {
             ratio_cap: 10_000,
             total_buffer_bytes: 2 * 1024 * 1024 * 1024,
         }
+    }
+
+    #[test]
+    fn the_limits_summary_names_every_value_including_unlimited() {
+        let l = limits();
+        let s = l.summary_line();
+        assert!(s.contains("10000"), "the ratio cap must be visible: {s}");
+        assert!(s.contains("depth 8"), "got {s}");
+
+        let unlimited = ArchiveLimits {
+            entry_max_bytes: None,
+            ..limits()
+        };
+        let u = unlimited.summary_line();
+        assert!(
+            u.contains("unlimited"),
+            "an unlimited ceiling must say so rather than printing a huge number: {u}"
+        );
     }
 
     #[test]
