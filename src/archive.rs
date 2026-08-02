@@ -46,10 +46,11 @@ pub fn looks_like_zip(prefix: &[u8]) -> bool {
     )
 }
 
-/// Read up to 4 leading bytes from a non-seekable stream, reporting whether they look like a zip.
-/// The bytes are returned so the caller can chain them back -- dropping them would silently
-/// truncate the content hash.
-fn peek4<R: Read>(r: &mut R) -> std::io::Result<(Vec<u8>, bool)> {
+/// Read up to 4 leading bytes from a stream, reporting whether they look like a zip. The bytes are
+/// returned so a caller reading a non-seekable stream (an archive entry) can chain them back --
+/// dropping them would silently truncate the content hash. `pub(crate)` so the scanner's top-level
+/// detection shares this instead of re-implementing the same 4-byte loop.
+pub(crate) fn peek4<R: Read>(r: &mut R) -> std::io::Result<(Vec<u8>, bool)> {
     let mut buf = [0u8; 4];
     let mut filled = 0;
     while filled < 4 {
@@ -61,6 +62,32 @@ fn peek4<R: Read>(r: &mut R) -> std::io::Result<(Vec<u8>, bool)> {
     let head = buf[..filled].to_vec();
     let is_zip = looks_like_zip(&head);
     Ok((head, is_zip))
+}
+
+/// The largest an End Of Central Directory record plus its trailing comment can occupy: a fixed
+/// 22-byte record plus up to 64 KiB of comment (the comment length field is 16 bits).
+const EOCD_MAX_TAIL: u64 = 64 * 1024 + 22;
+
+/// True if the last `min(EOCD_MAX_TAIL, file length)` bytes of a seekable stream contain the EOCD
+/// signature `PK\x05\x06`.
+///
+/// A zip does not have to START with `PK`: a self-extracting stub, or any tool that prepends data,
+/// leaves valid zip content whose central directory a real reader locates from the END of the
+/// file, not the start. `looks_like_zip` alone therefore misses prefixed zips. This is the fallback
+/// for exactly that case -- deliberately gated on the filename already claiming to be a zip (see
+/// the scanner call site), so it is not paid for every ordinary file on the drive.
+///
+/// Seek-only: an archive entry being read mid-descent is not seekable, so nested entries keep using
+/// the head-only `looks_like_zip` check in `scan_level` above and a prefixed zip nested inside
+/// another archive is not detected. Only the top-level scanner (which holds a real `File`) uses this.
+pub(crate) fn tail_has_eocd_signature<R: Read + std::io::Seek>(r: &mut R) -> std::io::Result<bool> {
+    use std::io::SeekFrom;
+    let len = r.seek(SeekFrom::End(0))?;
+    let window = EOCD_MAX_TAIL.min(len);
+    r.seek(SeekFrom::End(-(window as i64)))?;
+    let mut buf = vec![0u8; window as usize];
+    r.read_exact(&mut buf)?;
+    Ok(buf.windows(4).any(|w| w == [b'P', b'K', 0x05, 0x06]))
 }
 
 /// One hashed leaf entry found while scanning an archive.
