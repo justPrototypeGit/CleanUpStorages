@@ -1221,6 +1221,46 @@ mod tests {
     }
 
     #[test]
+    fn an_entry_at_exactly_the_revive_floor_is_revived() {
+        // Direct attack on the boundary comparison itself: an entry whose last_seen_at is EXACTLY
+        // equal to the floor (the archive's own last_seen_at at the moment it went missing) is the
+        // ordinary "went missing together with the archive" case, and it is what makes `>=` the
+        // correct comparison rather than `>`. If the comparison were ever tightened to `>`, this is
+        // what would silently break -- every normal whole-archive round-trip would stop reviving.
+        let (_t, cat) = open_tmp();
+        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("a.jpg", "h1"), None, 200)
+            .unwrap();
+        let id = cat
+            .conn
+            .query_row(
+                "SELECT id FROM files WHERE relative_path='old.zip' AND container_chain IS NOT NULL",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+        // Entry's last_seen_at is 200 (from upsert above). Mark it missing without touching
+        // last_seen_at, exactly as mark_missing_scanned does.
+        cat.conn
+            .execute("UPDATE files SET status='missing' WHERE id=?1", [id])
+            .unwrap();
+
+        // Floor == 200, exactly equal to the entry's own last_seen_at.
+        let touched = cat
+            .touch_archive_entries("vol-1", "old.zip", 300, Some(200))
+            .unwrap();
+        assert_eq!(
+            touched, 1,
+            "an entry at exactly the floor must revive (>= not >)"
+        );
+
+        let status: String = cat
+            .conn
+            .query_row("SELECT status FROM files WHERE id=?1", [id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "active");
+    }
+
+    #[test]
     fn touch_archive_entries_does_not_revive_a_quarantined_entry() {
         // Quarantine/purge are user decisions about files that were moved or deleted. A scan must
         // never silently flip them back to 'active', even with a permissive revive floor (the
