@@ -275,11 +275,21 @@ mod tests {
     fn settings_override_the_defaults_in_config() {
         let _g = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let t = tempfile::tempdir().unwrap();
+        // F3: save and restore whatever was there before, rather than unconditionally removing the
+        // var. `remove_var` unconditionally is exactly what broke the documented mitigation for the
+        // known `snapshot_best_effort` issue ("set CLEANUPSTORAGES_DATA_DIR before running the
+        // suite") -- if a caller had already scoped the var to a throwaway dir before this test ran,
+        // an unconditional remove would fall the rest of the suite through to the user's real
+        // app-data directory the moment this test finished.
+        let prev = std::env::var("CLEANUPSTORAGES_DATA_DIR").ok();
         std::env::set_var("CLEANUPSTORAGES_DATA_DIR", t.path());
         let p = t.path().join("settings.json");
         std::fs::write(&p, br#"{"archive_ratio_cap": 777, "max_archive_depth": 3}"#).unwrap();
         let cfg = Config::default_paths().unwrap();
-        std::env::remove_var("CLEANUPSTORAGES_DATA_DIR");
+        match prev {
+            Some(v) => std::env::set_var("CLEANUPSTORAGES_DATA_DIR", v),
+            None => std::env::remove_var("CLEANUPSTORAGES_DATA_DIR"),
+        }
         assert_eq!(cfg.archive_ratio_cap, 777);
         assert_eq!(cfg.max_archive_depth, 3);
         assert_eq!(
