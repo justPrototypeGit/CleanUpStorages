@@ -54,6 +54,31 @@ fn should_skip(path: &Path, file_name: &std::ffi::OsStr) -> bool {
             .any(|c| c.as_os_str() == crate::volume::QUARANTINE_DIR)
 }
 
+/// Opens `path` for the top-level archive-detection peek. Factored out purely so a test can force
+/// this one call to fail without also failing the hash step that runs just before it -- a real OS
+/// lock (share violation, permission) held externally blocks both opens indiscriminately, so there
+/// is no way to reproduce a detection-only failure with real file handles.
+#[cfg(not(test))]
+fn open_for_archive_detection(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_DETECTION_OPEN_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn open_for_archive_detection(path: &Path) -> std::io::Result<std::fs::File> {
+    if FORCE_DETECTION_OPEN_ERROR.with(|f| f.get()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "forced for test",
+        ));
+    }
+    std::fs::File::open(path)
+}
+
 /// Path of `path` relative to `root`, normalized to forward slashes; `None` if not under `root`.
 fn relative_path(path: &Path, root: &Path) -> Option<String> {
     path.strip_prefix(root)
@@ -344,18 +369,41 @@ pub fn scan_volume_with_progress(
                 .extension()
                 .map(|e| e.eq_ignore_ascii_case("zip"))
                 .unwrap_or(false);
-            std::fs::File::open(path)
-                .and_then(|mut f| {
-                    let (_head, head_is_zip) = archive::peek4(&mut f)?;
-                    if head_is_zip {
-                        return Ok(true);
+            let detected = open_for_archive_detection(path).and_then(|mut f| {
+                let (_head, head_is_zip) = archive::peek4(&mut f)?;
+                if head_is_zip {
+                    return Ok(true);
+                }
+                if ext_looks_like_zip {
+                    return archive::tail_has_eocd_signature(&mut f);
+                }
+                Ok(false)
+            });
+            match detected {
+                Ok(v) => v,
+                Err(e) => {
+                    // A detection failure must never be silently indistinguishable from "not an
+                    // archive": that would leave `descend_archive` unrun with no error logged, and
+                    // the entries inside would be swept to `missing` with no way to self-heal on a
+                    // later clean rescan (the archive's own row stays `active`, so the revive floor
+                    // is `None`). Log it so #6's completeness audit surfaces it, and fall back to
+                    // the extension test rather than to `false` so a momentarily-locked `.zip` is
+                    // still treated as an archive.
+                    cat.log_scan_error(
+                        Some(&identity.volume_id),
+                        &rel,
+                        &format!("archive detection: {e}"),
+                        "read",
+                        crate::catalog::scan_errors::classify_io(&e),
+                        now,
+                    )?;
+                    summary.errors += 1;
+                    if let Some(p) = progress {
+                        p.on_error();
                     }
-                    if ext_looks_like_zip {
-                        return archive::tail_has_eocd_signature(&mut f);
-                    }
-                    Ok(false)
-                })
-                .unwrap_or(false)
+                    ext_looks_like_zip
+                }
+            }
         };
         if is_archive {
             let _t = metrics.timer(crate::scan_metrics::Phase::Archive);
@@ -1576,6 +1624,54 @@ mod tests {
         assert_eq!(
             inner_catalogued, 1,
             "a prefixed zip's entries must be catalogued, not skipped as a leaf"
+        );
+    }
+
+    /// F1: a failed open at the top-level archive-detection step must never be silently
+    /// indistinguishable from "not an archive". Forces the detection `File::open` to fail (a real
+    /// external lock would also fail the hash step that runs just before it, so a thread-local
+    /// injection point is the only reproducible way to isolate this exact call).
+    ///
+    /// This test is DESIGNED to fail if the fix regresses to `.unwrap_or(false)`: with that old
+    /// behaviour, `is_archive` silently becomes `false`, `descend_archive` never runs, no scan error
+    /// is logged, and the archive's entry is swept to `missing` with no way to self-heal (the
+    /// archive's own row stays `active`, so the revive floor is `None`).
+    #[test]
+    fn a_failed_detection_open_is_logged_and_does_not_lose_the_archives_entries() {
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.zip"), make_zip(&[("a.txt", b"payload")])).unwrap();
+
+        FORCE_DETECTION_OPEN_ERROR.with(|f| f.set(true));
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let stop = crate::scan_control::StopFlag::new();
+        let scan_result =
+            scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop);
+        FORCE_DETECTION_OPEN_ERROR.with(|f| f.set(false));
+        let summary = scan_result.unwrap();
+
+        assert_eq!(
+            summary.errors, 1,
+            "a detection failure is a real scan error and must be counted"
+        );
+        let logged: i64 = cat
+            .conn
+            .query_row(
+                "SELECT count(*) FROM scan_errors WHERE path='a.zip'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            logged, 1,
+            "a detection failure must be recorded, not silent (this is the F1 defect)"
+        );
+        assert_eq!(
+            status_of(&cat, "a.txt"),
+            "active",
+            "the archive's entry must not be swept to missing just because detection had to \
+             fall back on the extension test"
         );
     }
 
