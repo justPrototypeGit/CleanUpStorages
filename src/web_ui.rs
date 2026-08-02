@@ -1235,30 +1235,32 @@ const LIMITS=[
   ["max_archive_depth","Maximum nesting depth",""],
 ];
 async function loadLimits(){
-  const d=await (await fetch("/api/settings")).json();
+  const d=await apiGet("/api/settings");
   $("#limitsbody").innerHTML=LIMITS.map(([k,label,help])=>`
     <div style="margin-bottom:10px">
-      <label for="lim_${k}">${esc(label)}</label>
-      <input id="lim_${k}" name="${esc(k)}" value="${d[k]===null||d[k]===undefined?'':esc(String(d[k]))}" style="width:100%">
+      <label for="lim_${esc(k)}">${esc(label)}</label>
+      <input id="lim_${esc(k)}" name="${esc(k)}" value="${d[k]===null||d[k]===undefined?'':esc(String(d[k]))}" style="width:100%">
       ${help?`<div class="mut" style="font-size:12px">${esc(help)}</div>`:''}
     </div>`).join('')
     + `<button class="btn" id="savelimits">Save</button>`;
 }
 document.addEventListener('toggle', e=>{
   if(e.target.id==='limits' && e.target.open && !e.target.dataset.loaded){
-    e.target.dataset.loaded='1';
-    loadLimits().catch(()=>{ $("#limitsbody").textContent='Could not load the limits.'; });
+    // Set the flag only once the load succeeds, so a failure leaves the section retryable on the
+    // next collapse/expand instead of stuck on the error message forever.
+    loadLimits().then(()=>{ e.target.dataset.loaded='1'; })
+      .catch(()=>{ $("#limitsbody").textContent='Could not load the limits.'; });
   }
 }, true);
 document.addEventListener('click', async e=>{
   if(e.target.id!=='savelimits') return;
   const body={};
-  for(const [k] of LIMITS){
+  for(const [k,label] of LIMITS){
     const raw=$("#lim_"+k).value.trim();
     // Empty means "unlimited" for the leaf ceiling and "leave unset" for everything else.
     if(raw==='') { if(k==='archive_entry_max_bytes') body[k]=null; continue; }
     const n=Number(raw);
-    if(!Number.isFinite(n)||n<0){ $("#limitsmsg").textContent=`${k} must be a number.`; return; }
+    if(!Number.isFinite(n)||n<0){ $("#limitsmsg").textContent=`${label} must be a number.`; return; }
     body[k]=n;
   }
   // apiPost (defined in the shared shell, web_ui.rs:370) sends the x-cleanup-token header and
