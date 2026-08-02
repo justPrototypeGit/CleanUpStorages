@@ -242,7 +242,7 @@ pub fn scan_volume_with_progress(
                     if old_size == size && old_mtime == mtime.unwrap_or(0) =>
                 {
                     cat.touch_seen(&identity.volume_id, &rel, now)?;
-                    if archive::is_archive_name(&rel) {
+                    if archive::is_archive_name_by_extension_shim(&rel) {
                         cat.touch_archive_entries(&identity.volume_id, &rel, now)?;
                     }
                     true
@@ -324,7 +324,7 @@ pub fn scan_volume_with_progress(
             p.on_hashed();
         }
 
-        if archive::is_archive_name(&rel) {
+        if archive::is_archive_name_by_extension_shim(&rel) {
             let _t = metrics.timer(crate::scan_metrics::Phase::Archive);
             descend_archive(
                 cat,
