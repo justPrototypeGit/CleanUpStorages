@@ -120,6 +120,46 @@ may be stale. **Unreadable directories** are counted separately because the numb
 one is unknown. The Drives page lists the paths and reasons. Fixing the cause and re-scanning clears
 them automatically.
 
+### Archive limits
+
+Scanning descends into zip archives and catalogues what is inside. Five limits govern that, and
+`scan` prints them as it starts:
+
+```
+Archive limits: ratio cap 10000, largest entry 64.0 GB, nested buffer 2.0 GB (total 2.0 GB), depth 8
+```
+
+- **Ratio cap** refuses an entry whose declared uncompressed/compressed ratio is higher. It bounds
+  *time*, not memory — genuine files reach the hundreds (an FPGA bitstream measured 815), while a zip
+  bomb reaches the millions.
+- **Largest entry** is the biggest file inside an archive that will be catalogued, or unlimited.
+  These are streamed, so this bounds how long one entry may take rather than memory use.
+- **Nested buffer** and **total buffer** are real memory: a zip inside a zip must be held in RAM to
+  be hashed and re-opened.
+- **Depth** bounds how many archives deep the scan will go.
+
+Edit them on the **Scan** page of `cleanupstorages browse`, or in `settings.json` beside the
+catalogue. Changes apply to the next scan. If that file is missing or invalid the defaults are used
+and a warning is logged — a bad settings file never stops a scan.
+
+![Archive limits on the Scan page](docs/screenshots/scan-limits.png)
+
+Archives are recognised by **their content, not their extension**. A zip renamed to something else is
+catalogued properly, and a file that merely ends in `.zip` — such as a macOS `._name.zip` sidecar — is
+not mistaken for one. Note the consequence: any file in zip format is an archive, including `.docx`,
+`.xlsx`, `.jar` and `.epub`.
+
+### Is the catalogue complete?
+
+A scan continues past files it cannot read, so `scan` and the **Drives** page report what was missed:
+
+![Completeness on the Drives page](docs/screenshots/drives-completeness.png)
+
+**Not catalogued** means the file is absent from the catalogue entirely — invisible to search and
+deduplication. **Unverified** means it is catalogued but this scan could not re-read it, so its hash
+may be stale. **Unreadable directories** are counted separately, because the number of files inside
+one is unknown. Fixing the cause and re-scanning clears them automatically.
+
 ### Make scans ~30% faster on Windows (worth doing before a big scan)
 
 Cataloguing hashes every byte on the drive, so Windows Defender inspects every file the scan opens.

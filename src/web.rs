@@ -72,6 +72,10 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/scan/stop", post(api_scan_stop))
         .route("/api/scan-runs", get(api_scan_runs))
         .route("/api/pick-folder", post(api_pick_folder))
+        .route(
+            "/api/settings",
+            get(api_settings_get).post(api_settings_post),
+        )
         .route("/review", get(review))
         .route("/scan", get(scan_page_h))
         .route("/drives", get(drives_page_h))
@@ -916,6 +920,166 @@ async fn api_repack(
         removed_entry: out.removed_entry,
         retained_entries: out.retained_entries,
     }))
+}
+
+#[derive(serde::Serialize)]
+struct SettingsDto {
+    max_archive_depth: usize,
+    archive_buffer_max_bytes: u64,
+    archive_total_buffer_bytes: u64,
+    archive_entry_max_bytes: Option<u64>,
+    archive_ratio_cap: u64,
+}
+
+/// The effective configuration, re-read from disk. Shared by both handlers so a write responds
+/// with what is actually in force rather than echoing the request back.
+fn effective_settings() -> Result<SettingsDto, (StatusCode, String)> {
+    let cfg = crate::config::Config::default_paths().map_err(err500)?;
+    Ok(SettingsDto {
+        max_archive_depth: cfg.max_archive_depth,
+        archive_buffer_max_bytes: cfg.archive_buffer_max_bytes,
+        archive_total_buffer_bytes: cfg.archive_total_buffer_bytes,
+        archive_entry_max_bytes: cfg.archive_entry_max_bytes,
+        archive_ratio_cap: cfg.archive_ratio_cap,
+    })
+}
+
+async fn api_settings_get() -> Result<Json<SettingsDto>, (StatusCode, String)> {
+    Ok(Json(effective_settings()?))
+}
+
+/// A quarter of RAM: the scan leans on the OS file cache, and `browse` runs the web server in this
+/// same process. Buffering more than this trades a working scan for a bigger buffer.
+fn memory_ceiling() -> Option<u64> {
+    use sysinfo::System;
+    let mut sys = System::new();
+    sys.refresh_memory();
+    match sys.total_memory() {
+        0 => None,
+        total => Some(total / 4),
+    }
+}
+
+/// `before` is the currently-EFFECTIVE config (defaults already resolved) that `s` would replace.
+/// The memory-ceiling check only fires for a field that is actually being RAISED above that
+/// baseline: F7 -- the compiled-in default `archive_buffer_max_bytes` (2 GiB) already exceeds
+/// RAM/4 on a machine with under 8 GiB, so checking every save unconditionally would refuse EVERY
+/// save on such a machine, including ones that only touch the ratio cap and leave the buffer
+/// fields untouched. A value that is unchanged, or lowered, cannot make memory pressure worse than
+/// it already was, so it must always be editable.
+fn validate(s: &crate::config::Settings, before: &crate::config::Config) -> Result<(), String> {
+    if let Some(d) = s.max_archive_depth {
+        if d < 1 {
+            return Err("max_archive_depth must be at least 1".into());
+        }
+    }
+    if let Some(r) = s.archive_ratio_cap {
+        if r < 1 {
+            return Err("archive_ratio_cap must be at least 1".into());
+        }
+    }
+    // F4: zero is not a valid byte bound. `archive_buffer_max_bytes: 0` or
+    // `archive_total_buffer_bytes: 0` would buffer nothing, and `archive_entry_max_bytes: 0` would
+    // convert every present archive entry to `missing` on the next scan even though nothing on disk
+    // changed -- unlimited is spelled `null` (`Some(None)`), never `0`.
+    if let Some(v) = s.archive_buffer_max_bytes {
+        if v < 1 {
+            return Err("archive_buffer_max_bytes must be at least 1 byte".into());
+        }
+    }
+    if let Some(v) = s.archive_total_buffer_bytes {
+        if v < 1 {
+            return Err("archive_total_buffer_bytes must be at least 1 byte".into());
+        }
+    }
+    if let Some(Some(0)) = s.archive_entry_max_bytes {
+        return Err(
+            "archive_entry_max_bytes cannot be 0: use null for unlimited, not 0, which would \
+             reject every entry"
+                .into(),
+        );
+    }
+    if let (Some(per), Some(total)) = (s.archive_buffer_max_bytes, s.archive_total_buffer_bytes) {
+        if per > total {
+            return Err(
+                "archive_buffer_max_bytes cannot exceed archive_total_buffer_bytes: a per-archive \
+                 bound larger than the whole descent's budget has no effect"
+                    .into(),
+            );
+        }
+    }
+    if let Some(ceiling) = memory_ceiling() {
+        for (name, v, prev) in [
+            (
+                "archive_buffer_max_bytes",
+                s.archive_buffer_max_bytes,
+                before.archive_buffer_max_bytes,
+            ),
+            (
+                "archive_total_buffer_bytes",
+                s.archive_total_buffer_bytes,
+                before.archive_total_buffer_bytes,
+            ),
+        ] {
+            if let Some(v) = v {
+                if v > ceiling && v > prev {
+                    return Err(format!(
+                        "{name} of {v} bytes exceeds a quarter of system memory ({ceiling} bytes); \
+                         buffering that much would starve the file cache the scan depends on"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Merge a POST body onto the currently-stored settings: a field the request omits (`None`) keeps
+/// whatever is stored, a field it sets (`Some(..)`) overwrites -- including `Some(None)` on
+/// `archive_entry_max_bytes`, which means "explicitly unlimited" and must overwrite too, not be
+/// treated as absence.
+///
+/// Two different meanings of "absent" meet here: in the STORED file, `None` means "unset, use the
+/// compiled-in default"; in the REQUEST, `None` means "omitted, keep whatever is stored". Without
+/// this merge, a partial POST (e.g. one field from a `curl` call) would silently reset every other
+/// field to its hardcoded default -- exactly what Task 4's "every field is optional" contract was
+/// meant to prevent.
+fn merge_settings(
+    stored: crate::config::Settings,
+    req: crate::config::Settings,
+) -> crate::config::Settings {
+    crate::config::Settings {
+        max_archive_depth: req.max_archive_depth.or(stored.max_archive_depth),
+        archive_buffer_max_bytes: req
+            .archive_buffer_max_bytes
+            .or(stored.archive_buffer_max_bytes),
+        archive_total_buffer_bytes: req
+            .archive_total_buffer_bytes
+            .or(stored.archive_total_buffer_bytes),
+        archive_entry_max_bytes: req
+            .archive_entry_max_bytes
+            .or(stored.archive_entry_max_bytes),
+        archive_ratio_cap: req.archive_ratio_cap.or(stored.archive_ratio_cap),
+    }
+}
+
+async fn api_settings_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<crate::config::Settings>,
+) -> Result<Json<SettingsDto>, (StatusCode, String)> {
+    check_csrf(&headers, &state)?;
+    let cfg = crate::config::Config::default_paths().map_err(err500)?;
+    let path = cfg.settings_path();
+    let stored = crate::config::load_settings(&path);
+    let merged = merge_settings(stored, body);
+    // Validate the MERGED result, not the request alone: a request that omits
+    // archive_total_buffer_bytes could otherwise slip an archive_buffer_max_bytes past the
+    // per-archive-vs-total rule by comparing it against nothing. `cfg` is the config in effect
+    // BEFORE this write, so the memory-ceiling check in `validate` can tell a raise from a no-op.
+    validate(&merged, &cfg).map_err(|m| (StatusCode::BAD_REQUEST, m))?;
+    crate::config::save_settings(&path, &merged).map_err(err500)?;
+    Ok(Json(effective_settings()?))
 }
 
 #[derive(Deserialize)]
@@ -2555,6 +2719,10 @@ mod tests {
         // without it leaves a multi-day scan unstoppable short of killing the process.
         assert!(body.contains("/api/scan/stop"));
         assert!(body.contains("stopscan"));
+        // The limits are only reachable from here; a page without the section leaves the user
+        // editing JSON by hand, which is what this feature exists to avoid.
+        assert!(body.contains("/api/settings"));
+        assert!(body.contains("archive_ratio_cap"));
         assert!(!body.contains("http://") && !body.contains("https://"));
     }
 
@@ -2797,5 +2965,310 @@ mod tests {
         let (_t, db, _state) = seed_dupes();
         let v = get_json(&db, "/api/scan-runs?limit=100000").await;
         assert!(v.is_array(), "an absurd limit must not error: {v}");
+    }
+
+    /// `/api/settings` reads and writes via `Config::default_paths()`, which falls through to the
+    /// user's real app-data directory unless `CLEANUPSTORAGES_DATA_DIR` is set. This guard points
+    /// it at a throwaway tempdir for the test's duration and restores whatever was there before on
+    /// drop (even on panic), using the same mutex `config.rs` uses so the two never race on the
+    /// process-global env var.
+    struct ScopedDataDir {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _dir: tempfile::TempDir,
+        prev: Option<String>,
+    }
+    impl ScopedDataDir {
+        fn new() -> Self {
+            let lock = crate::config::ENV_GUARD
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let prev = std::env::var("CLEANUPSTORAGES_DATA_DIR").ok();
+            std::env::set_var("CLEANUPSTORAGES_DATA_DIR", dir.path());
+            ScopedDataDir {
+                _lock: lock,
+                _dir: dir,
+                prev,
+            }
+        }
+    }
+    impl Drop for ScopedDataDir {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("CLEANUPSTORAGES_DATA_DIR", v),
+                None => std::env::remove_var("CLEANUPSTORAGES_DATA_DIR"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_endpoint_returns_the_effective_limits() {
+        let _scope = ScopedDataDir::new();
+        let (_t, db, _state) = seed_dupes();
+        let v = get_json(&db, "/api/settings").await;
+        assert_eq!(v["archive_ratio_cap"], 10000);
+        assert_eq!(v["max_archive_depth"], 8);
+    }
+
+    #[tokio::test]
+    async fn posting_settings_without_a_csrf_token_is_refused() {
+        // Every write endpoint in this file is guarded; a settings write is no exception.
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let _scope = ScopedDataDir::new();
+        let (_t, _db, state) = seed_dupes();
+        let app = build_router_with(state);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/settings")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"archive_ratio_cap":5000}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_buffer_budget_is_refused_with_a_reason() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let _scope = ScopedDataDir::new();
+        let (_t, _db, state) = seed_dupes();
+        let token = state.csrf_token.clone();
+        let app = build_router_with(state);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/settings")
+                    .header("content-type", "application/json")
+                    .header("x-cleanup-token", token)
+                    .body(Body::from(
+                        r#"{"archive_total_buffer_bytes": 1000000000000000}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(res.into_body(), 100_000)
+            .await
+            .unwrap();
+        let msg = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(
+            msg.to_lowercase().contains("memory"),
+            "the refusal must say why: {msg}"
+        );
+    }
+
+    /// A `Config` literal standing in for "the config in effect before this write" -- used to drive
+    /// `validate` directly, since the real memory ceiling (`sysinfo`) is not mockable and this needs
+    /// to hold regardless of how much RAM the test machine actually has.
+    fn config_with_buffer(buffer_bytes: u64, total_bytes: u64) -> crate::config::Config {
+        crate::config::Config {
+            catalog_path: std::path::PathBuf::from("unused/catalog.db"),
+            snapshot_retention: 10,
+            max_archive_depth: 8,
+            archive_buffer_max_bytes: buffer_bytes,
+            archive_total_buffer_bytes: total_bytes,
+            archive_entry_max_bytes: Some(64 * 1024 * 1024 * 1024),
+            archive_ratio_cap: 10_000,
+        }
+    }
+
+    #[test]
+    fn f4_zero_is_refused_for_every_byte_limit() {
+        // F4: zero converts present archive entries to `missing` on the next scan even though
+        // nothing on disk changed (archive_entry_max_bytes: 0 rejects every entry; the buffer
+        // fields at 0 buffer nothing). Unlimited is spelled `null`, never `0`.
+        let before = config_with_buffer(2 * 1024 * 1024 * 1024, 2 * 1024 * 1024 * 1024);
+        let zero_buffer = crate::config::Settings {
+            archive_buffer_max_bytes: Some(0),
+            ..Default::default()
+        };
+        assert!(
+            validate(&zero_buffer, &before).is_err(),
+            "0 must be refused for archive_buffer_max_bytes"
+        );
+
+        let zero_total = crate::config::Settings {
+            archive_total_buffer_bytes: Some(0),
+            ..Default::default()
+        };
+        assert!(
+            validate(&zero_total, &before).is_err(),
+            "0 must be refused for archive_total_buffer_bytes"
+        );
+
+        let zero_entry = crate::config::Settings {
+            archive_entry_max_bytes: Some(Some(0)),
+            ..Default::default()
+        };
+        assert!(
+            validate(&zero_entry, &before).is_err(),
+            "0 must be refused for archive_entry_max_bytes -- unlimited is null, not 0"
+        );
+
+        // Unlimited (null) must still be accepted.
+        let unlimited_entry = crate::config::Settings {
+            archive_entry_max_bytes: Some(None),
+            ..Default::default()
+        };
+        assert!(
+            validate(&unlimited_entry, &before).is_ok(),
+            "null (explicitly unlimited) must remain valid"
+        );
+    }
+
+    #[test]
+    fn f7_an_unchanged_oversized_buffer_is_not_refused() {
+        // F7: on a machine with under 8 GiB RAM, the compiled-in default archive_buffer_max_bytes
+        // (2 GiB) already exceeds RAM/4, so checking every save unconditionally would refuse EVERY
+        // save on such a machine -- including one that only edits the ratio cap and resends the
+        // buffer fields unchanged. A value larger than any real machine's RAM/4 is used here so the
+        // assertion holds regardless of the test machine's actual memory.
+        let absurdly_large = u64::MAX / 2;
+        let before = config_with_buffer(absurdly_large, absurdly_large);
+        let s = crate::config::Settings {
+            archive_buffer_max_bytes: Some(absurdly_large),
+            archive_total_buffer_bytes: Some(absurdly_large),
+            archive_ratio_cap: Some(4321),
+            ..Default::default()
+        };
+        assert!(
+            validate(&s, &before).is_ok(),
+            "an unchanged (or lowered) value must never be refused by the memory ceiling"
+        );
+    }
+
+    #[test]
+    fn f7_raising_the_buffer_past_the_ceiling_is_still_refused() {
+        // The other half of F7: the ceiling must still bite when a value is genuinely being raised.
+        let before = config_with_buffer(1, 1);
+        let s = crate::config::Settings {
+            archive_buffer_max_bytes: Some(u64::MAX / 2),
+            ..Default::default()
+        };
+        assert!(
+            validate(&s, &before).is_err(),
+            "raising a value past the memory ceiling must still be refused"
+        );
+    }
+
+    /// POST `/api/settings` with the CSRF token attached, returning status and the raw body text
+    /// (a success body is JSON, a rejection body is plain text -- callers parse only what they need).
+    async fn post_settings(
+        state: AppState,
+        token: &str,
+        body: &str,
+    ) -> (axum::http::StatusCode, String) {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let app = build_router_with(state);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/settings")
+                    .header("content-type", "application/json")
+                    .header("x-cleanup-token", token)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), 100_000)
+            .await
+            .unwrap();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_partial_post_does_not_reset_the_fields_it_omits() {
+        // The reviewer's scenario: set one field, then POST only an unrelated one. The first
+        // field must survive -- Task 4's whole point was that every field is optional, so a
+        // partial write must not silently reset the rest to their compiled-in defaults.
+        let _scope = ScopedDataDir::new();
+        let (_t, _db, state) = seed_dupes();
+        let token = state.csrf_token.clone();
+
+        let (status, _) =
+            post_settings(state.clone(), &token, r#"{"archive_ratio_cap": 9999}"#).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+
+        let (status, _) = post_settings(state.clone(), &token, r#"{"max_archive_depth": 3}"#).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+
+        let v = get_json_state(state, "/api/settings").await;
+        assert_eq!(
+            v["archive_ratio_cap"], 9999,
+            "an earlier, unrelated field must survive a later partial POST"
+        );
+        assert_eq!(v["max_archive_depth"], 3);
+    }
+
+    #[tokio::test]
+    async fn an_explicit_null_still_sets_unlimited_not_omission() {
+        // `null` and "key absent" both look like Rust's `None`, but they must mean different
+        // things: absent keeps whatever is stored, null explicitly overwrites it to unlimited.
+        let _scope = ScopedDataDir::new();
+        let (_t, _db, state) = seed_dupes();
+        let token = state.csrf_token.clone();
+
+        let (status, _) = post_settings(
+            state.clone(),
+            &token,
+            r#"{"archive_entry_max_bytes": 12345}"#,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+
+        let (status, _) = post_settings(
+            state.clone(),
+            &token,
+            r#"{"archive_entry_max_bytes": null}"#,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+
+        let v = get_json_state(state, "/api/settings").await;
+        assert!(
+            v["archive_entry_max_bytes"].is_null(),
+            "an explicit null must mean unlimited, not 'leave it alone': {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn merged_validation_rejects_a_per_archive_bound_that_exceeds_the_stored_total() {
+        // Validating the request in isolation would miss this: the request only mentions
+        // archive_buffer_max_bytes, so a check against the request alone has nothing to compare
+        // it to. The stored archive_total_buffer_bytes must be part of what gets validated.
+        let _scope = ScopedDataDir::new();
+        let (_t, _db, state) = seed_dupes();
+        let token = state.csrf_token.clone();
+
+        let (status, _) = post_settings(
+            state.clone(),
+            &token,
+            r#"{"archive_total_buffer_bytes": 1000000}"#,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+
+        let (status, msg) =
+            post_settings(state, &token, r#"{"archive_buffer_max_bytes": 2000000}"#).await;
+        assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            msg.contains("archive_total_buffer_bytes"),
+            "the refusal must name the stored limit it was checked against: {msg}"
+        );
     }
 }
