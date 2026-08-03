@@ -16,6 +16,10 @@ pub struct SearchFilters {
     pub modified_before: Option<i64>,
 }
 
+/// `(size_bytes, modified_time, has_archive_entries, revive_floor)` -- see `Catalog::get_file_meta`
+/// for what each field means.
+pub type FileMeta = (i64, i64, bool, Option<i64>);
+
 /// The full `files` column list, in one place. Every full-row SELECT uses this; the mapper
 /// (`map_file_record`) reads results by column NAME, so this list and the mapper cannot drift.
 pub(crate) const FILE_COLUMNS: &str =
@@ -41,17 +45,43 @@ impl Catalog {
         Ok(())
     }
 
-    /// (size_bytes, modified_time-or-0) for a loose file, if catalogued.
+    /// `(size_bytes, modified_time, has_archive_entries, revive_floor)` for a loose file, or None if
+    /// unknown.
+    ///
+    /// The third field exists so the incremental-skip path never has to open a file to learn
+    /// whether it is an archive. Guessing from the filename would be wrong for a renamed zip, and
+    /// a skip path that fails to touch an archive's entries lets the sweep mark present files
+    /// missing.
+    ///
+    /// The fourth field is `Some(last_seen_at)` -- this row's own `last_seen_at`, from before this
+    /// call touches it -- when this row's status is `missing`, and `None` otherwise. It tells the
+    /// skip path not just THAT the whole archive just reappeared, but WHEN it went missing, which
+    /// `touch_archive_entries` uses as a floor: an entry that was legitimately removed from the
+    /// archive's content has a strictly smaller `last_seen_at` than the archive had when it went
+    /// missing, so the floor is what separates "went missing together with the archive" from "was
+    /// removed before the archive went missing" -- a plain boolean cannot make that distinction.
     pub fn get_file_meta(
         &self,
         volume_id: &str,
         relative_path: &str,
-    ) -> anyhow::Result<Option<(i64, i64)>> {
+    ) -> anyhow::Result<Option<FileMeta>> {
         let row = self.conn.query_row(
-            "SELECT size_bytes, IFNULL(modified_time,0) FROM files
-             WHERE volume_id=?1 AND relative_path=?2 AND container_chain IS NULL",
+            "SELECT size_bytes, IFNULL(modified_time,0),
+                    EXISTS(SELECT 1 FROM files e
+                            WHERE e.volume_id=?1 AND e.relative_path=?2
+                              AND e.container_chain IS NOT NULL),
+                    CASE WHEN status='missing' THEN last_seen_at ELSE NULL END
+               FROM files
+              WHERE volume_id=?1 AND relative_path=?2 AND container_chain IS NULL",
             params![volume_id, relative_path],
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)? != 0,
+                    r.get::<_, Option<i64>>(3)?,
+                ))
+            },
         );
         match row {
             Ok(v) => Ok(Some(v)),
@@ -184,17 +214,45 @@ impl Catalog {
     }
 
     /// Refresh last_seen/status for every archive entry under one archive file (unchanged-archive skip).
+    ///
+    /// `revive_floor` distinguishes two cases that both reach this function with the archive's own
+    /// row unchanged in size/mtime, and that must be handled oppositely:
+    ///
+    /// - `Some(floor)`: the WHOLE archive disappeared (e.g. an unmounted drive) and has now
+    ///   reappeared unchanged. `floor` is the `last_seen_at` the archive's own row had at the moment
+    ///   it went missing (from `get_file_meta`). A `missing` entry revives only if ITS OWN
+    ///   `last_seen_at >= floor` -- i.e. it was still present when the archive itself vanished, so it
+    ///   went missing together with the archive, not before it. An entry with a smaller
+    ///   `last_seen_at` was removed from the archive's real content by an earlier, real descend, and
+    ///   must stay `missing` even though the archive has now returned -- reviving it would assert a
+    ///   file is present that the archive demonstrably does not contain (a phantom entry that can
+    ///   surface in Duplicates as a fake "safe" copy of a real file).
+    /// - `None`: the archive was never absent (its own row was not `missing`); no `missing` entry
+    ///   under it is revived at all -- only `active` rows are touched.
+    ///
+    /// `quarantined`/`purged` are never revived either way -- those are user decisions about files
+    /// that were moved or deleted, and a scan must never silently flip them back to `active`.
     pub fn touch_archive_entries(
         &self,
         volume_id: &str,
         archive_rel_path: &str,
         now: i64,
+        revive_floor: Option<i64>,
     ) -> anyhow::Result<usize> {
-        let n = self.conn.execute(
-            "UPDATE files SET last_seen_at=?3, status='active'
-             WHERE volume_id=?1 AND relative_path=?2 AND container_chain IS NOT NULL AND status='active'",
-            params![volume_id, archive_rel_path, now],
-        )?;
+        let n = match revive_floor {
+            Some(floor) => self.conn.execute(
+                "UPDATE files SET last_seen_at=?3, status='active'
+                 WHERE volume_id=?1 AND relative_path=?2 AND container_chain IS NOT NULL
+                   AND (status='active' OR (status='missing' AND last_seen_at>=?4))",
+                params![volume_id, archive_rel_path, now, floor],
+            )?,
+            None => self.conn.execute(
+                "UPDATE files SET last_seen_at=?3, status='active'
+                 WHERE volume_id=?1 AND relative_path=?2 AND container_chain IS NOT NULL
+                   AND status='active'",
+                params![volume_id, archive_rel_path, now],
+            )?,
+        };
         Ok(n)
     }
 
@@ -1117,11 +1175,124 @@ mod tests {
             .unwrap();
         cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("b.jpg", "h2"), None, 200)
             .unwrap();
-        let touched = cat.touch_archive_entries("vol-1", "old.zip", 300).unwrap();
+        let touched = cat
+            .touch_archive_entries("vol-1", "old.zip", 300, None)
+            .unwrap();
         assert_eq!(touched, 2);
         // after touch, a later sweep starting at 300 does NOT mark them missing
         let n = cat.mark_missing_scanned("vol-1", 300, 300, &[]).unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn touch_archive_entries_revives_entries_that_were_marked_missing() {
+        // An archive can disappear (its entries swept to 'missing') and later reappear unchanged.
+        // The skip path's touch must bring the entries back to 'active' when the caller supplies a
+        // revive floor at or below the entry's own last_seen_at (i.e. the entry was still present
+        // when the archive itself went missing) -- otherwise they are stuck 'missing' forever,
+        // since nothing else ever touches them again.
+        let (_t, cat) = open_tmp();
+        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("a.jpg", "h1"), None, 200)
+            .unwrap();
+        let id = cat
+            .conn
+            .query_row(
+                "SELECT id FROM files WHERE relative_path='old.zip' AND container_chain IS NOT NULL",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+        cat.conn
+            .execute("UPDATE files SET status='missing' WHERE id=?1", [id])
+            .unwrap();
+
+        // The entry's own last_seen_at is 200 (set by upsert_archive_entry above); a floor of 200
+        // means "still present at the moment the archive went missing".
+        let touched = cat
+            .touch_archive_entries("vol-1", "old.zip", 300, Some(200))
+            .unwrap();
+        assert_eq!(touched, 1, "a missing entry must be revivable");
+
+        let status: String = cat
+            .conn
+            .query_row("SELECT status FROM files WHERE id=?1", [id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "active");
+    }
+
+    #[test]
+    fn an_entry_at_exactly_the_revive_floor_is_revived() {
+        // Direct attack on the boundary comparison itself: an entry whose last_seen_at is EXACTLY
+        // equal to the floor (the archive's own last_seen_at at the moment it went missing) is the
+        // ordinary "went missing together with the archive" case, and it is what makes `>=` the
+        // correct comparison rather than `>`. If the comparison were ever tightened to `>`, this is
+        // what would silently break -- every normal whole-archive round-trip would stop reviving.
+        let (_t, cat) = open_tmp();
+        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("a.jpg", "h1"), None, 200)
+            .unwrap();
+        let id = cat
+            .conn
+            .query_row(
+                "SELECT id FROM files WHERE relative_path='old.zip' AND container_chain IS NOT NULL",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+        // Entry's last_seen_at is 200 (from upsert above). Mark it missing without touching
+        // last_seen_at, exactly as mark_missing_scanned does.
+        cat.conn
+            .execute("UPDATE files SET status='missing' WHERE id=?1", [id])
+            .unwrap();
+
+        // Floor == 200, exactly equal to the entry's own last_seen_at.
+        let touched = cat
+            .touch_archive_entries("vol-1", "old.zip", 300, Some(200))
+            .unwrap();
+        assert_eq!(
+            touched, 1,
+            "an entry at exactly the floor must revive (>= not >)"
+        );
+
+        let status: String = cat
+            .conn
+            .query_row("SELECT status FROM files WHERE id=?1", [id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "active");
+    }
+
+    #[test]
+    fn touch_archive_entries_does_not_revive_a_quarantined_entry() {
+        // Quarantine/purge are user decisions about files that were moved or deleted. A scan must
+        // never silently flip them back to 'active', even with a permissive revive floor (the
+        // whole-archive-came-back case) -- quarantine/purge must win over that.
+        let (_t, cat) = open_tmp();
+        cat.upsert_archive_entry("vol-1", "old.zip", &mk_entry("a.jpg", "h1"), None, 200)
+            .unwrap();
+        let id = cat
+            .conn
+            .query_row(
+                "SELECT id FROM files WHERE relative_path='old.zip' AND container_chain IS NOT NULL",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+        cat.conn
+            .execute("UPDATE files SET status='quarantined' WHERE id=?1", [id])
+            .unwrap();
+
+        let touched = cat
+            .touch_archive_entries("vol-1", "old.zip", 300, Some(200))
+            .unwrap();
+        assert_eq!(touched, 0, "a quarantined entry must not be touched");
+
+        let status: String = cat
+            .conn
+            .query_row("SELECT status FROM files WHERE id=?1", [id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            status, "quarantined",
+            "quarantine must not be reverted by a scan"
+        );
     }
 
     #[test]
@@ -1315,8 +1486,10 @@ mod tests {
                 .len(),
             1
         );
-        // a later incremental-skip touch must NOT resurrect gone.jpg
-        cat.touch_archive_entries("vol-1", "old.zip", 400).unwrap();
+        // a later incremental-skip touch must NOT resurrect gone.jpg: the archive itself was never
+        // missing (revive_floor=None), so a genuinely-removed entry must stay missing.
+        cat.touch_archive_entries("vol-1", "old.zip", 400, None)
+            .unwrap();
         assert_eq!(
             cat.search("gone", None, None, Some("missing"))
                 .unwrap()
@@ -1545,5 +1718,50 @@ mod tests {
         let rec = cat.get_file(id).unwrap().unwrap();
         assert_eq!(rec.content_hash, "NEW");
         assert_eq!(rec.size_bytes, 999);
+    }
+
+    #[test]
+    fn get_file_meta_reports_whether_the_file_has_archive_entries() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_volume(&crate::catalog::models::Volume {
+            volume_id: "v".into(),
+            label: "V".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
+        let mk = |rel: &str, chain: Option<&str>| crate::catalog::models::NewFile {
+            volume_id: "v".into(),
+            relative_path: rel.into(),
+            filename: rel.rsplit('/').next().unwrap().into(),
+            extension: "zip".into(),
+            size_bytes: 10,
+            content_hash: "H".into(),
+            created_time: Some(1),
+            modified_time: Some(5),
+            accessed_time: Some(1),
+            category: crate::category::Category::Other,
+            container_chain: chain.map(|c| c.to_string()),
+        };
+        cat.upsert_file(&mk("plain.bin", None), 1).unwrap();
+        cat.upsert_file(&mk("bundle.bak", None), 1).unwrap();
+        cat.upsert_file(&mk("bundle.bak", Some("inner.txt")), 1)
+            .unwrap();
+
+        let (_, _, plain_has, plain_floor) = cat.get_file_meta("v", "plain.bin").unwrap().unwrap();
+        let (_, _, bundle_has, bundle_floor) =
+            cat.get_file_meta("v", "bundle.bak").unwrap().unwrap();
+        assert!(!plain_has, "a loose file has no archive entries");
+        assert!(
+            bundle_has,
+            "an archive's own row must report that it has entries"
+        );
+        assert_eq!(
+            plain_floor, None,
+            "a freshly-upserted file is active, not missing"
+        );
+        assert_eq!(bundle_floor, None);
+        assert!(cat.get_file_meta("v", "absent.bin").unwrap().is_none());
     }
 }

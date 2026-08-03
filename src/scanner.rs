@@ -54,6 +54,31 @@ fn should_skip(path: &Path, file_name: &std::ffi::OsStr) -> bool {
             .any(|c| c.as_os_str() == crate::volume::QUARANTINE_DIR)
 }
 
+/// Opens `path` for the top-level archive-detection peek. Factored out purely so a test can force
+/// this one call to fail without also failing the hash step that runs just before it -- a real OS
+/// lock (share violation, permission) held externally blocks both opens indiscriminately, so there
+/// is no way to reproduce a detection-only failure with real file handles.
+#[cfg(not(test))]
+fn open_for_archive_detection(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_DETECTION_OPEN_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn open_for_archive_detection(path: &Path) -> std::io::Result<std::fs::File> {
+    if FORCE_DETECTION_OPEN_ERROR.with(|f| f.get()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "forced for test",
+        ));
+    }
+    std::fs::File::open(path)
+}
+
 /// Path of `path` relative to `root`, normalized to forward slashes; `None` if not under `root`.
 fn relative_path(path: &Path, root: &Path) -> Option<String> {
     path.strip_prefix(root)
@@ -238,12 +263,20 @@ pub fn scan_volume_with_progress(
         } else {
             let _t = metrics.timer(crate::scan_metrics::Phase::SkipCheck);
             match cat.get_file_meta(&identity.volume_id, &rel)? {
-                Some((old_size, old_mtime))
+                Some((old_size, old_mtime, has_archive_entries, revive_floor))
                     if old_size == size && old_mtime == mtime.unwrap_or(0) =>
                 {
                     cat.touch_seen(&identity.volume_id, &rel, now)?;
-                    if archive::is_archive_name(&rel) {
-                        cat.touch_archive_entries(&identity.volume_id, &rel, now)?;
+                    // From the catalogue, not from the filename: a renamed zip has entries too,
+                    // and missing them here would let the sweep mark present files missing.
+                    if has_archive_entries {
+                        // revive_floor is Some(last_seen_at) only if the archive's own row was
+                        // ALSO missing a moment ago -- i.e. the whole archive vanished and came
+                        // back. Only entries that were still present at that same moment (their own
+                        // last_seen_at >= the floor) revive; an entry removed from the archive's
+                        // real content by an earlier descend has a smaller last_seen_at and stays
+                        // missing even though the archive returned.
+                        cat.touch_archive_entries(&identity.volume_id, &rel, now, revive_floor)?;
                     }
                     true
                 }
@@ -324,7 +357,55 @@ pub fn scan_volume_with_progress(
             p.on_hashed();
         }
 
-        if archive::is_archive_name(&rel) {
+        // By content, not by name. Cheap here because the file has just been hashed, so it is warm
+        // in the OS cache -- unlike the skip path above, which must never open anything.
+        //
+        // The head-magic check alone misses a prefixed/self-extracting zip (real readers locate the
+        // central directory from the END of the file, not the start). The extension is used as a
+        // HINT to do that extra tail read, never as the decision: `._Video.zip` (AppleDouble) also
+        // reaches the tail check, finds no EOCD signature, and is correctly left a leaf.
+        let is_archive = {
+            let ext_looks_like_zip = path
+                .extension()
+                .map(|e| e.eq_ignore_ascii_case("zip"))
+                .unwrap_or(false);
+            let detected = open_for_archive_detection(path).and_then(|mut f| {
+                let (_head, head_is_zip) = archive::peek4(&mut f)?;
+                if head_is_zip {
+                    return Ok(true);
+                }
+                if ext_looks_like_zip {
+                    return archive::tail_has_eocd_signature(&mut f);
+                }
+                Ok(false)
+            });
+            match detected {
+                Ok(v) => v,
+                Err(e) => {
+                    // A detection failure must never be silently indistinguishable from "not an
+                    // archive": that would leave `descend_archive` unrun with no error logged, and
+                    // the entries inside would be swept to `missing` with no way to self-heal on a
+                    // later clean rescan (the archive's own row stays `active`, so the revive floor
+                    // is `None`). Log it so #6's completeness audit surfaces it, and fall back to
+                    // the extension test rather than to `false` so a momentarily-locked `.zip` is
+                    // still treated as an archive.
+                    cat.log_scan_error(
+                        Some(&identity.volume_id),
+                        &rel,
+                        &format!("archive detection: {e}"),
+                        "read",
+                        crate::catalog::scan_errors::classify_io(&e),
+                        now,
+                    )?;
+                    summary.errors += 1;
+                    if let Some(p) = progress {
+                        p.on_error();
+                    }
+                    ext_looks_like_zip
+                }
+            }
+        };
+        if is_archive {
             let _t = metrics.timer(crate::scan_metrics::Phase::Archive);
             descend_archive(
                 cat,
@@ -582,6 +663,33 @@ mod tests {
         })
         .unwrap();
         (tmp, cat)
+    }
+
+    /// Build a stored (uncompressed) zip in memory, for tests that write archive bytes to disk.
+    fn make_zip(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zw = zip::ZipWriter::new(&mut buf);
+            let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, bytes) in files {
+                zw.start_file(*name, opts).unwrap();
+                std::io::Write::write_all(&mut zw, bytes).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    /// The status of the one archive entry with this filename, catalogued anywhere.
+    fn status_of(cat: &Catalog, name: &str) -> String {
+        cat.conn
+            .query_row(
+                "SELECT status FROM files WHERE filename=?1 AND container_chain IS NOT NULL",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap()
     }
 
     // A real scan over a file that genuinely fails to read, asserting the scanner itself (not the
@@ -1416,6 +1524,301 @@ mod tests {
         assert_eq!(
             n, 1,
             "a stopped scan must not clear a legacy error for an unreached path"
+        );
+    }
+
+    #[test]
+    fn a_renamed_zip_keeps_its_entries_active_across_an_unchanged_rescan() {
+        // THE regression for this task. Once archives are detected by content, a renamed zip has
+        // entries. If the skip path does not recognise it, those entries keep an old last_seen_at
+        // and the sweep marks present files missing -- silent data loss in the catalogue.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+
+        // A real zip, deliberately NOT named .zip.
+        let inner = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut zw = zip::ZipWriter::new(&mut buf);
+                let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                zw.start_file("inside.txt", opts).unwrap();
+                std::io::Write::write_all(&mut zw, b"payload").unwrap();
+                zw.finish().unwrap();
+            }
+            buf.into_inner()
+        };
+        std::fs::write(root.join("archive.bak"), &inner).unwrap();
+
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let stop = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+
+        let entries_active = || -> i64 {
+            cat.conn
+                .query_row(
+                    "SELECT count(*) FROM files WHERE container_chain IS NOT NULL AND status='active'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(-1)
+        };
+        assert_eq!(entries_active(), 1, "the renamed zip's entry is catalogued");
+
+        // Second scan, nothing changed on disk: the skip path runs, then the sweep.
+        let m2 = crate::scan_metrics::ScanMetrics::new();
+        let stop2 = crate::scan_control::StopFlag::new();
+        let s = scan_volume_with_progress(&cat, &root, &ident(), false, 300, None, &m2, &stop2)
+            .unwrap();
+
+        assert_eq!(
+            s.marked_missing, 0,
+            "nothing on disk changed, so nothing may be marked missing"
+        );
+        assert_eq!(
+            entries_active(),
+            1,
+            "the archive entry must still be active after an unchanged rescan"
+        );
+    }
+
+    #[test]
+    fn a_prefixed_zip_is_still_detected_and_descended_into() {
+        // A self-extracting stub (or anything else that prepends bytes) leaves a file that does not
+        // start with PK, yet is a perfectly valid zip: real readers locate the central directory
+        // from the END of the file. The head-only check alone would regress this to undetected.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let zip_bytes = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut zw = zip::ZipWriter::new(&mut buf);
+                let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                zw.start_file("inside.txt", opts).unwrap();
+                std::io::Write::write_all(&mut zw, b"payload").unwrap();
+                zw.finish().unwrap();
+            }
+            buf.into_inner()
+        };
+        // Prepend a fake self-extracting stub. The file is named .zip, but does not start with PK.
+        let mut prefixed = b"MZ this is a fake SFX stub, not a zip signature".to_vec();
+        prefixed.extend_from_slice(&zip_bytes);
+        std::fs::write(root.join("installer.zip"), &prefixed).unwrap();
+
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let stop = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+
+        let inner_catalogued: i64 = cat
+            .conn
+            .query_row(
+                "SELECT count(*) FROM files WHERE filename='inside.txt' AND container_chain IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            inner_catalogued, 1,
+            "a prefixed zip's entries must be catalogued, not skipped as a leaf"
+        );
+    }
+
+    /// F1: a failed open at the top-level archive-detection step must never be silently
+    /// indistinguishable from "not an archive". Forces the detection `File::open` to fail (a real
+    /// external lock would also fail the hash step that runs just before it, so a thread-local
+    /// injection point is the only reproducible way to isolate this exact call).
+    ///
+    /// This test is DESIGNED to fail if the fix regresses to `.unwrap_or(false)`: with that old
+    /// behaviour, `is_archive` silently becomes `false`, `descend_archive` never runs, no scan error
+    /// is logged, and the archive's entry is swept to `missing` with no way to self-heal (the
+    /// archive's own row stays `active`, so the revive floor is `None`).
+    #[test]
+    fn a_failed_detection_open_is_logged_and_does_not_lose_the_archives_entries() {
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.zip"), make_zip(&[("a.txt", b"payload")])).unwrap();
+
+        FORCE_DETECTION_OPEN_ERROR.with(|f| f.set(true));
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let stop = crate::scan_control::StopFlag::new();
+        let scan_result =
+            scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop);
+        FORCE_DETECTION_OPEN_ERROR.with(|f| f.set(false));
+        let summary = scan_result.unwrap();
+
+        assert_eq!(
+            summary.errors, 1,
+            "a detection failure is a real scan error and must be counted"
+        );
+        let logged: i64 = cat
+            .conn
+            .query_row(
+                "SELECT count(*) FROM scan_errors WHERE path='a.zip'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            logged, 1,
+            "a detection failure must be recorded, not silent (this is the F1 defect)"
+        );
+        assert_eq!(
+            status_of(&cat, "a.txt"),
+            "active",
+            "the archive's entry must not be swept to missing just because detection had to \
+             fall back on the extension test"
+        );
+    }
+
+    #[test]
+    fn a_revive_floor_does_not_resurrect_an_entry_removed_before_the_archive_went_missing() {
+        // THE Finding-2 regression, reproduced end to end through the real scanner rather than the
+        // store API directly:
+        //
+        //   t=100  bundle.zip = a.txt + gone.txt      -> both active
+        //   t=200  rewritten without gone.txt         -> gone.txt correctly swept 'missing'
+        //   t=300  archive moved out of the tree      -> archive row + a.txt swept 'missing'
+        //   t=400  moved back, identical, same mtime  -> skip path, revive_floor = Some(...)
+        //
+        // A plain "was the archive missing" boolean cannot tell gone.txt (removed BEFORE the
+        // archive went missing) apart from a.txt (missing only because it went missing WITH the
+        // archive) -- both revive. The floor must let only a.txt come back.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        let bundle_path = root.join("bundle.zip");
+        let parked_path = tmp.path().join("bundle.zip.parked");
+
+        // t=100: both entries present.
+        std::fs::write(
+            &bundle_path,
+            make_zip(&[("a.txt", b"alpha"), ("gone.txt", b"beta")]),
+        )
+        .unwrap();
+        let m1 = crate::scan_metrics::ScanMetrics::new();
+        let stop1 = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m1, &stop1).unwrap();
+        assert_eq!(status_of(&cat, "a.txt"), "active");
+        assert_eq!(status_of(&cat, "gone.txt"), "active");
+
+        // t=200: rewritten without gone.txt -- a real content change, so it redescends (the size
+        // differs, which alone fails the skip check regardless of mtime resolution).
+        std::fs::write(&bundle_path, make_zip(&[("a.txt", b"alpha")])).unwrap();
+        let m2 = crate::scan_metrics::ScanMetrics::new();
+        let stop2 = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 200, None, &m2, &stop2).unwrap();
+        assert_eq!(status_of(&cat, "a.txt"), "active");
+        assert_eq!(
+            status_of(&cat, "gone.txt"),
+            "missing",
+            "gone.txt was genuinely removed from the archive's content"
+        );
+
+        // t=300: the archive itself leaves the tree -- its own row and a.txt's entry are swept.
+        std::fs::rename(&bundle_path, &parked_path).unwrap();
+        let m3 = crate::scan_metrics::ScanMetrics::new();
+        let stop3 = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 300, None, &m3, &stop3).unwrap();
+        assert_eq!(status_of(&cat, "a.txt"), "missing");
+        assert_eq!(status_of(&cat, "gone.txt"), "missing");
+
+        // t=400: moved back byte-identical (same size, same mtime since it's the same underlying
+        // file, never rewritten) -- the skip path fires and touches the archive's entries.
+        std::fs::rename(&parked_path, &bundle_path).unwrap();
+        let m4 = crate::scan_metrics::ScanMetrics::new();
+        let stop4 = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 400, None, &m4, &stop4).unwrap();
+
+        assert_eq!(
+            status_of(&cat, "a.txt"),
+            "active",
+            "a.txt went missing together with the archive, so it must revive with it"
+        );
+        assert_eq!(
+            status_of(&cat, "gone.txt"),
+            "missing",
+            "gone.txt was removed from the archive BEFORE the archive went missing -- reviving it \
+             would assert the archive contains a file it demonstrably does not"
+        );
+    }
+
+    #[test]
+    fn the_revive_floor_still_separates_after_a_second_round_trip() {
+        // Adapted from a salvaged review attack: the archive goes missing and returns TWICE, with a
+        // legitimate removal happening between the two round-trips. Does the floor correctly
+        // separate "removed before the SECOND disappearance" from "present at the second
+        // disappearance", given that the same entry (gone.txt) already lived through one revival
+        // earlier in its history?
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        let bundle_path = root.join("bundle.zip");
+        let parked_path = tmp.path().join("bundle.zip.parked");
+
+        // t=100: a.txt + gone.txt present.
+        std::fs::write(
+            &bundle_path,
+            make_zip(&[("a.txt", b"alpha"), ("gone.txt", b"beta")]),
+        )
+        .unwrap();
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let s = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &s).unwrap();
+
+        // t=200/300: archive vanishes (round-trip #1) and returns unchanged -- both entries revive
+        // together (this is the ordinary, already-tested case).
+        std::fs::rename(&bundle_path, &parked_path).unwrap();
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let s = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 200, None, &m, &s).unwrap();
+        std::fs::rename(&parked_path, &bundle_path).unwrap();
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let s = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 300, None, &m, &s).unwrap();
+        assert_eq!(status_of(&cat, "a.txt"), "active");
+        assert_eq!(
+            status_of(&cat, "gone.txt"),
+            "active",
+            "revived together at round-trip #1"
+        );
+
+        // t=400: gone.txt is now genuinely removed via a real descend (size changes).
+        std::fs::write(&bundle_path, make_zip(&[("a.txt", b"alpha")])).unwrap();
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let s = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 400, None, &m, &s).unwrap();
+        assert_eq!(
+            status_of(&cat, "gone.txt"),
+            "missing",
+            "genuinely removed this time"
+        );
+
+        // t=500/600: archive vanishes AGAIN (round-trip #2) and returns unchanged.
+        std::fs::rename(&bundle_path, &parked_path).unwrap();
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let s = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 500, None, &m, &s).unwrap();
+        std::fs::rename(&parked_path, &bundle_path).unwrap();
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let s = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(&cat, &root, &ident(), false, 600, None, &m, &s).unwrap();
+
+        assert_eq!(
+            status_of(&cat, "a.txt"),
+            "active",
+            "a.txt was present at round-trip #2's disappearance, must revive"
+        );
+        assert_eq!(
+            status_of(&cat, "gone.txt"),
+            "missing",
+            "ATTACK: gone.txt was removed BEFORE round-trip #2's disappearance (at t=400), so the \
+             SECOND round-trip must not revive it either, even though it WAS revived by the FIRST \
+             round-trip"
         );
     }
 }

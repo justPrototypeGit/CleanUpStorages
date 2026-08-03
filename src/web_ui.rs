@@ -1104,7 +1104,15 @@ pub fn scan_page(csrf: &str) -> String {
   <h3 style="margin:0 0 4px">Scan timings</h3>
   <div class="mut" style="font-size:12px;margin-bottom:10px">Where past scans spent their time. Kept across restarts, unlike the list above.</div>
   <div id="runs"><span class="mut">Loading…</span></div>
-</div>"##;
+</div>
+<details class="card" id="limits" style="margin-top:16px">
+  <summary style="cursor:pointer">Archive limits</summary>
+  <div class="mut" style="margin:8px 0 12px">
+    Applies to the <b>next</b> scan — a run already in progress keeps the limits it started with.
+  </div>
+  <div id="limitsbody" class="mut">loading…</div>
+  <div id="limitsmsg" class="mut" style="min-height:1.3em;margin-top:8px"></div>
+</details>"##;
     let script = r##"
 function baseName(p){ const s=String(p).replace(/[\\/]+$/,""); const m=s.split(/[\\/]/); return m[m.length-1]||s; }
 async function loadDrives(){
@@ -1218,7 +1226,53 @@ async function loadRuns(){
       : '<span class="mut">No scans recorded yet.</span>';
   }catch(e){ $("#runs").innerHTML='<span class="mut">Could not load scan history.</span>'; }
 }
-loadDrives(); poll(); loadRuns();"##;
+loadDrives(); poll(); loadRuns();
+const LIMITS=[
+  ["archive_ratio_cap","Ratio cap","Refuses an entry whose declared uncompressed/compressed ratio is higher. Guards time, not memory: real files reach the hundreds, a zip bomb reaches the millions."],
+  ["archive_entry_max_bytes","Largest file in an archive (bytes)","Leave empty for unlimited. Files inside archives are streamed, so this bounds how long one entry may take, not how much memory it uses."],
+  ["archive_buffer_max_bytes","Nested archive buffer (bytes)","Real memory: a zip inside a zip is held in RAM so it can be hashed and re-opened."],
+  ["archive_total_buffer_bytes","Total buffer budget (bytes)","Real memory: the ceiling on all nested-archive buffers alive at once."],
+  ["max_archive_depth","Maximum nesting depth",""],
+];
+async function loadLimits(){
+  const d=await apiGet("/api/settings");
+  $("#limitsbody").innerHTML=LIMITS.map(([k,label,help])=>`
+    <div style="margin-bottom:10px">
+      <label for="lim_${esc(k)}">${esc(label)}</label>
+      <input id="lim_${esc(k)}" name="${esc(k)}" value="${d[k]===null||d[k]===undefined?'':esc(String(d[k]))}" style="width:100%">
+      ${help?`<div class="mut" style="font-size:12px">${esc(help)}</div>`:''}
+    </div>`).join('')
+    + `<button class="btn" id="savelimits">Save</button>`;
+}
+document.addEventListener('toggle', e=>{
+  if(e.target.id==='limits' && e.target.open && !e.target.dataset.loaded){
+    // Set the flag only once the load succeeds, so a failure leaves the section retryable on the
+    // next collapse/expand instead of stuck on the error message forever.
+    loadLimits().then(()=>{ e.target.dataset.loaded='1'; })
+      .catch(()=>{ $("#limitsbody").textContent='Could not load the limits.'; });
+  }
+}, true);
+document.addEventListener('click', async e=>{
+  if(e.target.id!=='savelimits') return;
+  const body={};
+  for(const [k,label] of LIMITS){
+    const raw=$("#lim_"+k).value.trim();
+    // Empty means "unlimited" for the leaf ceiling and "leave unset" for everything else.
+    if(raw==='') { if(k==='archive_entry_max_bytes') body[k]=null; continue; }
+    const n=Number(raw);
+    if(!Number.isFinite(n)||n<0){ $("#limitsmsg").textContent=`${label} must be a number.`; return; }
+    body[k]=n;
+  }
+  // apiPost (defined in the shared shell, web_ui.rs:370) sends the x-cleanup-token header and
+  // THROWS on a non-2xx, returning parsed JSON otherwise -- so the refusal arrives as an
+  // exception, not as a falsy `ok`.
+  try{
+    await apiPost("/api/settings", body);
+    $("#limitsmsg").textContent="Saved — applies to the next scan.";
+  }catch(err){
+    $("#limitsmsg").textContent="Refused: "+err.message;
+  }
+});"##;
     shell("scan", csrf, "Scan a drive", main, script)
 }
 
