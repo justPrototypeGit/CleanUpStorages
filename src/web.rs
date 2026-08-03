@@ -1025,6 +1025,12 @@ fn merge_settings(
             .archive_entry_max_bytes
             .or(stored.archive_entry_max_bytes),
         archive_ratio_cap: req.archive_ratio_cap.or(stored.archive_ratio_cap),
+        archive_deny_extensions: req
+            .archive_deny_extensions
+            .or(stored.archive_deny_extensions),
+        archive_allow_extensions: req
+            .archive_allow_extensions
+            .or(stored.archive_allow_extensions),
     }
 }
 
@@ -3044,6 +3050,8 @@ mod tests {
             archive_total_buffer_bytes: total_bytes,
             archive_entry_max_bytes: Some(64 * 1024 * 1024 * 1024),
             archive_ratio_cap: 10_000,
+            archive_deny_extensions: Vec::new(),
+            archive_allow_extensions: Vec::new(),
         }
     }
 
