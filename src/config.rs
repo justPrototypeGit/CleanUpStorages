@@ -14,7 +14,16 @@ pub struct Config {
     /// memory.
     pub archive_entry_max_bytes: Option<u64>,
     pub archive_ratio_cap: u64,
+    pub archive_deny_extensions: Vec<String>,
+    pub archive_allow_extensions: Vec<String>,
 }
+
+/// Zip-format files that are documents or packages, not archives worth exploding into parts.
+/// Extending this needs no release -- it is editable in settings.json and on the Scan page.
+const DEFAULT_DENY: &[&str] = &[
+    "docx", "xlsx", "pptx", "docm", "xlsm", "pptm", "jar", "apk", "war", "ear", "epub", "odt",
+    "ods", "odp", "nupkg", "vsix", "ipa",
+];
 
 impl Config {
     /// Build a Config with default paths in the OS app-data directory.
@@ -47,6 +56,10 @@ impl Config {
                 .archive_entry_max_bytes
                 .unwrap_or(Some(64 * 1024 * 1024 * 1024)),
             archive_ratio_cap: s.archive_ratio_cap.unwrap_or(10_000),
+            archive_deny_extensions: s
+                .archive_deny_extensions
+                .unwrap_or_else(|| DEFAULT_DENY.iter().map(|s| s.to_string()).collect()),
+            archive_allow_extensions: s.archive_allow_extensions.unwrap_or_default(),
         }
     }
 
@@ -92,6 +105,10 @@ pub struct Settings {
     pub archive_entry_max_bytes: Option<Option<u64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archive_ratio_cap: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive_deny_extensions: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive_allow_extensions: Option<Vec<String>>,
 }
 
 /// Distinguishes an absent key from an explicit `null`. See `archive_entry_max_bytes`.
