@@ -90,6 +90,12 @@ pub enum Descent {
 ///
 /// The deny-list is checked FIRST and always wins -- including over `zip` itself. Silently
 /// overriding an explicit choice would be worse than obeying one the user can see and undo.
+///
+/// `extension` is lowercase, without a dot ("" when the name has none).
+///
+/// `extension` is lowercase and dot-free ("" when the name has none). A dotted value never
+/// matches either list and therefore reads as `Unrecognised` -- safe, but wrong, so callers
+/// must strip the dot.
 pub fn descent_for(extension: &str, deny: &[String], allow: &[String]) -> Descent {
     let ext = extension.to_ascii_lowercase();
     let has = |list: &[String]| list.iter().any(|e| e.eq_ignore_ascii_case(&ext));
