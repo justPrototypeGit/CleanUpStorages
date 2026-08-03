@@ -968,45 +968,10 @@ fn memory_ceiling() -> Option<u64> {
 /// fields untouched. A value that is unchanged, or lowered, cannot make memory pressure worse than
 /// it already was, so it must always be editable.
 fn validate(s: &crate::config::Settings, before: &crate::config::Config) -> Result<(), String> {
-    if let Some(d) = s.max_archive_depth {
-        if d < 1 {
-            return Err("max_archive_depth must be at least 1".into());
-        }
-    }
-    if let Some(r) = s.archive_ratio_cap {
-        if r < 1 {
-            return Err("archive_ratio_cap must be at least 1".into());
-        }
-    }
-    // F4: zero is not a valid byte bound. `archive_buffer_max_bytes: 0` or
-    // `archive_total_buffer_bytes: 0` would buffer nothing, and `archive_entry_max_bytes: 0` would
-    // convert every present archive entry to `missing` on the next scan even though nothing on disk
-    // changed -- unlimited is spelled `null` (`Some(None)`), never `0`.
-    if let Some(v) = s.archive_buffer_max_bytes {
-        if v < 1 {
-            return Err("archive_buffer_max_bytes must be at least 1 byte".into());
-        }
-    }
-    if let Some(v) = s.archive_total_buffer_bytes {
-        if v < 1 {
-            return Err("archive_total_buffer_bytes must be at least 1 byte".into());
-        }
-    }
-    if let Some(Some(0)) = s.archive_entry_max_bytes {
-        return Err(
-            "archive_entry_max_bytes cannot be 0: use null for unlimited, not 0, which would \
-             reject every entry"
-                .into(),
-        );
-    }
-    if let (Some(per), Some(total)) = (s.archive_buffer_max_bytes, s.archive_total_buffer_bytes) {
-        if per > total {
-            return Err(
-                "archive_buffer_max_bytes cannot exceed archive_total_buffer_bytes: a per-archive \
-                 bound larger than the whole descent's budget has no effect"
-                    .into(),
-            );
-        }
+    // Shared with load-time validation in config.rs: a hand-edited settings.json must be rejected
+    // (per field) by the exact same rules the HTTP boundary enforces.
+    if let Some((field, reason)) = crate::config::check_ranges(s).into_iter().next() {
+        return Err(format!("{field} {reason}"));
     }
     if let Some(ceiling) = memory_ceiling() {
         for (name, v, prev) in [
