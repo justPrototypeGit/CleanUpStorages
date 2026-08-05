@@ -957,20 +957,24 @@ async fn api_settings_get() -> Result<Json<SettingsDto>, (StatusCode, String)> {
 /// Unfamiliar zip-format extensions found during scans, aggregated for the user to approve
 /// ("descend" -> treat as an archive) or dismiss ("document" -> treat as a document/package).
 ///
-/// Opens the catalog READ-ONLY: `Catalog::open_readonly` runs no schema DDL, so a catalog
-/// created before this branch has no `pending_archive_formats` table yet. Rather than 500 on
-/// "no such table" (which would break the Scan page on every pre-existing install until the
-/// user's next write-opening operation creates the table), this degrades to an empty list --
-/// there is nothing pending to report until a scan using the new code records a row, at which
-/// point the table already exists because `Catalog::open` (used by the scanner) always runs
-/// `schema::apply`.
+/// Two -- and only two -- cases degrade to an empty list instead of a 500, both meaning "there is
+/// truly nothing to report yet":
+///   1. No catalog file exists at all (nothing has been scanned yet).
+///   2. The catalog exists but predates this branch, so `pending_archive_formats` hasn't been
+///      created -- `Catalog::open_readonly` runs no schema DDL, and the table appears the next
+///      time anything write-opens the catalog (the scanner, or `api_resolve_format`).
+///
+/// Any other failure to open or query the catalog -- a locked file, a permissions error, a path
+/// that is not a database at all -- surfaces as a genuine 500. This endpoint's whole job is to
+/// warn the user about files the scanner could not classify, so swallowing a real error here
+/// would silently read as "nothing pending", indistinguishable from a clean drive.
 async fn api_pending_formats(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<crate::catalog::pending_formats::PendingFormat>>, (StatusCode, String)> {
-    let cat = match Catalog::open_readonly(&state.catalog_path) {
-        Ok(c) => c,
-        Err(_) => return Ok(Json(Vec::new())),
-    };
+    if !state.catalog_path.exists() {
+        return Ok(Json(Vec::new()));
+    }
+    let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
     match cat.pending_formats() {
         Ok(rows) => Ok(Json(rows)),
         Err(e) if e.to_string().contains("no such table") => Ok(Json(Vec::new())),
@@ -3499,6 +3503,32 @@ mod tests {
         assert!(
             v.as_array().unwrap().is_empty(),
             "a pre-migration catalog should report no pending formats, not 500: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_formats_endpoint_surfaces_a_genuine_open_failure() {
+        // A directory used as the db path is a clean way to force a real OS/sqlite open error,
+        // distinct from "no catalog yet". This must NOT read as "nothing pending" -- that would be
+        // indistinguishable from a clean drive to the user.
+        let tmp = tempfile::tempdir().unwrap();
+        let bogus_db = tmp.path().join("looks-like-a-db-but-is-a-directory");
+        std::fs::create_dir_all(&bogus_db).unwrap();
+
+        let app = build_router(bogus_db);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/pending-formats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            res.status(),
+            axum::http::StatusCode::OK,
+            "a genuine open failure must not be reported as an empty pending list"
         );
     }
 
