@@ -1031,6 +1031,17 @@ async fn api_resolve_format(
     crate::config::save_settings(&path, &s).map_err(err500)?;
 
     let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
+    // "descend" needs the next ordinary scan to actually re-open these files -- SC3. The
+    // incremental skip path never opens a file whose cached (size, mtime) still matches disk, so
+    // without this a plain `force=false` rescan would never reach `descend_archive` and approving
+    // an extension would be a silent no-op (see F-1, archive-descent-policy review). "document"
+    // needs none of this: the file is already catalogued whole, which is what the deny-list means.
+    if body.action == "descend" {
+        for (volume_id, relative_path) in cat.pending_format_paths(&ext).map_err(err500)? {
+            cat.invalidate_scan_fingerprint(&volume_id, &relative_path)
+                .map_err(err500)?;
+        }
+    }
     cat.clear_pending_format(&ext).map_err(err500)?;
     Ok(Json(cat.pending_formats().map_err(err500)?))
 }

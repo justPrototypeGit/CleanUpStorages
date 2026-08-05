@@ -90,6 +90,40 @@ impl Catalog {
         }
     }
 
+    /// Invalidate the cached fingerprint the incremental-skip check compares against, without
+    /// touching `status`, `content_hash`, or `last_seen_at`.
+    ///
+    /// Used by `api_resolve_format` (action `"descend"`) when an unfamiliar extension is approved:
+    /// the file on disk has not changed, but the policy governing it has, so the skip check at
+    /// `src/scanner.rs` (`old_size == size && old_mtime == mtime.unwrap_or(0)`) must fail on the
+    /// next ordinary (`force=false`) pass, forcing a re-hash -- only a re-hash reaches
+    /// `descend_archive`. Without this, a rescan takes the skip path forever and "approve" is a
+    /// silent no-op until the next `--force` (see F-1 in the archive-descent-policy review).
+    ///
+    /// `modified_time = -1` is the sentinel. `unix_secs` (`src/scanner.rs`) computes a real file's
+    /// mtime via `duration_since(UNIX_EPOCH)`, which is `Err` (not a negative number) for any
+    /// pre-epoch or unreadable timestamp; that case is stored as SQL `NULL` and read back as `0`
+    /// through `IFNULL(modified_time,0)` in `get_file_meta`. So a genuine `modified_time` is always
+    /// `NULL` or `>= 0` -- `-1` can never collide with it, guaranteeing the comparison fails
+    /// regardless of the file's real mtime.
+    ///
+    /// Scoped to exactly one `(volume_id, relative_path)` loose-file row (`container_chain IS
+    /// NULL`, matching the unique index `idx_files_loose_identity`): approving one extension cannot
+    /// touch any other file's fingerprint, and this never changes `status`, so it cannot mark
+    /// anything `missing`.
+    pub fn invalidate_scan_fingerprint(
+        &self,
+        volume_id: &str,
+        relative_path: &str,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE files SET modified_time = -1
+             WHERE volume_id=?1 AND relative_path=?2 AND container_chain IS NULL",
+            params![volume_id, relative_path],
+        )?;
+        Ok(())
+    }
+
     /// Insert or update one loose file; sets status=active and last_seen_at=now.
     pub fn upsert_file(&self, f: &NewFile, now: i64) -> anyhow::Result<()> {
         self.conn.execute(
