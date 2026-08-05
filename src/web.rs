@@ -999,10 +999,10 @@ async fn api_resolve_format(
     Json(body): Json<ResolveFormat>,
 ) -> Result<Json<Vec<crate::catalog::pending_formats::PendingFormat>>, (StatusCode, String)> {
     check_csrf(&headers, &state)?;
+    // "" is a legitimate value here, not a malformed request: an extensionless zip-format file
+    // records a pending row with extension == "" (src/scanner.rs, `descent_ext`), and resolving
+    // that row must round-trip the same as any other extension.
     let ext = body.extension.to_ascii_lowercase();
-    if ext.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "extension is required".into()));
-    }
     let cfg = crate::config::Config::default_paths().map_err(err500)?;
     let path = cfg.settings_path();
     // Merge, never overwrite: the other settings must survive.
@@ -2797,6 +2797,12 @@ mod tests {
         // editing JSON by hand, which is what this feature exists to avoid.
         assert!(body.contains("/api/settings"));
         assert!(body.contains("archive_ratio_cap"));
+        assert!(body.contains("/api/pending-formats"));
+        assert!(body.contains("humanBytes"), "byte fields carry a unit hint");
+        // The extension lists are only reachable from here; without them a user who mis-clicks
+        // "Treat as documents" cannot see it happened or undo it except by hand-editing settings.json.
+        assert!(body.contains("archive_deny_extensions"));
+        assert!(body.contains("archive_allow_extensions"));
         assert!(!body.contains("http://") && !body.contains("https://"));
     }
 
@@ -3483,6 +3489,43 @@ mod tests {
             allow.iter().filter(|e| *e == "bak").count(),
             1,
             "resolving twice must not duplicate: got {allow:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolving_a_pending_format_with_no_extension_round_trips() {
+        // An extensionless zip-format file records a pending row with extension == "". That is a
+        // legitimate domain value ("no extension"), not a malformed request -- resolving it must
+        // work the same as any other extension, not be rejected as "missing".
+        let _scope = ScopedDataDir::new();
+        let (_t, db, state) = seed_dupes();
+        {
+            let cat = Catalog::open(&db).unwrap();
+            cat.record_pending_format("vol-1", "a", "", 10, 10).unwrap();
+        }
+        let v = get_json(&db, "/api/pending-formats").await;
+        assert_eq!(v[0]["extension"], "");
+
+        let token = state.csrf_token.clone();
+        let app = build_router_with(state);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/pending-formats/resolve")
+                    .header("content-type", "application/json")
+                    .header("x-cleanup-token", token)
+                    .body(Body::from(r#"{"extension":"","action":"document"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+
+        let v = get_json(&db, "/api/pending-formats").await;
+        assert!(
+            v.as_array().unwrap().is_empty(),
+            "resolved formats stop being reported"
         );
     }
 
