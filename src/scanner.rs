@@ -160,6 +160,8 @@ pub fn scan_volume_with_progress(
     // held back from the missing-sweep below (#7) — unreadable is not the same as gone.
     let mut unreadable_dirs: Vec<String> = Vec::new();
     cat.conn.execute_batch("BEGIN")?;
+    // Re-count from scratch for this volume, so a rescan does not accumulate.
+    cat.clear_pending_formats_for_volume(&identity.volume_id)?;
 
     let mut walker = WalkDir::new(root).into_iter();
     loop {
@@ -405,19 +407,36 @@ pub fn scan_volume_with_progress(
             }
         };
         if is_archive {
-            let _t = metrics.timer(crate::scan_metrics::Phase::Archive);
-            descend_archive(
-                cat,
-                path,
-                &rel,
-                mtime,
-                identity,
-                limits,
-                now,
-                &mut summary,
-                &mut in_batch,
-                progress,
-            )?;
+            let descent_ext = path
+                .extension()
+                .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            match archive::descent_for(
+                &descent_ext,
+                &limits.deny_extensions,
+                &limits.allow_extensions,
+            ) {
+                archive::Descent::Descend => {
+                    let _t = metrics.timer(crate::scan_metrics::Phase::Archive);
+                    descend_archive(
+                        cat,
+                        path,
+                        &rel,
+                        mtime,
+                        identity,
+                        limits,
+                        now,
+                        &mut summary,
+                        &mut in_batch,
+                        progress,
+                    )?;
+                }
+                archive::Descent::Leaf => {}
+                archive::Descent::Unrecognised => {
+                    // Left whole AND recorded: the user decides, the scanner does not guess.
+                    cat.record_pending_format(&identity.volume_id, &descent_ext, size, now)?;
+                }
+            }
         }
     }
 
@@ -666,6 +685,11 @@ mod tests {
             total_buffer_bytes: 2 * 1024 * 1024 * 1024,
             entry_max_bytes: Some(64 * 1024 * 1024 * 1024),
             ratio_cap: 10_000,
+            deny_extensions: crate::config::DEFAULT_DENY
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            allow_extensions: Vec::new(),
         }
     }
 
@@ -1721,6 +1745,14 @@ mod tests {
         };
         std::fs::write(root.join("archive.bak"), &inner).unwrap();
 
+        // This regression is about the SKIP-PATH/revival mechanics for an already-descended
+        // archive's entries, not about the descent decision itself -- so `bak` is explicitly
+        // allow-listed here (unlike `test_limits()`) to keep that decision out of the way.
+        let allow_bak = crate::archive::ArchiveLimits {
+            allow_extensions: vec!["bak".to_string()],
+            ..test_limits()
+        };
+
         let m = crate::scan_metrics::ScanMetrics::new();
         let stop = crate::scan_control::StopFlag::new();
         scan_volume_with_progress(
@@ -1732,7 +1764,7 @@ mod tests {
             None,
             &m,
             &stop,
-            &test_limits(),
+            &allow_bak,
         )
         .unwrap();
 
@@ -1759,7 +1791,7 @@ mod tests {
             None,
             &m2,
             &stop2,
-            &test_limits(),
+            &allow_bak,
         )
         .unwrap();
 
@@ -2140,6 +2172,116 @@ mod tests {
             "ATTACK: gone.txt was removed BEFORE round-trip #2's disappearance (at t=400), so the \
              SECOND round-trip must not revive it either, even though it WAS revived by the FIRST \
              round-trip"
+        );
+    }
+
+    #[test]
+    fn a_document_container_is_catalogued_whole_and_a_renamed_zip_is_reported() {
+        // The whole point of this branch: a .docx must not explode into its parts, and a zip with
+        // an unfamiliar extension must be reported rather than silently descended or ignored.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        let zip_bytes = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut zw = zip::ZipWriter::new(&mut buf);
+                let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                zw.start_file("inside.txt", opts).unwrap();
+                std::io::Write::write_all(&mut zw, b"payload").unwrap();
+                zw.finish().unwrap();
+            }
+            buf.into_inner()
+        };
+        std::fs::write(root.join("thesis.docx"), &zip_bytes).unwrap();
+        std::fs::write(root.join("backup.bak"), &zip_bytes).unwrap();
+        std::fs::write(root.join("real.zip"), &zip_bytes).unwrap();
+
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let stop = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
+
+        let entries: Vec<String> = cat
+            .conn
+            .prepare("SELECT relative_path FROM files WHERE container_chain IS NOT NULL ORDER BY relative_path")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            entries,
+            vec!["real.zip".to_string()],
+            "only the .zip is descended into"
+        );
+
+        let pending = cat.pending_formats().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].extension, "bak");
+        assert_eq!(pending[0].count, 1);
+
+        // All three are still catalogued as ordinary files -- nothing is skipped.
+        let loose: i64 = cat
+            .conn
+            .query_row(
+                "SELECT count(*) FROM files WHERE container_chain IS NULL AND status='active'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(loose, 3);
+    }
+
+    #[test]
+    fn a_rescan_does_not_double_count_pending_formats() {
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        let zip_bytes = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut zw = zip::ZipWriter::new(&mut buf);
+                let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                zw.start_file("inside.txt", opts).unwrap();
+                std::io::Write::write_all(&mut zw, b"payload").unwrap();
+                zw.finish().unwrap();
+            }
+            buf.into_inner()
+        };
+        std::fs::write(root.join("backup.bak"), &zip_bytes).unwrap();
+        let stop = crate::scan_control::StopFlag::new();
+        for now in [100, 200] {
+            let m = crate::scan_metrics::ScanMetrics::new();
+            scan_volume_with_progress(
+                &cat,
+                &root,
+                &ident(),
+                true,
+                now,
+                None,
+                &m,
+                &stop,
+                &test_limits(),
+            )
+            .unwrap();
+        }
+        let pending = cat.pending_formats().unwrap();
+        assert_eq!(
+            pending[0].count, 1,
+            "a rescan re-counts, it does not accumulate"
         );
     }
 }

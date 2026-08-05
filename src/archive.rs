@@ -21,6 +21,11 @@ pub struct ArchiveLimits {
     /// TIME: declared uncompressed/compressed. With a generous leaf ceiling this is what stops a
     /// genuine bomb streaming for a long time before its size cap trips.
     pub ratio_cap: u64,
+    /// Zip-format extensions always treated as a leaf, never descended -- checked first and always
+    /// wins, including over `zip` itself.
+    pub deny_extensions: Vec<String>,
+    /// Zip-format extensions (other than `zip` itself) approved for descent.
+    pub allow_extensions: Vec<String>,
 }
 
 impl ArchiveLimits {
@@ -31,6 +36,8 @@ impl ArchiveLimits {
             total_buffer_bytes: cfg.archive_total_buffer_bytes,
             entry_max_bytes: cfg.archive_entry_max_bytes,
             ratio_cap: cfg.archive_ratio_cap,
+            deny_extensions: cfg.archive_deny_extensions.clone(),
+            allow_extensions: cfg.archive_allow_extensions.clone(),
         }
     }
 
@@ -694,6 +701,8 @@ mod tests {
             entry_max_bytes: Some(64 * 1024 * 1024 * 1024),
             ratio_cap: 10_000,
             total_buffer_bytes: 2 * 1024 * 1024 * 1024,
+            deny_extensions: Vec::new(),
+            allow_extensions: Vec::new(),
         }
     }
 

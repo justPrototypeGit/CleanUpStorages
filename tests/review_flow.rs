@@ -37,6 +37,8 @@ fn test_limits() -> cleanupstorages::archive::ArchiveLimits {
         total_buffer_bytes: 2 * 1024 * 1024 * 1024,
         entry_max_bytes: Some(64 * 1024 * 1024 * 1024),
         ratio_cap: 10_000,
+        deny_extensions: Vec::new(),
+        allow_extensions: Vec::new(),
     }
 }
 
