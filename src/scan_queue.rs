@@ -261,6 +261,17 @@ impl ScanQueue {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs() as i64;
+            // One config load, used for both the scan and the snapshot. This DOES change one
+            // thing: a Config::default_paths() failure now aborts before run_scan, so it no
+            // longer leaves a scan_runs row with status="failed" the way it did when the failure
+            // happened inside the scanner. That is deliberate -- if the configuration cannot
+            // load, no scan ever started, and a row claiming one ran and failed records something
+            // that did not happen. The failure still reaches the user as a job error in the
+            // queue's `recent` list (see `error_result` below).
+            // It also removes a real race: the two old calls could disagree if the config changed
+            // between them.
+            let cfg = crate::config::Config::default_paths()?;
+            let limits = crate::archive::ArchiveLimits::from_config(&cfg);
             let progress: &dyn crate::scanner::Progress = counters_for_job.as_ref();
             // Counting first is what makes a real percentage possible from the very first byte
             // hashed, rather than only once the scan itself has walked the whole tree.
@@ -274,16 +285,15 @@ impl ScanQueue {
                 now,
                 Some(progress),
                 &stop_for_job,
+                &limits,
             )?;
             // snapshot the catalog after a successful scan (best-effort)
-            if let Ok(cfg) = crate::config::Config::default_paths() {
-                let _ = crate::catalog::backup::snapshot(
-                    &catalog_path,
-                    &cfg.backups_dir(),
-                    cfg.snapshot_retention,
-                    now,
-                );
-            }
+            let _ = crate::catalog::backup::snapshot(
+                &catalog_path,
+                &cfg.backups_dir(),
+                cfg.snapshot_retention,
+                now,
+            );
             let (hashed, skipped, errors, archive_entries) = counters_for_job.snapshot();
             Ok(match scanned {
                 Some((_id, s)) => ScanResult {

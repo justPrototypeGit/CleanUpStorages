@@ -21,6 +21,11 @@ pub struct ArchiveLimits {
     /// TIME: declared uncompressed/compressed. With a generous leaf ceiling this is what stops a
     /// genuine bomb streaming for a long time before its size cap trips.
     pub ratio_cap: u64,
+    /// Zip-format extensions always treated as a leaf, never descended -- checked first and always
+    /// wins, including over `zip` itself.
+    pub deny_extensions: Vec<String>,
+    /// Zip-format extensions (other than `zip` itself) approved for descent.
+    pub allow_extensions: Vec<String>,
 }
 
 impl ArchiveLimits {
@@ -31,6 +36,8 @@ impl ArchiveLimits {
             total_buffer_bytes: cfg.archive_total_buffer_bytes,
             entry_max_bytes: cfg.archive_entry_max_bytes,
             ratio_cap: cfg.archive_ratio_cap,
+            deny_extensions: cfg.archive_deny_extensions.clone(),
+            allow_extensions: cfg.archive_allow_extensions.clone(),
         }
     }
 
@@ -69,6 +76,43 @@ fn human_bytes(b: u64) -> String {
     } else {
         format!("{b} bytes")
     }
+}
+
+/// What to do with a file that is already known to be zip format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Descent {
+    /// Catalogue what is inside.
+    Descend,
+    /// A known container -- catalogue the file itself and leave it whole.
+    Leaf,
+    /// Zip format with an unfamiliar extension. Treated as a leaf, and reported so the user can
+    /// decide, rather than guessed at: a five-day unattended scan cannot ask.
+    Unrecognised,
+}
+
+/// The naming policy for a file already established to be zip format.
+///
+/// A renamed zip and a `.docx` are indistinguishable by magic bytes alone, so the difference has to
+/// be an explicit rule rather than something implied by a policy name.
+///
+/// The deny-list is checked FIRST and always wins -- including over `zip` itself. Silently
+/// overriding an explicit choice would be worse than obeying one the user can see and undo.
+///
+/// `extension` is lowercase, without a dot ("" when the name has none).
+///
+/// `extension` is lowercase and dot-free ("" when the name has none). A dotted value never
+/// matches either list and therefore reads as `Unrecognised` -- safe, but wrong, so callers
+/// must strip the dot.
+pub fn descent_for(extension: &str, deny: &[String], allow: &[String]) -> Descent {
+    let ext = extension.to_ascii_lowercase();
+    let has = |list: &[String]| list.iter().any(|e| e.eq_ignore_ascii_case(&ext));
+    if has(deny) {
+        return Descent::Leaf;
+    }
+    if ext == "zip" || has(allow) {
+        return Descent::Descend;
+    }
+    Descent::Unrecognised
 }
 
 /// True if these leading bytes carry a zip signature.
@@ -372,6 +416,103 @@ mod tests {
     use std::io::{Cursor, Write};
 
     #[test]
+    fn the_descent_rule_separates_archives_from_document_containers() {
+        let deny: Vec<String> = ["docx", "jar", "epub"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let allow: Vec<String> = vec![];
+        assert_eq!(descent_for("zip", &deny, &allow), Descent::Descend);
+        assert_eq!(
+            descent_for("docx", &deny, &allow),
+            Descent::Leaf,
+            "a document container"
+        );
+        assert_eq!(descent_for("jar", &deny, &allow), Descent::Leaf);
+        // The renamed-zip case from #42: unfamiliar, so reported rather than guessed at.
+        assert_eq!(descent_for("bak", &deny, &allow), Descent::Unrecognised);
+        assert_eq!(
+            descent_for("", &deny, &allow),
+            Descent::Unrecognised,
+            "no extension"
+        );
+    }
+
+    #[test]
+    fn an_approved_extension_is_descended_into() {
+        let deny: Vec<String> = vec!["docx".into()];
+        let allow: Vec<String> = vec!["bak".into()];
+        assert_eq!(descent_for("bak", &deny, &allow), Descent::Descend);
+    }
+
+    #[test]
+    fn the_deny_list_wins_over_everything() {
+        // Deliberate: if a user denies `zip`, or denies something they also allowed, the visible
+        // choice must win. Silently overriding them would be worse than obeying an undoable choice.
+        let deny: Vec<String> = vec!["zip".into(), "bak".into()];
+        let allow: Vec<String> = vec!["bak".into()];
+        assert_eq!(descent_for("zip", &deny, &allow), Descent::Leaf);
+        assert_eq!(descent_for("bak", &deny, &allow), Descent::Leaf);
+    }
+
+    #[test]
+    fn extension_matching_ignores_case() {
+        let deny: Vec<String> = vec!["docx".into()];
+        assert_eq!(descent_for("DOCX", &deny, &[]), Descent::Leaf);
+        assert_eq!(descent_for("ZIP", &[], &[]), Descent::Descend);
+    }
+
+    /// `Config::default_paths()` reads the ambient environment. This scopes
+    /// `CLEANUPSTORAGES_DATA_DIR` to a throwaway tempdir for the test's duration and restores
+    /// whatever was there before on drop (even on panic), using the same mutex `config.rs` uses so
+    /// the two never race on the process-global env var. The #41/#42 review found this exact test
+    /// shape reading the user's real settings file without this guard.
+    struct ScopedDataDir {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _dir: tempfile::TempDir,
+        prev: Option<String>,
+    }
+    impl ScopedDataDir {
+        fn new() -> Self {
+            let lock = crate::config::ENV_GUARD
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let prev = std::env::var("CLEANUPSTORAGES_DATA_DIR").ok();
+            std::env::set_var("CLEANUPSTORAGES_DATA_DIR", dir.path());
+            ScopedDataDir {
+                _lock: lock,
+                _dir: dir,
+                prev,
+            }
+        }
+    }
+    impl Drop for ScopedDataDir {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("CLEANUPSTORAGES_DATA_DIR", v),
+                None => std::env::remove_var("CLEANUPSTORAGES_DATA_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_default_deny_list_covers_the_formats_that_prompted_this() {
+        let _scope = ScopedDataDir::new();
+        let cfg = Config::default_paths().unwrap();
+        for e in ["docx", "xlsx", "pptx", "jar", "apk", "epub", "odt"] {
+            assert!(
+                cfg.archive_deny_extensions.iter().any(|d| d == e),
+                "{e} must be denied by default"
+            );
+        }
+        assert!(
+            cfg.archive_allow_extensions.is_empty(),
+            "nothing is approved until the user says so"
+        );
+    }
+
+    #[test]
     fn limits_from_config() {
         // F2: a `Config` literal, not `Config::default_paths()` -- that call reads whatever
         // `settings.json` exists in the AMBIENT data directory (no ENV_GUARD, no scoped data dir),
@@ -385,6 +526,8 @@ mod tests {
             archive_total_buffer_bytes: 2 * 1024 * 1024 * 1024,
             archive_entry_max_bytes: Some(64 * 1024 * 1024 * 1024),
             archive_ratio_cap: 10_000,
+            archive_deny_extensions: Vec::new(),
+            archive_allow_extensions: Vec::new(),
         };
         let l = ArchiveLimits::from_config(&cfg);
         assert_eq!(l.max_depth, 8);
@@ -558,6 +701,8 @@ mod tests {
             entry_max_bytes: Some(64 * 1024 * 1024 * 1024),
             ratio_cap: 10_000,
             total_buffer_bytes: 2 * 1024 * 1024 * 1024,
+            deny_extensions: Vec::new(),
+            allow_extensions: Vec::new(),
         }
     }
 
