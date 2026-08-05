@@ -186,6 +186,22 @@ mod tests {
     use crate::catalog::models::Volume;
     use std::fs;
 
+    /// Limits for tests: the compiled-in defaults, with NO ambient environment read.
+    fn test_limits() -> crate::archive::ArchiveLimits {
+        crate::archive::ArchiveLimits {
+            max_depth: 8,
+            buffer_max_bytes: 2 * 1024 * 1024 * 1024,
+            total_buffer_bytes: 2 * 1024 * 1024 * 1024,
+            entry_max_bytes: Some(64 * 1024 * 1024 * 1024),
+            ratio_cap: 10_000,
+            deny_extensions: crate::config::DEFAULT_DENY
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            allow_extensions: Vec::new(),
+        }
+    }
+
     // A fake mounted drive with a marker and two identical files.
     fn fake_drive() -> (tempfile::TempDir, Catalog, String) {
         let tmp = tempfile::tempdir().unwrap();
@@ -209,7 +225,7 @@ mod tests {
             label: "D".into(),
             identified_by: "marker".into(),
         };
-        crate::scanner::scan_volume(&cat, &root, &ident, false, 100).unwrap();
+        crate::scanner::scan_volume(&cat, &root, &ident, false, 100, &test_limits()).unwrap();
         (tmp, cat, root.to_string_lossy().into_owned())
     }
 

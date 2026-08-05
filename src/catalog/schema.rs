@@ -79,6 +79,17 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_scan_runs_started ON scan_runs(started_at DESC);
 
+        CREATE TABLE IF NOT EXISTS pending_archive_formats (
+            volume_id     TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
+            extension     TEXT NOT NULL,
+            size_bytes    INTEGER NOT NULL,
+            first_seen_at INTEGER NOT NULL,
+            PRIMARY KEY (volume_id, relative_path)
+        );
+        CREATE INDEX IF NOT EXISTS idx_pending_archive_formats_extension
+            ON pending_archive_formats(extension);
+
         CREATE VIRTUAL TABLE IF NOT EXISTS files_fts
             USING fts5(filename, relative_path, container_chain,
                        content='files', content_rowid='id');

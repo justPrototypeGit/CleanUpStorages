@@ -5,7 +5,6 @@ use crate::archive::{self, ArchiveLimits};
 use crate::catalog::models::{NewFile, Volume};
 use crate::catalog::Catalog;
 use crate::category::Category;
-use crate::config::Config;
 use crate::hashing;
 use crate::volume::VolumeIdentity;
 
@@ -152,9 +151,9 @@ pub fn scan_volume_with_progress(
     progress: Option<&dyn Progress>,
     metrics: &crate::scan_metrics::ScanMetrics,
     stop: &crate::scan_control::StopFlag,
+    limits: &ArchiveLimits,
 ) -> anyhow::Result<ScanSummary> {
     let scan_started_at = now;
-    let limits = ArchiveLimits::from_config(&Config::default_paths()?);
     let mut summary = ScanSummary::default();
     let mut in_batch = 0usize;
     // Directories this pass could not enumerate. Their contents were never visited, so they must be
@@ -258,11 +257,25 @@ pub fn scan_volume_with_progress(
         // triggers is db_write (it is the fsync #26 targets), so the guard must be dead before
         // rotate_batch runs — otherwise a rescan books 100% of its fsyncs to skip_check and reads
         // as seek-bound.
+        //
+        // Also captures what the catalogue knew about this path BEFORE this pass touches it, for
+        // the archive-detection fallback further down: `upsert_file` below unconditionally writes
+        // this path's own row, so a query made AFTER it would find a row for every path -- even one
+        // seen for the very first time -- and could never fall through to the extension test.
+        //
+        // Fetched unconditionally, `force` or not: `force` governs only whether the SKIP decision
+        // below is allowed to fire, not whether we learn what the catalogue already knew. A forced
+        // scan already re-hashes every byte of every file, so one more indexed lookup is noise
+        // beside that -- and skipping the fetch under `force` is exactly what silently reopened
+        // this defect for the documented `--force` recovery path.
+        let prior_meta: Option<crate::catalog::store::FileMeta> = {
+            let _t = metrics.timer(crate::scan_metrics::Phase::SkipCheck);
+            cat.get_file_meta(&identity.volume_id, &rel)?
+        };
         let is_unchanged = if force {
             false
         } else {
-            let _t = metrics.timer(crate::scan_metrics::Phase::SkipCheck);
-            match cat.get_file_meta(&identity.volume_id, &rel)? {
+            match prior_meta {
                 Some((old_size, old_mtime, has_archive_entries, revive_floor))
                     if old_size == size && old_mtime == mtime.unwrap_or(0) =>
                 {
@@ -386,9 +399,7 @@ pub fn scan_volume_with_progress(
                     // archive": that would leave `descend_archive` unrun with no error logged, and
                     // the entries inside would be swept to `missing` with no way to self-heal on a
                     // later clean rescan (the archive's own row stays `active`, so the revive floor
-                    // is `None`). Log it so #6's completeness audit surfaces it, and fall back to
-                    // the extension test rather than to `false` so a momentarily-locked `.zip` is
-                    // still treated as an archive.
+                    // is `None`). Log it so #6's completeness audit surfaces it.
                     cat.log_scan_error(
                         Some(&identity.volume_id),
                         &rel,
@@ -401,24 +412,48 @@ pub fn scan_volume_with_progress(
                     if let Some(p) = progress {
                         p.on_error();
                     }
-                    ext_looks_like_zip
+                    // Fall back on what the catalogue already knew BEFORE this scan touched this
+                    // path (`prior_meta`, captured above), not on the filename: it is right for a
+                    // renamed zip and for a .docx alike. Only when there is no prior row at all (a
+                    // new file we could not open) does the extension remain the last resort.
+                    match prior_meta {
+                        Some((_, _, has_archive_entries, _)) => has_archive_entries,
+                        None => ext_looks_like_zip,
+                    }
                 }
             }
         };
         if is_archive {
-            let _t = metrics.timer(crate::scan_metrics::Phase::Archive);
-            descend_archive(
-                cat,
-                path,
-                &rel,
-                mtime,
-                identity,
-                &limits,
-                now,
-                &mut summary,
-                &mut in_batch,
-                progress,
-            )?;
+            let descent_ext = path
+                .extension()
+                .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                .unwrap_or_default();
+            match archive::descent_for(
+                &descent_ext,
+                &limits.deny_extensions,
+                &limits.allow_extensions,
+            ) {
+                archive::Descent::Descend => {
+                    let _t = metrics.timer(crate::scan_metrics::Phase::Archive);
+                    descend_archive(
+                        cat,
+                        path,
+                        &rel,
+                        mtime,
+                        identity,
+                        limits,
+                        now,
+                        &mut summary,
+                        &mut in_batch,
+                        progress,
+                    )?;
+                }
+                archive::Descent::Leaf => {}
+                archive::Descent::Unrecognised => {
+                    // Left whole AND recorded: the user decides, the scanner does not guess.
+                    cat.record_pending_format(&identity.volume_id, &rel, &descent_ext, size, now)?;
+                }
+            }
         }
     }
 
@@ -454,6 +489,7 @@ pub fn scan_volume(
     identity: &VolumeIdentity,
     force: bool,
     now: i64,
+    limits: &ArchiveLimits,
 ) -> anyhow::Result<ScanSummary> {
     let metrics = crate::scan_metrics::ScanMetrics::new();
     scan_volume_with_progress(
@@ -465,6 +501,7 @@ pub fn scan_volume(
         None,
         &metrics,
         &crate::scan_control::StopFlag::new(),
+        limits,
     )
 }
 
@@ -472,6 +509,11 @@ pub fn scan_volume(
 ///
 /// The single shared definition of "how a scan works" — used by both the CLI's `cmd_scan` and
 /// the web worker, so the two callers can never drift apart on volume-identity/upsert semantics.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each parameter is an independent scan input; grouping them into a struct would add \
+        indirection without reducing real complexity"
+)]
 pub fn run_scan(
     cat: &Catalog,
     mount_root: &Path,
@@ -480,6 +522,7 @@ pub fn run_scan(
     now: i64,
     progress: Option<&dyn Progress>,
     stop: &crate::scan_control::StopFlag,
+    limits: &ArchiveLimits,
 ) -> anyhow::Result<Option<(VolumeIdentity, ScanSummary)>> {
     let identity = match crate::volume::resolve(mount_root, fallback)? {
         Some(id) => id,
@@ -515,7 +558,7 @@ pub fn run_scan(
     // measured before it died.
     let metrics = crate::scan_metrics::ScanMetrics::new();
     let result = scan_volume_with_progress(
-        cat, mount_root, &identity, force, now, progress, &metrics, stop,
+        cat, mount_root, &identity, force, now, progress, &metrics, stop, limits,
     );
 
     if result.is_err() {
@@ -651,6 +694,22 @@ mod tests {
         }
     }
 
+    /// Limits for tests: the compiled-in defaults, with NO ambient environment read.
+    fn test_limits() -> crate::archive::ArchiveLimits {
+        crate::archive::ArchiveLimits {
+            max_depth: 8,
+            buffer_max_bytes: 2 * 1024 * 1024 * 1024,
+            total_buffer_bytes: 2 * 1024 * 1024 * 1024,
+            entry_max_bytes: Some(64 * 1024 * 1024 * 1024),
+            ratio_cap: 10_000,
+            deny_extensions: crate::config::DEFAULT_DENY
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            allow_extensions: Vec::new(),
+        }
+    }
+
     fn setup() -> (tempfile::TempDir, Catalog) {
         let tmp = tempfile::tempdir().unwrap();
         let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
@@ -718,7 +777,18 @@ mod tests {
 
         let m = crate::scan_metrics::ScanMetrics::new();
         let stop = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
 
         let (phase, kind): (String, String) = cat
             .conn
@@ -747,7 +817,17 @@ mod tests {
 
         let m = crate::scan_metrics::ScanMetrics::new();
         let stop = crate::scan_control::StopFlag::new();
-        let result = scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop);
+        let result = scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &test_limits(),
+        );
 
         // Restore permissions before any assertion can early-return/panic, so the tempdir can
         // still be cleaned up regardless of outcome.
@@ -787,8 +867,18 @@ mod tests {
         // First scan: the file is readable, so it gets catalogued normally.
         let m1 = crate::scan_metrics::ScanMetrics::new();
         let stop1 = crate::scan_control::StopFlag::new();
-        let s1 = scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m1, &stop1)
-            .unwrap();
+        let s1 = scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m1,
+            &stop1,
+            &test_limits(),
+        )
+        .unwrap();
         assert_eq!(s1.errors, 0);
 
         // Second scan: the file is now locked, so the re-read fails. `force=true` so the unchanged
@@ -800,8 +890,18 @@ mod tests {
             .unwrap();
         let m2 = crate::scan_metrics::ScanMetrics::new();
         let stop2 = crate::scan_control::StopFlag::new();
-        let s2 =
-            scan_volume_with_progress(&cat, &root, &ident(), true, 200, None, &m2, &stop2).unwrap();
+        let s2 = scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            true,
+            200,
+            None,
+            &m2,
+            &stop2,
+            &test_limits(),
+        )
+        .unwrap();
         assert_eq!(s2.errors, 1, "the scan itself must count the failure");
 
         let c = cat.volume_completeness("vol-1").unwrap();
@@ -832,8 +932,18 @@ mod tests {
         // First scan: the file is readable, so it gets catalogued normally.
         let m1 = crate::scan_metrics::ScanMetrics::new();
         let stop1 = crate::scan_control::StopFlag::new();
-        let s1 = scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m1, &stop1)
-            .unwrap();
+        let s1 = scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m1,
+            &stop1,
+            &test_limits(),
+        )
+        .unwrap();
         assert_eq!(s1.errors, 0);
 
         // Second scan: the file is now unreadable, so the re-read fails. `force=true` so the
@@ -842,7 +952,17 @@ mod tests {
         std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o000)).unwrap();
         let m2 = crate::scan_metrics::ScanMetrics::new();
         let stop2 = crate::scan_control::StopFlag::new();
-        let result = scan_volume_with_progress(&cat, &root, &ident(), true, 200, None, &m2, &stop2);
+        let result = scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            true,
+            200,
+            None,
+            &m2,
+            &stop2,
+            &test_limits(),
+        );
 
         // Restore permissions before any assertion can early-return/panic, so the tempdir can
         // still be cleaned up regardless of outcome.
@@ -872,12 +992,12 @@ mod tests {
         fs::write(root.join("a.txt"), b"alpha").unwrap();
         fs::write(root.join("sub/b.txt"), b"beta").unwrap();
 
-        let s1 = scan_volume(&cat, &root, &ident(), false, 100).unwrap();
+        let s1 = scan_volume(&cat, &root, &ident(), false, 100, &test_limits()).unwrap();
         assert_eq!(s1.hashed, 2);
         assert_eq!(s1.skipped, 0);
 
         // second scan: nothing changed -> both skipped (no re-hash)
-        let s2 = scan_volume(&cat, &root, &ident(), false, 200).unwrap();
+        let s2 = scan_volume(&cat, &root, &ident(), false, 200, &test_limits()).unwrap();
         assert_eq!(s2.hashed, 0);
         assert_eq!(s2.skipped, 2);
 
@@ -892,10 +1012,10 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("keep.txt"), b"x").unwrap();
         fs::write(root.join("gone.txt"), b"y").unwrap();
-        scan_volume(&cat, &root, &ident(), false, 100).unwrap();
+        scan_volume(&cat, &root, &ident(), false, 100, &test_limits()).unwrap();
 
         fs::remove_file(root.join("gone.txt")).unwrap();
-        let s = scan_volume(&cat, &root, &ident(), false, 200).unwrap();
+        let s = scan_volume(&cat, &root, &ident(), false, 200, &test_limits()).unwrap();
         assert_eq!(s.marked_missing, 1);
         assert_eq!(
             cat.search("gone", None, None, Some("missing"))
@@ -935,7 +1055,7 @@ mod tests {
             &[("trip/beach.jpg", b"sand"), ("note.txt", b"hi")],
         );
 
-        let s = scan_volume(&cat, &root, &ident(), false, 100).unwrap();
+        let s = scan_volume(&cat, &root, &ident(), false, 100, &test_limits()).unwrap();
         // the zip file itself is a loose hashed file
         assert_eq!(s.hashed, 1);
         // its two entries are catalogued
@@ -953,10 +1073,10 @@ mod tests {
         let root = tmp.path().join("drive");
         fs::create_dir_all(&root).unwrap();
         write_zip_file(&root.join("a.zip"), &[("x.txt", b"one")]);
-        scan_volume(&cat, &root, &ident(), false, 100).unwrap();
+        scan_volume(&cat, &root, &ident(), false, 100, &test_limits()).unwrap();
 
         // rescan unchanged: archive is skipped, but its entry must NOT be swept to missing
-        let s = scan_volume(&cat, &root, &ident(), false, 200).unwrap();
+        let s = scan_volume(&cat, &root, &ident(), false, 200, &test_limits()).unwrap();
         assert_eq!(s.marked_missing, 0);
         assert_eq!(
             cat.search("x", None, None, Some("active")).unwrap().len(),
@@ -1014,6 +1134,7 @@ mod tests {
             100,
             None,
             &crate::scan_control::StopFlag::new(),
+            &test_limits(),
         )
         .unwrap();
         let (identity, summary) = out.expect("not skipped");
@@ -1067,6 +1188,7 @@ mod tests {
             100,
             None,
             &crate::scan_control::StopFlag::new(),
+            &test_limits(),
         )
         .unwrap();
         let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
@@ -1092,6 +1214,7 @@ mod tests {
             1234,
             None,
             &crate::scan_control::StopFlag::new(),
+            &test_limits(),
         )
         .unwrap();
         assert!(n.is_some());
@@ -1121,6 +1244,7 @@ mod tests {
             Some(&p),
             &m,
             &crate::scan_control::StopFlag::new(),
+            &test_limits(),
         )
         .unwrap();
         assert_eq!(p.hashed.load(Relaxed), s.hashed);
@@ -1156,7 +1280,7 @@ mod tests {
     #[test]
     fn scan_records_phase_timings_and_the_size_histogram() {
         let (_t, cat, root) = fixture_with_files(&[("a.txt", 10), ("big.bin", 5000)]);
-        let s = scan_volume(&cat, &root, &ident(), false, 100).unwrap();
+        let s = scan_volume(&cat, &root, &ident(), false, 100, &test_limits()).unwrap();
         let m = &s.metrics;
 
         assert_eq!(m.files_seen, 2);
@@ -1177,8 +1301,8 @@ mod tests {
     #[test]
     fn rescan_attributes_bytes_to_skipped_not_hashed() {
         let (_t, cat, root) = fixture_with_files(&[("a.txt", 10), ("b.txt", 20)]);
-        scan_volume(&cat, &root, &ident(), false, 100).unwrap();
-        let s = scan_volume(&cat, &root, &ident(), false, 200).unwrap();
+        scan_volume(&cat, &root, &ident(), false, 100, &test_limits()).unwrap();
+        let s = scan_volume(&cat, &root, &ident(), false, 200, &test_limits()).unwrap();
 
         assert_eq!(s.skipped, 2, "second pass takes the incremental-skip path");
         assert_eq!(s.metrics.bytes_hashed, 0);
@@ -1198,6 +1322,7 @@ mod tests {
             100,
             None,
             &crate::scan_control::StopFlag::new(),
+            &test_limits(),
         )
         .unwrap();
         assert!(out.is_some());
@@ -1232,6 +1357,7 @@ mod tests {
             100,
             None,
             &crate::scan_control::StopFlag::new(),
+            &test_limits(),
         );
         assert!(out.is_err(), "the induced trigger must fail the scan");
         drop(cat);
@@ -1273,6 +1399,7 @@ mod tests {
             100,
             None,
             &crate::scan_control::StopFlag::new(),
+            &test_limits(),
         );
         assert!(
             out.is_ok(),
@@ -1331,7 +1458,18 @@ mod tests {
         // First pass catalogues both files.
         let m = crate::scan_metrics::ScanMetrics::new();
         let stop = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
         assert_eq!(cat.search("", None, None, Some("active")).unwrap().len(), 2);
 
         // Second pass is stopped before it starts: nothing is re-seen, so an unguarded sweep would
@@ -1339,8 +1477,18 @@ mod tests {
         let stop2 = crate::scan_control::StopFlag::new();
         stop2.request();
         let m2 = crate::scan_metrics::ScanMetrics::new();
-        let s = scan_volume_with_progress(&cat, &root, &ident(), false, 300, None, &m2, &stop2)
-            .unwrap();
+        let s = scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            300,
+            None,
+            &m2,
+            &stop2,
+            &test_limits(),
+        )
+        .unwrap();
 
         assert!(s.stopped, "the summary must report that it was stopped");
         assert_eq!(s.marked_missing, 0, "a stopped scan must not sweep");
@@ -1361,12 +1509,33 @@ mod tests {
 
         let m = crate::scan_metrics::ScanMetrics::new();
         let stop = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
 
         std::fs::remove_file(root.join("gone.txt")).unwrap();
         let m2 = crate::scan_metrics::ScanMetrics::new();
-        let s =
-            scan_volume_with_progress(&cat, &root, &ident(), false, 300, None, &m2, &stop).unwrap();
+        let s = scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            300,
+            None,
+            &m2,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
         assert!(!s.stopped);
         assert_eq!(s.marked_missing, 1);
     }
@@ -1403,7 +1572,18 @@ mod tests {
 
         let m = crate::scan_metrics::ScanMetrics::new();
         let stop = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
 
         let remaining: Vec<String> = cat
             .conn
@@ -1441,8 +1621,18 @@ mod tests {
         let m = crate::scan_metrics::ScanMetrics::new();
         let stop = crate::scan_control::StopFlag::new();
         stop.request(); // stopped before it starts
-        let s =
-            scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+        let s = scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
         assert!(s.stopped);
 
         let n: i64 = cat
@@ -1476,7 +1666,18 @@ mod tests {
 
         let m = crate::scan_metrics::ScanMetrics::new();
         let stop = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
 
         let n: i64 = cat
             .conn
@@ -1509,8 +1710,18 @@ mod tests {
         let m = crate::scan_metrics::ScanMetrics::new();
         let stop = crate::scan_control::StopFlag::new();
         stop.request(); // stopped before it starts
-        let s =
-            scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+        let s = scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
         assert!(s.stopped);
 
         let n: i64 = cat
@@ -1551,9 +1762,28 @@ mod tests {
         };
         std::fs::write(root.join("archive.bak"), &inner).unwrap();
 
+        // This regression is about the SKIP-PATH/revival mechanics for an already-descended
+        // archive's entries, not about the descent decision itself -- so `bak` is explicitly
+        // allow-listed here (unlike `test_limits()`) to keep that decision out of the way.
+        let allow_bak = crate::archive::ArchiveLimits {
+            allow_extensions: vec!["bak".to_string()],
+            ..test_limits()
+        };
+
         let m = crate::scan_metrics::ScanMetrics::new();
         let stop = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &allow_bak,
+        )
+        .unwrap();
 
         let entries_active = || -> i64 {
             cat.conn
@@ -1569,8 +1799,18 @@ mod tests {
         // Second scan, nothing changed on disk: the skip path runs, then the sweep.
         let m2 = crate::scan_metrics::ScanMetrics::new();
         let stop2 = crate::scan_control::StopFlag::new();
-        let s = scan_volume_with_progress(&cat, &root, &ident(), false, 300, None, &m2, &stop2)
-            .unwrap();
+        let s = scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            300,
+            None,
+            &m2,
+            &stop2,
+            &allow_bak,
+        )
+        .unwrap();
 
         assert_eq!(
             s.marked_missing, 0,
@@ -1611,7 +1851,18 @@ mod tests {
 
         let m = crate::scan_metrics::ScanMetrics::new();
         let stop = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
 
         let inner_catalogued: i64 = cat
             .conn
@@ -1646,8 +1897,17 @@ mod tests {
         FORCE_DETECTION_OPEN_ERROR.with(|f| f.set(true));
         let m = crate::scan_metrics::ScanMetrics::new();
         let stop = crate::scan_control::StopFlag::new();
-        let scan_result =
-            scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop);
+        let scan_result = scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &test_limits(),
+        );
         FORCE_DETECTION_OPEN_ERROR.with(|f| f.set(false));
         let summary = scan_result.unwrap();
 
@@ -1672,6 +1932,130 @@ mod tests {
             "active",
             "the archive's entry must not be swept to missing just because detection had to \
              fall back on the extension test"
+        );
+    }
+
+    #[test]
+    fn a_detection_failure_on_a_catalogued_archive_keeps_its_entries() {
+        // The archive is named .bak, so the old extension-based fallback said "not an archive",
+        // descend never ran, and the sweep took its entries -- with no way to self-heal.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        let zip_bytes = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut zw = zip::ZipWriter::new(&mut buf);
+                let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                zw.start_file("inside.txt", opts).unwrap();
+                std::io::Write::write_all(&mut zw, b"payload").unwrap();
+                zw.finish().unwrap();
+            }
+            buf.into_inner()
+        };
+        std::fs::write(root.join("backup.bak"), &zip_bytes).unwrap();
+
+        // Approve .bak so the first scan descends and the entry exists. Task 3 made the limits an
+        // argument, so this needs no environment or settings file.
+        let limits = crate::archive::ArchiveLimits {
+            allow_extensions: vec!["bak".to_string()],
+            ..test_limits()
+        };
+        let stop = crate::scan_control::StopFlag::new();
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let ident = ident();
+        scan_volume_with_progress(&cat, &root, &ident, false, 100, None, &m, &stop, &limits)
+            .unwrap();
+        let active = || -> i64 {
+            cat.conn
+                .query_row(
+                    "SELECT count(*) FROM files WHERE container_chain IS NOT NULL AND status='active'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(active(), 1, "the entry is catalogued");
+
+        // Now force the detection open to fail, with the file's content changed so the skip path
+        // does not short-circuit.
+        std::fs::write(root.join("backup.bak"), [&zip_bytes[..], b"x"].concat()).unwrap();
+        FORCE_DETECTION_OPEN_ERROR.with(|f| f.set(true));
+        let m2 = crate::scan_metrics::ScanMetrics::new();
+        let r =
+            scan_volume_with_progress(&cat, &root, &ident, false, 300, None, &m2, &stop, &limits);
+        // Reset before unwrapping, so a failure cannot leave the hook set for other tests on this
+        // thread.
+        FORCE_DETECTION_OPEN_ERROR.with(|f| f.set(false));
+        r.unwrap();
+
+        assert_eq!(
+            active(),
+            1,
+            "a detection failure must not cost the archive its entries"
+        );
+    }
+
+    /// The `--force` variant of the above. `--force` is the documented recovery path for a stale
+    /// catalogue, so a detection failure under `--force` must ALSO consult the catalogue rather
+    /// than the filename -- otherwise the one recovery mechanism this defect tells users to reach
+    /// for reopens the exact same loss it is supposed to fix.
+    #[test]
+    fn a_detection_failure_under_force_also_keeps_a_catalogued_archives_entries() {
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        let zip_bytes = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut zw = zip::ZipWriter::new(&mut buf);
+                let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                zw.start_file("inside.txt", opts).unwrap();
+                std::io::Write::write_all(&mut zw, b"payload").unwrap();
+                zw.finish().unwrap();
+            }
+            buf.into_inner()
+        };
+        std::fs::write(root.join("backup.bak"), &zip_bytes).unwrap();
+
+        let limits = crate::archive::ArchiveLimits {
+            allow_extensions: vec!["bak".to_string()],
+            ..test_limits()
+        };
+        let stop = crate::scan_control::StopFlag::new();
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let ident = ident();
+        scan_volume_with_progress(&cat, &root, &ident, false, 100, None, &m, &stop, &limits)
+            .unwrap();
+        let active = || -> i64 {
+            cat.conn
+                .query_row(
+                    "SELECT count(*) FROM files WHERE container_chain IS NOT NULL AND status='active'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(active(), 1, "the entry is catalogued");
+
+        // Content need not even change here: `force=true` re-hashes and re-runs detection
+        // regardless of size/mtime, which is the whole point of `--force`.
+        FORCE_DETECTION_OPEN_ERROR.with(|f| f.set(true));
+        let m2 = crate::scan_metrics::ScanMetrics::new();
+        let r =
+            scan_volume_with_progress(&cat, &root, &ident, true, 300, None, &m2, &stop, &limits);
+        // Reset before unwrapping, so a failure cannot leave the hook set for other tests on this
+        // thread.
+        FORCE_DETECTION_OPEN_ERROR.with(|f| f.set(false));
+        r.unwrap();
+
+        assert_eq!(
+            active(),
+            1,
+            "a detection failure under --force must not cost the archive its entries either -- \
+             --force is the documented recovery path for this defect"
         );
     }
 
@@ -1702,7 +2086,18 @@ mod tests {
         .unwrap();
         let m1 = crate::scan_metrics::ScanMetrics::new();
         let stop1 = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m1, &stop1).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m1,
+            &stop1,
+            &test_limits(),
+        )
+        .unwrap();
         assert_eq!(status_of(&cat, "a.txt"), "active");
         assert_eq!(status_of(&cat, "gone.txt"), "active");
 
@@ -1711,7 +2106,18 @@ mod tests {
         std::fs::write(&bundle_path, make_zip(&[("a.txt", b"alpha")])).unwrap();
         let m2 = crate::scan_metrics::ScanMetrics::new();
         let stop2 = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 200, None, &m2, &stop2).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            200,
+            None,
+            &m2,
+            &stop2,
+            &test_limits(),
+        )
+        .unwrap();
         assert_eq!(status_of(&cat, "a.txt"), "active");
         assert_eq!(
             status_of(&cat, "gone.txt"),
@@ -1723,7 +2129,18 @@ mod tests {
         std::fs::rename(&bundle_path, &parked_path).unwrap();
         let m3 = crate::scan_metrics::ScanMetrics::new();
         let stop3 = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 300, None, &m3, &stop3).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            300,
+            None,
+            &m3,
+            &stop3,
+            &test_limits(),
+        )
+        .unwrap();
         assert_eq!(status_of(&cat, "a.txt"), "missing");
         assert_eq!(status_of(&cat, "gone.txt"), "missing");
 
@@ -1732,7 +2149,18 @@ mod tests {
         std::fs::rename(&parked_path, &bundle_path).unwrap();
         let m4 = crate::scan_metrics::ScanMetrics::new();
         let stop4 = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 400, None, &m4, &stop4).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            400,
+            None,
+            &m4,
+            &stop4,
+            &test_limits(),
+        )
+        .unwrap();
 
         assert_eq!(
             status_of(&cat, "a.txt"),
@@ -1768,18 +2196,51 @@ mod tests {
         .unwrap();
         let m = crate::scan_metrics::ScanMetrics::new();
         let s = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &s).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &s,
+            &test_limits(),
+        )
+        .unwrap();
 
         // t=200/300: archive vanishes (round-trip #1) and returns unchanged -- both entries revive
         // together (this is the ordinary, already-tested case).
         std::fs::rename(&bundle_path, &parked_path).unwrap();
         let m = crate::scan_metrics::ScanMetrics::new();
         let s = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 200, None, &m, &s).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            200,
+            None,
+            &m,
+            &s,
+            &test_limits(),
+        )
+        .unwrap();
         std::fs::rename(&parked_path, &bundle_path).unwrap();
         let m = crate::scan_metrics::ScanMetrics::new();
         let s = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 300, None, &m, &s).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            300,
+            None,
+            &m,
+            &s,
+            &test_limits(),
+        )
+        .unwrap();
         assert_eq!(status_of(&cat, "a.txt"), "active");
         assert_eq!(
             status_of(&cat, "gone.txt"),
@@ -1791,7 +2252,18 @@ mod tests {
         std::fs::write(&bundle_path, make_zip(&[("a.txt", b"alpha")])).unwrap();
         let m = crate::scan_metrics::ScanMetrics::new();
         let s = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 400, None, &m, &s).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            400,
+            None,
+            &m,
+            &s,
+            &test_limits(),
+        )
+        .unwrap();
         assert_eq!(
             status_of(&cat, "gone.txt"),
             "missing",
@@ -1802,11 +2274,33 @@ mod tests {
         std::fs::rename(&bundle_path, &parked_path).unwrap();
         let m = crate::scan_metrics::ScanMetrics::new();
         let s = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 500, None, &m, &s).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            500,
+            None,
+            &m,
+            &s,
+            &test_limits(),
+        )
+        .unwrap();
         std::fs::rename(&parked_path, &bundle_path).unwrap();
         let m = crate::scan_metrics::ScanMetrics::new();
         let s = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 600, None, &m, &s).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            600,
+            None,
+            &m,
+            &s,
+            &test_limits(),
+        )
+        .unwrap();
 
         assert_eq!(
             status_of(&cat, "a.txt"),
@@ -1819,6 +2313,360 @@ mod tests {
             "ATTACK: gone.txt was removed BEFORE round-trip #2's disappearance (at t=400), so the \
              SECOND round-trip must not revive it either, even though it WAS revived by the FIRST \
              round-trip"
+        );
+    }
+
+    #[test]
+    fn a_document_container_is_catalogued_whole_and_a_renamed_zip_is_reported() {
+        // The whole point of this branch: a .docx must not explode into its parts, and a zip with
+        // an unfamiliar extension must be reported rather than silently descended or ignored.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        let zip_bytes = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut zw = zip::ZipWriter::new(&mut buf);
+                let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                zw.start_file("inside.txt", opts).unwrap();
+                std::io::Write::write_all(&mut zw, b"payload").unwrap();
+                zw.finish().unwrap();
+            }
+            buf.into_inner()
+        };
+        std::fs::write(root.join("thesis.docx"), &zip_bytes).unwrap();
+        std::fs::write(root.join("backup.bak"), &zip_bytes).unwrap();
+        std::fs::write(root.join("real.zip"), &zip_bytes).unwrap();
+
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let stop = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
+
+        let entries: Vec<String> = cat
+            .conn
+            .prepare("SELECT relative_path FROM files WHERE container_chain IS NOT NULL ORDER BY relative_path")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            entries,
+            vec!["real.zip".to_string()],
+            "only the .zip is descended into"
+        );
+
+        let pending = cat.pending_formats().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].extension, "bak");
+        assert_eq!(pending[0].count, 1);
+
+        // All three are still catalogued as ordinary files -- nothing is skipped.
+        let loose: i64 = cat
+            .conn
+            .query_row(
+                "SELECT count(*) FROM files WHERE container_chain IS NULL AND status='active'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(loose, 3);
+    }
+
+    #[test]
+    fn approving_a_reported_extension_descends_it_on_the_very_next_ordinary_rescan() {
+        // SC3: "Approving a reported extension descends into those files on the next scan." This
+        // reproduces F-1 from the archive-descent-policy final review: without invalidating the
+        // cached fingerprint, an unchanged file's (size, mtime) still matches the catalogue, so the
+        // skip path at the top of this loop never re-opens it and `descend_archive` never runs --
+        // only `--force` (a second multi-day pass over the whole drive) would descend it.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        let zip_bytes = make_zip(&[("inside.txt", b"payload")]);
+        std::fs::write(root.join("backup.bak"), &zip_bytes).unwrap();
+
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let stop = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
+
+        let pending = cat.pending_formats().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].extension, "bak");
+
+        // What `api_resolve_format` (action "descend") does: invalidate the cached fingerprint for
+        // every file pending under this extension, then clear the pending rows. The extension
+        // joining the allow-list (the settings.json write in the real handler) is modeled here by
+        // handing the second scan a `limits` value with "bak" already in `allow_extensions`.
+        for (volume_id, relative_path) in cat.pending_format_paths("bak").unwrap() {
+            cat.invalidate_scan_fingerprint(&volume_id, &relative_path)
+                .unwrap();
+        }
+        cat.clear_pending_format("bak").unwrap();
+
+        let mut limits2 = test_limits();
+        limits2.allow_extensions = vec!["bak".to_string()];
+
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let stop = crate::scan_control::StopFlag::new();
+        let summary = scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false, // ordinary rescan -- NOT --force. This is the criterion.
+            200,
+            None,
+            &m,
+            &stop,
+            &limits2,
+        )
+        .unwrap();
+
+        assert_eq!(
+            summary.skipped, 0,
+            "the cached fingerprint must be invalidated, or backup.bak takes the skip path and is \
+             never re-opened"
+        );
+        assert_eq!(summary.hashed, 1);
+
+        let entries: Vec<String> = cat
+            .conn
+            .prepare(
+                "SELECT relative_path FROM files WHERE container_chain IS NOT NULL \
+                 ORDER BY relative_path",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            entries,
+            vec!["backup.bak".to_string()],
+            "approving the extension must descend it on an ORDINARY (force=false) rescan"
+        );
+
+        let pending_after = cat.pending_formats().unwrap();
+        assert!(
+            pending_after.is_empty(),
+            "the approved extension must not still be reported as pending"
+        );
+    }
+
+    #[test]
+    fn a_forced_rescan_does_not_double_count_pending_formats() {
+        // force=true: the file is re-hashed every pass, so record_pending_format is called again --
+        // the per-file upsert must replace the row, not add a second one.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        let zip_bytes = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut zw = zip::ZipWriter::new(&mut buf);
+                let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                zw.start_file("inside.txt", opts).unwrap();
+                std::io::Write::write_all(&mut zw, b"payload").unwrap();
+                zw.finish().unwrap();
+            }
+            buf.into_inner()
+        };
+        std::fs::write(root.join("backup.bak"), &zip_bytes).unwrap();
+        let stop = crate::scan_control::StopFlag::new();
+        for now in [100, 200] {
+            let m = crate::scan_metrics::ScanMetrics::new();
+            scan_volume_with_progress(
+                &cat,
+                &root,
+                &ident(),
+                true,
+                now,
+                None,
+                &m,
+                &stop,
+                &test_limits(),
+            )
+            .unwrap();
+        }
+        let pending = cat.pending_formats().unwrap();
+        assert_eq!(
+            pending[0].count, 1,
+            "a forced rescan re-hashes the file but must not accumulate a second row"
+        );
+    }
+
+    #[test]
+    fn an_incremental_rescan_still_reports_the_pending_format() {
+        // THE bug this round fixes: an ordinary (force=false) second scan finds the file unchanged
+        // and takes the skip path, which never opens the file and therefore never calls
+        // record_pending_format again. With no clear-at-scan-start, the row from the first scan must
+        // simply persist -- the report must not go blank just because nothing changed on disk.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        let zip_bytes = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut zw = zip::ZipWriter::new(&mut buf);
+                let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                zw.start_file("inside.txt", opts).unwrap();
+                std::io::Write::write_all(&mut zw, b"payload").unwrap();
+                zw.finish().unwrap();
+            }
+            buf.into_inner()
+        };
+        std::fs::write(root.join("backup.bak"), &zip_bytes).unwrap();
+        let stop = crate::scan_control::StopFlag::new();
+
+        let m1 = crate::scan_metrics::ScanMetrics::new();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m1,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
+        let pending = cat.pending_formats().unwrap();
+        assert_eq!(pending.len(), 1, "the first scan reports it");
+        assert_eq!(pending[0].count, 1);
+
+        // Second scan: nothing on disk changed, so this is the skip path.
+        let m2 = crate::scan_metrics::ScanMetrics::new();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            200,
+            None,
+            &m2,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
+        let pending = cat.pending_formats().unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "an incremental rescan must not empty the report"
+        );
+        assert_eq!(pending[0].extension, "bak");
+        assert_eq!(pending[0].count, 1, "still exactly one file");
+    }
+
+    #[test]
+    fn scanning_one_volume_does_not_touch_another_volumes_pending_formats() {
+        let (tmp, cat) = setup();
+        let root_a = tmp.path().join("drive-a");
+        let root_b = tmp.path().join("drive-b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        let zip_bytes = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut zw = zip::ZipWriter::new(&mut buf);
+                let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                zw.start_file("inside.txt", opts).unwrap();
+                std::io::Write::write_all(&mut zw, b"payload").unwrap();
+                zw.finish().unwrap();
+            }
+            buf.into_inner()
+        };
+        std::fs::write(root_a.join("a.bak"), &zip_bytes).unwrap();
+        std::fs::write(root_b.join("b.kra"), &zip_bytes).unwrap();
+
+        let ident_a = VolumeIdentity {
+            volume_id: "vol-a".into(),
+            label: "A".into(),
+            identified_by: "marker".into(),
+        };
+        let ident_b = VolumeIdentity {
+            volume_id: "vol-b".into(),
+            label: "B".into(),
+            identified_by: "marker".into(),
+        };
+        cat.upsert_volume(&Volume {
+            volume_id: "vol-a".into(),
+            label: "A".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
+        cat.upsert_volume(&Volume {
+            volume_id: "vol-b".into(),
+            label: "B".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
+        let stop = crate::scan_control::StopFlag::new();
+        let m = crate::scan_metrics::ScanMetrics::new();
+        scan_volume_with_progress(
+            &cat,
+            &root_a,
+            &ident_a,
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
+        let m2 = crate::scan_metrics::ScanMetrics::new();
+        scan_volume_with_progress(
+            &cat,
+            &root_b,
+            &ident_b,
+            false,
+            200,
+            None,
+            &m2,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
+
+        let pending = cat.pending_formats().unwrap();
+        let exts: std::collections::BTreeSet<String> =
+            pending.iter().map(|p| p.extension.clone()).collect();
+        assert_eq!(
+            exts,
+            ["bak".to_string(), "kra".to_string()].into_iter().collect(),
+            "scanning volume B must not clear or otherwise disturb volume A's report"
         );
     }
 }

@@ -97,6 +97,11 @@ main>.narrow{max-width:1120px;margin-left:auto;margin-right:auto;flex:1 1 auto;d
  background:var(--accent-weak);color:var(--accent);}
 .card-ico .material-symbols-outlined{font-size:22px;}
 .tag{font-size:11px;font-weight:500;padding:3px 9px;border-radius:6px;background:var(--line);color:var(--mut);font-family:var(--font-mono);}
+.chiprow{display:flex;flex-wrap:wrap;gap:6px;margin:4px 0 12px;}
+.chip{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-family:var(--font-mono);
+ background:var(--line);color:var(--mut);padding:3px 6px 3px 9px;border-radius:6px;}
+.chip button{background:none;border:0;color:var(--mut);cursor:pointer;font-size:13px;line-height:1;padding:0 2px;font-family:inherit;}
+.chip button:hover{color:var(--red);}
 .linkbtn{display:inline-flex;align-items:center;gap:5px;background:none;border:0;cursor:pointer;color:var(--mut);font:inherit;font-size:12.5px;padding:2px 4px;border-radius:6px;}
 .linkbtn:hover{color:var(--accent);}
 .linkbtn .material-symbols-outlined{font-size:16px;}
@@ -1105,6 +1110,15 @@ pub fn scan_page(csrf: &str) -> String {
   <div class="mut" style="font-size:12px;margin-bottom:10px">Where past scans spent their time. Kept across restarts, unlike the list above.</div>
   <div id="runs"><span class="mut">Loading…</span></div>
 </div>
+<div class="card" id="pendingfmt" style="margin-top:16px;display:none">
+  <b>Unrecognised zip-format files found</b>
+  <div class="mut" style="margin:6px 0 10px">
+    These are zip files with an extension the scanner does not recognise. They were catalogued whole
+    and <b>not</b> opened. Approve one to catalogue what is inside on the next scan.
+  </div>
+  <div id="pendingfmtbody"></div>
+  <div class="mut" id="pendingfmtmsg" style="min-height:1.3em;margin-top:8px"></div>
+</div>
 <details class="card" id="limits" style="margin-top:16px">
   <summary style="cursor:pointer">Archive limits</summary>
   <div class="mut" style="margin:8px 0 12px">
@@ -1226,30 +1240,113 @@ async function loadRuns(){
       : '<span class="mut">No scans recorded yet.</span>';
   }catch(e){ $("#runs").innerHTML='<span class="mut">Could not load scan history.</span>'; }
 }
-loadDrives(); poll(); loadRuns();
+loadDrives(); poll(); loadRuns(); loadPendingFormats();
+function humanBytes(n){
+  const v=Number(n);
+  if(!Number.isFinite(v)) return '';
+  const u=['B','KB','MB','GB','TB'];
+  let i=0, x=v;
+  while(x>=1024 && i<u.length-1){ x/=1024; i++; }
+  return (i===0? x : x.toFixed(1))+' '+u[i];
+}
+async function loadPendingFormats(){
+  let rows;
+  try{ rows=await apiGet("/api/pending-formats"); }catch(e){ return; }
+  const box=$("#pendingfmt");
+  if(!rows.length){ box.style.display='none'; return; }
+  box.style.display='';
+  $("#pendingfmtbody").innerHTML=rows.map(r=>`<div class="erow">
+      <span class="tag">${r.extension===''?'(no extension)':'.'+esc(r.extension)}</span>
+      <span>${esc(String(r.count))} files</span>
+      <span class="mut">${esc(humanBytes(r.total_bytes))}</span>
+      <button class="btn pfmt" data-ext="${esc(r.extension)}" data-action="descend">Descend into these</button>
+      <button class="btn pfmt" data-ext="${esc(r.extension)}" data-action="document">Treat as documents</button>
+    </div>`).join('');
+}
+document.addEventListener('click', async e=>{
+  const b=e.target.closest('button.pfmt');
+  if(!b) return;
+  const label=b.dataset.ext===''?'(no extension)':'.'+b.dataset.ext;
+  try{
+    await apiPost("/api/pending-formats/resolve", {extension:b.dataset.ext, action:b.dataset.action});
+    $("#pendingfmtmsg").textContent =
+      b.dataset.action==='descend'
+        ? `${label} will be opened on the next scan.`
+        : `${label} will be catalogued whole.`;
+    // A resolve moves the extension onto one of the settings lists -- refresh the chips too, or
+    // the pending row vanishes with nothing visibly taking its place, which reads as "did
+    // nothing" (or worse, "threw the file away") rather than "moved to the other list".
+    await loadPendingFormats();
+    await refreshLimits();
+  }catch(err){ $("#pendingfmtmsg").textContent="Failed: "+err.message; }
+});
 const LIMITS=[
-  ["archive_ratio_cap","Ratio cap","Refuses an entry whose declared uncompressed/compressed ratio is higher. Guards time, not memory: real files reach the hundreds, a zip bomb reaches the millions."],
-  ["archive_entry_max_bytes","Largest file in an archive (bytes)","Leave empty for unlimited. Files inside archives are streamed, so this bounds how long one entry may take, not how much memory it uses."],
-  ["archive_buffer_max_bytes","Nested archive buffer (bytes)","Real memory: a zip inside a zip is held in RAM so it can be hashed and re-opened."],
-  ["archive_total_buffer_bytes","Total buffer budget (bytes)","Real memory: the ceiling on all nested-archive buffers alive at once."],
-  ["max_archive_depth","Maximum nesting depth",""],
+  ["archive_ratio_cap","Ratio cap","Refuses an entry whose declared uncompressed/compressed ratio is higher. Guards time, not memory: real files reach the hundreds, a zip bomb reaches the millions.",false],
+  ["archive_entry_max_bytes","Largest file in an archive (bytes)","Leave empty for unlimited. Files inside archives are streamed, so this bounds how long one entry may take, not how much memory it uses.",true],
+  ["archive_buffer_max_bytes","Nested archive buffer (bytes)","Real memory: a zip inside a zip is held in RAM so it can be hashed and re-opened.",true],
+  ["archive_total_buffer_bytes","Total buffer budget (bytes)","Real memory: the ceiling on all nested-archive buffers alive at once.",true],
+  ["max_archive_depth","Maximum nesting depth","",false],
 ];
+const EXTLISTS=[
+  ["archive_deny_extensions","Treated as documents (never opened as archives)"],
+  ["archive_allow_extensions","Always descended into (even if otherwise unrecognised)"],
+];
+let LASTSETTINGS=null;
+function extGroupHtml(key,title,list){
+  const chips=list.length
+    ? `<div class="chiprow">${list.map(ex=>`<span class="chip">${ex===''?'(no extension)':'.'+esc(ex)}
+        <button class="chiprm" data-list="${esc(key)}" data-ext="${esc(ex)}" title="Remove">×</button></span>`).join('')}</div>`
+    : `<div class="mut" style="font-size:12px">None.</div>`;
+  return `<div style="margin-bottom:12px">
+    <label>${esc(title)}</label>
+    ${chips}
+  </div>`;
+}
 async function loadLimits(){
   const d=await apiGet("/api/settings");
-  $("#limitsbody").innerHTML=LIMITS.map(([k,label,help])=>`
+  LASTSETTINGS=d;
+  $("#limitsbody").innerHTML=LIMITS.map(([k,label,help,isBytes])=>`
     <div style="margin-bottom:10px">
       <label for="lim_${esc(k)}">${esc(label)}</label>
       <input id="lim_${esc(k)}" name="${esc(k)}" value="${d[k]===null||d[k]===undefined?'':esc(String(d[k]))}" style="width:100%">
+      ${isBytes?`<span class="mut" id="hint_${esc(k)}" style="font-size:12px"></span>`:''}
       ${help?`<div class="mut" style="font-size:12px">${esc(help)}</div>`:''}
     </div>`).join('')
+    + EXTLISTS.map(([key,title])=>extGroupHtml(key,title,d[key]||[])).join('')
     + `<button class="btn" id="savelimits">Save</button>`;
+  for(const [k,,,isBytes] of LIMITS){
+    if(!isBytes) continue;
+    const inp=$("#lim_"+k), hint=$("#hint_"+k);
+    const update=()=>{ hint.textContent = inp.value.trim()===''?'':'= '+humanBytes(inp.value); };
+    update();
+    inp.addEventListener('input', update);
+  }
+}
+document.addEventListener('click', async e=>{
+  const b=e.target.closest('button.chiprm');
+  if(!b) return;
+  const key=b.dataset.list, ext=b.dataset.ext;
+  const cur=(LASTSETTINGS && LASTSETTINGS[key]) || [];
+  const next=cur.filter(x=>x!==ext);
+  try{
+    await apiPost("/api/settings", {[key]: next});
+    $("#limitsmsg").textContent="Removed.";
+    await loadLimits();
+  }catch(err){ $("#limitsmsg").textContent="Failed: "+err.message; }
+});
+// Shared by the details-toggle handler below and by anything that changes a setting the section
+// displays (resolving a pending format) so the two never drift out of sync. Sets the "loaded" flag
+// only once the load succeeds, so a failure leaves the section retryable on the next collapse/
+// expand -- and so a caller who refreshes while the section has never been opened correctly marks
+// it as already fresh, instead of the next open silently re-fetching (harmless) or, if the flag
+// were set unconditionally, silently skipping a real reload after a failed one (not harmless).
+function refreshLimits(){
+  return loadLimits().then(()=>{ $("#limits").dataset.loaded='1'; })
+    .catch(()=>{ $("#limitsbody").textContent='Could not load the limits.'; });
 }
 document.addEventListener('toggle', e=>{
   if(e.target.id==='limits' && e.target.open && !e.target.dataset.loaded){
-    // Set the flag only once the load succeeds, so a failure leaves the section retryable on the
-    // next collapse/expand instead of stuck on the error message forever.
-    loadLimits().then(()=>{ e.target.dataset.loaded='1'; })
-      .catch(()=>{ $("#limitsbody").textContent='Could not load the limits.'; });
+    refreshLimits();
   }
 }, true);
 document.addEventListener('click', async e=>{
@@ -1269,6 +1366,7 @@ document.addEventListener('click', async e=>{
   try{
     await apiPost("/api/settings", body);
     $("#limitsmsg").textContent="Saved — applies to the next scan.";
+    await loadPendingFormats();
   }catch(err){
     $("#limitsmsg").textContent="Refused: "+err.message;
   }

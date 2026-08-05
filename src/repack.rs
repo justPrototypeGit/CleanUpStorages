@@ -358,6 +358,22 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// Limits for tests: the compiled-in defaults, with NO ambient environment read.
+    fn test_limits() -> crate::archive::ArchiveLimits {
+        crate::archive::ArchiveLimits {
+            max_depth: 8,
+            buffer_max_bytes: 2 * 1024 * 1024 * 1024,
+            total_buffer_bytes: 2 * 1024 * 1024 * 1024,
+            entry_max_bytes: Some(64 * 1024 * 1024 * 1024),
+            ratio_cap: 10_000,
+            deny_extensions: crate::config::DEFAULT_DENY
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            allow_extensions: Vec::new(),
+        }
+    }
+
     fn make_zip(path: &Path, files: &[(&str, &[u8])]) {
         let f = std::fs::File::create(path).unwrap();
         let mut zw = zip::ZipWriter::new(f);
@@ -451,7 +467,7 @@ mod tests {
             label: "D".into(),
             identified_by: "marker".into(),
         };
-        crate::scanner::scan_volume(&cat, &root, &ident, false, 100).unwrap();
+        crate::scanner::scan_volume(&cat, &root, &ident, false, 100, &test_limits()).unwrap();
         (tmp, cat, root)
     }
 

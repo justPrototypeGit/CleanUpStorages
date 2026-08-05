@@ -14,7 +14,16 @@ pub struct Config {
     /// memory.
     pub archive_entry_max_bytes: Option<u64>,
     pub archive_ratio_cap: u64,
+    pub archive_deny_extensions: Vec<String>,
+    pub archive_allow_extensions: Vec<String>,
 }
+
+/// Zip-format files that are documents or packages, not archives worth exploding into parts.
+/// Extending this needs no release -- it is editable in settings.json and on the Scan page.
+pub(crate) const DEFAULT_DENY: &[&str] = &[
+    "docx", "xlsx", "pptx", "docm", "xlsm", "pptm", "jar", "apk", "war", "ear", "epub", "odt",
+    "ods", "odp", "nupkg", "vsix", "ipa",
+];
 
 impl Config {
     /// Build a Config with default paths in the OS app-data directory.
@@ -47,6 +56,10 @@ impl Config {
                 .archive_entry_max_bytes
                 .unwrap_or(Some(64 * 1024 * 1024 * 1024)),
             archive_ratio_cap: s.archive_ratio_cap.unwrap_or(10_000),
+            archive_deny_extensions: s
+                .archive_deny_extensions
+                .unwrap_or_else(|| DEFAULT_DENY.iter().map(|s| s.to_string()).collect()),
+            archive_allow_extensions: s.archive_allow_extensions.unwrap_or_default(),
         }
     }
 
@@ -92,6 +105,10 @@ pub struct Settings {
     pub archive_entry_max_bytes: Option<Option<u64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archive_ratio_cap: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive_deny_extensions: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive_allow_extensions: Option<Vec<String>>,
 }
 
 /// Distinguishes an absent key from an explicit `null`. See `archive_entry_max_bytes`.
@@ -140,14 +157,77 @@ pub fn load_settings(path: &Path) -> Settings {
         );
         return Settings::default();
     }
-    match serde_json::from_value(value) {
+    let mut s: Settings = match serde_json::from_value(value) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(
                 "{} is not valid settings JSON: {e}; using default limits",
                 path.display()
             );
-            Settings::default()
+            return Settings::default();
+        }
+    };
+    // Per field, never the whole file: a bad preference is a warning, a stopped five-day scan is not.
+    drop_out_of_range(&mut s, path);
+    s
+}
+
+/// Range rules for the archive limits, in ONE place.
+///
+/// Applied both when `settings.json` is read and at the HTTP boundary. The two used to differ, so a
+/// hand-edited file could set a 0-byte entry ceiling that the UI would have refused -- and a 0-byte
+/// ceiling converts present files to `missing`.
+///
+/// Returns `(field, reason)` for each out-of-range field; empty when everything is fine.
+pub fn check_ranges(s: &Settings) -> Vec<(&'static str, String)> {
+    let mut bad = Vec::new();
+    if matches!(s.max_archive_depth, Some(0)) {
+        bad.push(("max_archive_depth", "must be at least 1".to_string()));
+    }
+    if matches!(s.archive_ratio_cap, Some(0)) {
+        bad.push(("archive_ratio_cap", "must be at least 1".to_string()));
+    }
+    if matches!(s.archive_buffer_max_bytes, Some(0)) {
+        bad.push(("archive_buffer_max_bytes", "must be at least 1".to_string()));
+    }
+    if matches!(s.archive_total_buffer_bytes, Some(0)) {
+        bad.push((
+            "archive_total_buffer_bytes",
+            "must be at least 1".to_string(),
+        ));
+    }
+    // Some(Some(0)) is a zero ceiling; Some(None) is "explicitly unlimited" and is fine.
+    if matches!(s.archive_entry_max_bytes, Some(Some(0))) {
+        bad.push((
+            "archive_entry_max_bytes",
+            "must be at least 1; unlimited is null, not 0".to_string(),
+        ));
+    }
+    if let (Some(per), Some(total)) = (s.archive_buffer_max_bytes, s.archive_total_buffer_bytes) {
+        if per > total {
+            bad.push((
+                "archive_buffer_max_bytes",
+                format!(
+                    "{per} exceeds archive_total_buffer_bytes ({total}); a per-archive bound \
+                         larger than the whole descent's budget has no effect"
+                ),
+            ));
+        }
+    }
+    bad
+}
+
+/// Clear every field `check_ranges` rejected, so it falls back to the compiled-in default.
+fn drop_out_of_range(s: &mut Settings, where_: &Path) {
+    for (field, reason) in check_ranges(s) {
+        tracing::warn!("{}: {field} {reason}; using the default", where_.display());
+        match field {
+            "max_archive_depth" => s.max_archive_depth = None,
+            "archive_ratio_cap" => s.archive_ratio_cap = None,
+            "archive_buffer_max_bytes" => s.archive_buffer_max_bytes = None,
+            "archive_total_buffer_bytes" => s.archive_total_buffer_bytes = None,
+            "archive_entry_max_bytes" => s.archive_entry_max_bytes = None,
+            _ => {}
         }
     }
 }
@@ -269,6 +349,133 @@ mod tests {
         // And an unset field must NOT come back as "explicitly unlimited".
         save_settings(&p, &Settings::default()).unwrap();
         assert_eq!(load_settings(&p).archive_entry_max_bytes, None);
+    }
+
+    #[test]
+    fn a_zero_entry_ceiling_in_the_file_is_refused_and_falls_back() {
+        // Confirmed live during the #41/#42 review: a 0-byte ceiling marks present files `missing`.
+        // A preferences file must not be able to do that.
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("settings.json");
+        std::fs::write(
+            &p,
+            br#"{"archive_entry_max_bytes": 0, "archive_ratio_cap": 5000}"#,
+        )
+        .unwrap();
+        let s = load_settings(&p);
+        assert_eq!(
+            s.archive_entry_max_bytes, None,
+            "the bad field falls back to the default"
+        );
+        assert_eq!(
+            s.archive_ratio_cap,
+            Some(5000),
+            "a VALID field beside it must survive"
+        );
+    }
+
+    #[test]
+    fn a_zero_buffer_in_the_file_is_refused_and_falls_back() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("settings.json");
+        std::fs::write(
+            &p,
+            br#"{"archive_buffer_max_bytes": 0, "max_archive_depth": 3}"#,
+        )
+        .unwrap();
+        let s = load_settings(&p);
+        assert_eq!(s.archive_buffer_max_bytes, None);
+        assert_eq!(s.max_archive_depth, Some(3));
+    }
+
+    #[test]
+    fn a_zero_max_depth_in_the_file_is_refused_and_falls_back() {
+        // M3 (final review, F-2): `check_ranges`/`drop_out_of_range` match "max_archive_depth" as a
+        // hand-written string literal in two places; a typo in either leaves this field silently
+        // unvalidated with the full suite still green. This test exists so that class of typo fails.
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("settings.json");
+        std::fs::write(
+            &p,
+            br#"{"max_archive_depth": 0, "archive_ratio_cap": 5000}"#,
+        )
+        .unwrap();
+        let s = load_settings(&p);
+        assert_eq!(
+            s.max_archive_depth, None,
+            "the bad field falls back to the default"
+        );
+        assert_eq!(
+            s.archive_ratio_cap,
+            Some(5000),
+            "a VALID field beside it must survive"
+        );
+    }
+
+    #[test]
+    fn a_zero_ratio_cap_in_the_file_is_refused_and_falls_back() {
+        // M3 (final review, F-2): same exposure as above for "archive_ratio_cap". A `0` ratio cap
+        // that slipped through would suppress archive descent wholesale.
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("settings.json");
+        std::fs::write(&p, br#"{"archive_ratio_cap": 0, "max_archive_depth": 3}"#).unwrap();
+        let s = load_settings(&p);
+        assert_eq!(
+            s.archive_ratio_cap, None,
+            "the bad field falls back to the default"
+        );
+        assert_eq!(
+            s.max_archive_depth,
+            Some(3),
+            "a VALID field beside it must survive"
+        );
+    }
+
+    #[test]
+    fn a_zero_total_buffer_in_the_file_is_refused_and_falls_back() {
+        // M3 (final review, F-2): same exposure as above for "archive_total_buffer_bytes".
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("settings.json");
+        std::fs::write(
+            &p,
+            br#"{"archive_total_buffer_bytes": 0, "max_archive_depth": 3}"#,
+        )
+        .unwrap();
+        let s = load_settings(&p);
+        assert_eq!(
+            s.archive_total_buffer_bytes, None,
+            "the bad field falls back to the default"
+        );
+        assert_eq!(
+            s.max_archive_depth,
+            Some(3),
+            "a VALID field beside it must survive"
+        );
+    }
+
+    #[test]
+    fn an_explicit_null_ceiling_is_still_unlimited_not_out_of_range() {
+        // `null` means "the user chose unlimited" and must survive the range check untouched.
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("settings.json");
+        std::fs::write(&p, br#"{"archive_entry_max_bytes": null}"#).unwrap();
+        assert_eq!(load_settings(&p).archive_entry_max_bytes, Some(None));
+    }
+
+    #[test]
+    fn a_buffer_larger_than_the_total_budget_is_refused_at_load() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("settings.json");
+        std::fs::write(
+            &p,
+            br#"{"archive_buffer_max_bytes": 4000, "archive_total_buffer_bytes": 1000}"#,
+        )
+        .unwrap();
+        let s = load_settings(&p);
+        // The pair is inconsistent, so the per-archive bound is the one dropped: the total budget
+        // is the harder ceiling and keeping it is the safer of the two.
+        assert_eq!(s.archive_buffer_max_bytes, None);
+        assert_eq!(s.archive_total_buffer_bytes, Some(1000));
     }
 
     #[test]
