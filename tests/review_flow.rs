@@ -29,6 +29,17 @@ fn start(state_db: std::path::PathBuf, drive: std::path::PathBuf) -> std::net::S
     rx.recv().unwrap()
 }
 
+/// Limits for tests: the compiled-in defaults, with NO ambient environment read.
+fn test_limits() -> cleanupstorages::archive::ArchiveLimits {
+    cleanupstorages::archive::ArchiveLimits {
+        max_depth: 8,
+        buffer_max_bytes: 2 * 1024 * 1024 * 1024,
+        total_buffer_bytes: 2 * 1024 * 1024 * 1024,
+        entry_max_bytes: Some(64 * 1024 * 1024 * 1024),
+        ratio_cap: 10_000,
+    }
+}
+
 fn req(addr: std::net::SocketAddr, raw: &str) -> String {
     let mut s = TcpStream::connect(addr).unwrap();
     s.write_all(raw.as_bytes()).unwrap();
@@ -61,7 +72,8 @@ fn review_duplicates_then_quarantine_over_http() {
             label: "D".into(),
             identified_by: "marker".into(),
         };
-        cleanupstorages::scanner::scan_volume(&cat, &drive, &ident, false, 100).unwrap();
+        cleanupstorages::scanner::scan_volume(&cat, &drive, &ident, false, 100, &test_limits())
+            .unwrap();
     }
     std::mem::forget(tmp);
 

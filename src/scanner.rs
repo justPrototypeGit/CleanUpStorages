@@ -5,7 +5,6 @@ use crate::archive::{self, ArchiveLimits};
 use crate::catalog::models::{NewFile, Volume};
 use crate::catalog::Catalog;
 use crate::category::Category;
-use crate::config::Config;
 use crate::hashing;
 use crate::volume::VolumeIdentity;
 
@@ -152,9 +151,9 @@ pub fn scan_volume_with_progress(
     progress: Option<&dyn Progress>,
     metrics: &crate::scan_metrics::ScanMetrics,
     stop: &crate::scan_control::StopFlag,
+    limits: &ArchiveLimits,
 ) -> anyhow::Result<ScanSummary> {
     let scan_started_at = now;
-    let limits = ArchiveLimits::from_config(&Config::default_paths()?);
     let mut summary = ScanSummary::default();
     let mut in_batch = 0usize;
     // Directories this pass could not enumerate. Their contents were never visited, so they must be
@@ -413,7 +412,7 @@ pub fn scan_volume_with_progress(
                 &rel,
                 mtime,
                 identity,
-                &limits,
+                limits,
                 now,
                 &mut summary,
                 &mut in_batch,
@@ -454,6 +453,7 @@ pub fn scan_volume(
     identity: &VolumeIdentity,
     force: bool,
     now: i64,
+    limits: &ArchiveLimits,
 ) -> anyhow::Result<ScanSummary> {
     let metrics = crate::scan_metrics::ScanMetrics::new();
     scan_volume_with_progress(
@@ -465,6 +465,7 @@ pub fn scan_volume(
         None,
         &metrics,
         &crate::scan_control::StopFlag::new(),
+        limits,
     )
 }
 
@@ -472,6 +473,11 @@ pub fn scan_volume(
 ///
 /// The single shared definition of "how a scan works" — used by both the CLI's `cmd_scan` and
 /// the web worker, so the two callers can never drift apart on volume-identity/upsert semantics.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each parameter is an independent scan input; grouping them into a struct would add \
+        indirection without reducing real complexity"
+)]
 pub fn run_scan(
     cat: &Catalog,
     mount_root: &Path,
@@ -480,6 +486,7 @@ pub fn run_scan(
     now: i64,
     progress: Option<&dyn Progress>,
     stop: &crate::scan_control::StopFlag,
+    limits: &ArchiveLimits,
 ) -> anyhow::Result<Option<(VolumeIdentity, ScanSummary)>> {
     let identity = match crate::volume::resolve(mount_root, fallback)? {
         Some(id) => id,
@@ -515,7 +522,7 @@ pub fn run_scan(
     // measured before it died.
     let metrics = crate::scan_metrics::ScanMetrics::new();
     let result = scan_volume_with_progress(
-        cat, mount_root, &identity, force, now, progress, &metrics, stop,
+        cat, mount_root, &identity, force, now, progress, &metrics, stop, limits,
     );
 
     if result.is_err() {
@@ -651,6 +658,17 @@ mod tests {
         }
     }
 
+    /// Limits for tests: the compiled-in defaults, with NO ambient environment read.
+    fn test_limits() -> crate::archive::ArchiveLimits {
+        crate::archive::ArchiveLimits {
+            max_depth: 8,
+            buffer_max_bytes: 2 * 1024 * 1024 * 1024,
+            total_buffer_bytes: 2 * 1024 * 1024 * 1024,
+            entry_max_bytes: Some(64 * 1024 * 1024 * 1024),
+            ratio_cap: 10_000,
+        }
+    }
+
     fn setup() -> (tempfile::TempDir, Catalog) {
         let tmp = tempfile::tempdir().unwrap();
         let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
@@ -718,7 +736,18 @@ mod tests {
 
         let m = crate::scan_metrics::ScanMetrics::new();
         let stop = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
 
         let (phase, kind): (String, String) = cat
             .conn
@@ -747,7 +776,17 @@ mod tests {
 
         let m = crate::scan_metrics::ScanMetrics::new();
         let stop = crate::scan_control::StopFlag::new();
-        let result = scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop);
+        let result = scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &test_limits(),
+        );
 
         // Restore permissions before any assertion can early-return/panic, so the tempdir can
         // still be cleaned up regardless of outcome.
@@ -787,8 +826,18 @@ mod tests {
         // First scan: the file is readable, so it gets catalogued normally.
         let m1 = crate::scan_metrics::ScanMetrics::new();
         let stop1 = crate::scan_control::StopFlag::new();
-        let s1 = scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m1, &stop1)
-            .unwrap();
+        let s1 = scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m1,
+            &stop1,
+            &test_limits(),
+        )
+        .unwrap();
         assert_eq!(s1.errors, 0);
 
         // Second scan: the file is now locked, so the re-read fails. `force=true` so the unchanged
@@ -800,8 +849,18 @@ mod tests {
             .unwrap();
         let m2 = crate::scan_metrics::ScanMetrics::new();
         let stop2 = crate::scan_control::StopFlag::new();
-        let s2 =
-            scan_volume_with_progress(&cat, &root, &ident(), true, 200, None, &m2, &stop2).unwrap();
+        let s2 = scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            true,
+            200,
+            None,
+            &m2,
+            &stop2,
+            &test_limits(),
+        )
+        .unwrap();
         assert_eq!(s2.errors, 1, "the scan itself must count the failure");
 
         let c = cat.volume_completeness("vol-1").unwrap();
@@ -832,8 +891,18 @@ mod tests {
         // First scan: the file is readable, so it gets catalogued normally.
         let m1 = crate::scan_metrics::ScanMetrics::new();
         let stop1 = crate::scan_control::StopFlag::new();
-        let s1 = scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m1, &stop1)
-            .unwrap();
+        let s1 = scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m1,
+            &stop1,
+            &test_limits(),
+        )
+        .unwrap();
         assert_eq!(s1.errors, 0);
 
         // Second scan: the file is now unreadable, so the re-read fails. `force=true` so the
@@ -842,7 +911,17 @@ mod tests {
         std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o000)).unwrap();
         let m2 = crate::scan_metrics::ScanMetrics::new();
         let stop2 = crate::scan_control::StopFlag::new();
-        let result = scan_volume_with_progress(&cat, &root, &ident(), true, 200, None, &m2, &stop2);
+        let result = scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            true,
+            200,
+            None,
+            &m2,
+            &stop2,
+            &test_limits(),
+        );
 
         // Restore permissions before any assertion can early-return/panic, so the tempdir can
         // still be cleaned up regardless of outcome.
@@ -872,12 +951,12 @@ mod tests {
         fs::write(root.join("a.txt"), b"alpha").unwrap();
         fs::write(root.join("sub/b.txt"), b"beta").unwrap();
 
-        let s1 = scan_volume(&cat, &root, &ident(), false, 100).unwrap();
+        let s1 = scan_volume(&cat, &root, &ident(), false, 100, &test_limits()).unwrap();
         assert_eq!(s1.hashed, 2);
         assert_eq!(s1.skipped, 0);
 
         // second scan: nothing changed -> both skipped (no re-hash)
-        let s2 = scan_volume(&cat, &root, &ident(), false, 200).unwrap();
+        let s2 = scan_volume(&cat, &root, &ident(), false, 200, &test_limits()).unwrap();
         assert_eq!(s2.hashed, 0);
         assert_eq!(s2.skipped, 2);
 
@@ -892,10 +971,10 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("keep.txt"), b"x").unwrap();
         fs::write(root.join("gone.txt"), b"y").unwrap();
-        scan_volume(&cat, &root, &ident(), false, 100).unwrap();
+        scan_volume(&cat, &root, &ident(), false, 100, &test_limits()).unwrap();
 
         fs::remove_file(root.join("gone.txt")).unwrap();
-        let s = scan_volume(&cat, &root, &ident(), false, 200).unwrap();
+        let s = scan_volume(&cat, &root, &ident(), false, 200, &test_limits()).unwrap();
         assert_eq!(s.marked_missing, 1);
         assert_eq!(
             cat.search("gone", None, None, Some("missing"))
@@ -935,7 +1014,7 @@ mod tests {
             &[("trip/beach.jpg", b"sand"), ("note.txt", b"hi")],
         );
 
-        let s = scan_volume(&cat, &root, &ident(), false, 100).unwrap();
+        let s = scan_volume(&cat, &root, &ident(), false, 100, &test_limits()).unwrap();
         // the zip file itself is a loose hashed file
         assert_eq!(s.hashed, 1);
         // its two entries are catalogued
@@ -953,10 +1032,10 @@ mod tests {
         let root = tmp.path().join("drive");
         fs::create_dir_all(&root).unwrap();
         write_zip_file(&root.join("a.zip"), &[("x.txt", b"one")]);
-        scan_volume(&cat, &root, &ident(), false, 100).unwrap();
+        scan_volume(&cat, &root, &ident(), false, 100, &test_limits()).unwrap();
 
         // rescan unchanged: archive is skipped, but its entry must NOT be swept to missing
-        let s = scan_volume(&cat, &root, &ident(), false, 200).unwrap();
+        let s = scan_volume(&cat, &root, &ident(), false, 200, &test_limits()).unwrap();
         assert_eq!(s.marked_missing, 0);
         assert_eq!(
             cat.search("x", None, None, Some("active")).unwrap().len(),
@@ -1014,6 +1093,7 @@ mod tests {
             100,
             None,
             &crate::scan_control::StopFlag::new(),
+            &test_limits(),
         )
         .unwrap();
         let (identity, summary) = out.expect("not skipped");
@@ -1067,6 +1147,7 @@ mod tests {
             100,
             None,
             &crate::scan_control::StopFlag::new(),
+            &test_limits(),
         )
         .unwrap();
         let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
@@ -1092,6 +1173,7 @@ mod tests {
             1234,
             None,
             &crate::scan_control::StopFlag::new(),
+            &test_limits(),
         )
         .unwrap();
         assert!(n.is_some());
@@ -1121,6 +1203,7 @@ mod tests {
             Some(&p),
             &m,
             &crate::scan_control::StopFlag::new(),
+            &test_limits(),
         )
         .unwrap();
         assert_eq!(p.hashed.load(Relaxed), s.hashed);
@@ -1156,7 +1239,7 @@ mod tests {
     #[test]
     fn scan_records_phase_timings_and_the_size_histogram() {
         let (_t, cat, root) = fixture_with_files(&[("a.txt", 10), ("big.bin", 5000)]);
-        let s = scan_volume(&cat, &root, &ident(), false, 100).unwrap();
+        let s = scan_volume(&cat, &root, &ident(), false, 100, &test_limits()).unwrap();
         let m = &s.metrics;
 
         assert_eq!(m.files_seen, 2);
@@ -1177,8 +1260,8 @@ mod tests {
     #[test]
     fn rescan_attributes_bytes_to_skipped_not_hashed() {
         let (_t, cat, root) = fixture_with_files(&[("a.txt", 10), ("b.txt", 20)]);
-        scan_volume(&cat, &root, &ident(), false, 100).unwrap();
-        let s = scan_volume(&cat, &root, &ident(), false, 200).unwrap();
+        scan_volume(&cat, &root, &ident(), false, 100, &test_limits()).unwrap();
+        let s = scan_volume(&cat, &root, &ident(), false, 200, &test_limits()).unwrap();
 
         assert_eq!(s.skipped, 2, "second pass takes the incremental-skip path");
         assert_eq!(s.metrics.bytes_hashed, 0);
@@ -1198,6 +1281,7 @@ mod tests {
             100,
             None,
             &crate::scan_control::StopFlag::new(),
+            &test_limits(),
         )
         .unwrap();
         assert!(out.is_some());
@@ -1232,6 +1316,7 @@ mod tests {
             100,
             None,
             &crate::scan_control::StopFlag::new(),
+            &test_limits(),
         );
         assert!(out.is_err(), "the induced trigger must fail the scan");
         drop(cat);
@@ -1273,6 +1358,7 @@ mod tests {
             100,
             None,
             &crate::scan_control::StopFlag::new(),
+            &test_limits(),
         );
         assert!(
             out.is_ok(),
@@ -1331,7 +1417,18 @@ mod tests {
         // First pass catalogues both files.
         let m = crate::scan_metrics::ScanMetrics::new();
         let stop = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
         assert_eq!(cat.search("", None, None, Some("active")).unwrap().len(), 2);
 
         // Second pass is stopped before it starts: nothing is re-seen, so an unguarded sweep would
@@ -1339,8 +1436,18 @@ mod tests {
         let stop2 = crate::scan_control::StopFlag::new();
         stop2.request();
         let m2 = crate::scan_metrics::ScanMetrics::new();
-        let s = scan_volume_with_progress(&cat, &root, &ident(), false, 300, None, &m2, &stop2)
-            .unwrap();
+        let s = scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            300,
+            None,
+            &m2,
+            &stop2,
+            &test_limits(),
+        )
+        .unwrap();
 
         assert!(s.stopped, "the summary must report that it was stopped");
         assert_eq!(s.marked_missing, 0, "a stopped scan must not sweep");
@@ -1361,12 +1468,33 @@ mod tests {
 
         let m = crate::scan_metrics::ScanMetrics::new();
         let stop = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
 
         std::fs::remove_file(root.join("gone.txt")).unwrap();
         let m2 = crate::scan_metrics::ScanMetrics::new();
-        let s =
-            scan_volume_with_progress(&cat, &root, &ident(), false, 300, None, &m2, &stop).unwrap();
+        let s = scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            300,
+            None,
+            &m2,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
         assert!(!s.stopped);
         assert_eq!(s.marked_missing, 1);
     }
@@ -1403,7 +1531,18 @@ mod tests {
 
         let m = crate::scan_metrics::ScanMetrics::new();
         let stop = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
 
         let remaining: Vec<String> = cat
             .conn
@@ -1441,8 +1580,18 @@ mod tests {
         let m = crate::scan_metrics::ScanMetrics::new();
         let stop = crate::scan_control::StopFlag::new();
         stop.request(); // stopped before it starts
-        let s =
-            scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+        let s = scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
         assert!(s.stopped);
 
         let n: i64 = cat
@@ -1476,7 +1625,18 @@ mod tests {
 
         let m = crate::scan_metrics::ScanMetrics::new();
         let stop = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
 
         let n: i64 = cat
             .conn
@@ -1509,8 +1669,18 @@ mod tests {
         let m = crate::scan_metrics::ScanMetrics::new();
         let stop = crate::scan_control::StopFlag::new();
         stop.request(); // stopped before it starts
-        let s =
-            scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+        let s = scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
         assert!(s.stopped);
 
         let n: i64 = cat
@@ -1553,7 +1723,18 @@ mod tests {
 
         let m = crate::scan_metrics::ScanMetrics::new();
         let stop = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
 
         let entries_active = || -> i64 {
             cat.conn
@@ -1569,8 +1750,18 @@ mod tests {
         // Second scan, nothing changed on disk: the skip path runs, then the sweep.
         let m2 = crate::scan_metrics::ScanMetrics::new();
         let stop2 = crate::scan_control::StopFlag::new();
-        let s = scan_volume_with_progress(&cat, &root, &ident(), false, 300, None, &m2, &stop2)
-            .unwrap();
+        let s = scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            300,
+            None,
+            &m2,
+            &stop2,
+            &test_limits(),
+        )
+        .unwrap();
 
         assert_eq!(
             s.marked_missing, 0,
@@ -1611,7 +1802,18 @@ mod tests {
 
         let m = crate::scan_metrics::ScanMetrics::new();
         let stop = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
 
         let inner_catalogued: i64 = cat
             .conn
@@ -1646,8 +1848,17 @@ mod tests {
         FORCE_DETECTION_OPEN_ERROR.with(|f| f.set(true));
         let m = crate::scan_metrics::ScanMetrics::new();
         let stop = crate::scan_control::StopFlag::new();
-        let scan_result =
-            scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &stop);
+        let scan_result = scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &test_limits(),
+        );
         FORCE_DETECTION_OPEN_ERROR.with(|f| f.set(false));
         let summary = scan_result.unwrap();
 
@@ -1702,7 +1913,18 @@ mod tests {
         .unwrap();
         let m1 = crate::scan_metrics::ScanMetrics::new();
         let stop1 = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m1, &stop1).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m1,
+            &stop1,
+            &test_limits(),
+        )
+        .unwrap();
         assert_eq!(status_of(&cat, "a.txt"), "active");
         assert_eq!(status_of(&cat, "gone.txt"), "active");
 
@@ -1711,7 +1933,18 @@ mod tests {
         std::fs::write(&bundle_path, make_zip(&[("a.txt", b"alpha")])).unwrap();
         let m2 = crate::scan_metrics::ScanMetrics::new();
         let stop2 = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 200, None, &m2, &stop2).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            200,
+            None,
+            &m2,
+            &stop2,
+            &test_limits(),
+        )
+        .unwrap();
         assert_eq!(status_of(&cat, "a.txt"), "active");
         assert_eq!(
             status_of(&cat, "gone.txt"),
@@ -1723,7 +1956,18 @@ mod tests {
         std::fs::rename(&bundle_path, &parked_path).unwrap();
         let m3 = crate::scan_metrics::ScanMetrics::new();
         let stop3 = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 300, None, &m3, &stop3).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            300,
+            None,
+            &m3,
+            &stop3,
+            &test_limits(),
+        )
+        .unwrap();
         assert_eq!(status_of(&cat, "a.txt"), "missing");
         assert_eq!(status_of(&cat, "gone.txt"), "missing");
 
@@ -1732,7 +1976,18 @@ mod tests {
         std::fs::rename(&parked_path, &bundle_path).unwrap();
         let m4 = crate::scan_metrics::ScanMetrics::new();
         let stop4 = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 400, None, &m4, &stop4).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            400,
+            None,
+            &m4,
+            &stop4,
+            &test_limits(),
+        )
+        .unwrap();
 
         assert_eq!(
             status_of(&cat, "a.txt"),
@@ -1768,18 +2023,51 @@ mod tests {
         .unwrap();
         let m = crate::scan_metrics::ScanMetrics::new();
         let s = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 100, None, &m, &s).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &s,
+            &test_limits(),
+        )
+        .unwrap();
 
         // t=200/300: archive vanishes (round-trip #1) and returns unchanged -- both entries revive
         // together (this is the ordinary, already-tested case).
         std::fs::rename(&bundle_path, &parked_path).unwrap();
         let m = crate::scan_metrics::ScanMetrics::new();
         let s = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 200, None, &m, &s).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            200,
+            None,
+            &m,
+            &s,
+            &test_limits(),
+        )
+        .unwrap();
         std::fs::rename(&parked_path, &bundle_path).unwrap();
         let m = crate::scan_metrics::ScanMetrics::new();
         let s = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 300, None, &m, &s).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            300,
+            None,
+            &m,
+            &s,
+            &test_limits(),
+        )
+        .unwrap();
         assert_eq!(status_of(&cat, "a.txt"), "active");
         assert_eq!(
             status_of(&cat, "gone.txt"),
@@ -1791,7 +2079,18 @@ mod tests {
         std::fs::write(&bundle_path, make_zip(&[("a.txt", b"alpha")])).unwrap();
         let m = crate::scan_metrics::ScanMetrics::new();
         let s = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 400, None, &m, &s).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            400,
+            None,
+            &m,
+            &s,
+            &test_limits(),
+        )
+        .unwrap();
         assert_eq!(
             status_of(&cat, "gone.txt"),
             "missing",
@@ -1802,11 +2101,33 @@ mod tests {
         std::fs::rename(&bundle_path, &parked_path).unwrap();
         let m = crate::scan_metrics::ScanMetrics::new();
         let s = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 500, None, &m, &s).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            500,
+            None,
+            &m,
+            &s,
+            &test_limits(),
+        )
+        .unwrap();
         std::fs::rename(&parked_path, &bundle_path).unwrap();
         let m = crate::scan_metrics::ScanMetrics::new();
         let s = crate::scan_control::StopFlag::new();
-        scan_volume_with_progress(&cat, &root, &ident(), false, 600, None, &m, &s).unwrap();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            600,
+            None,
+            &m,
+            &s,
+            &test_limits(),
+        )
+        .unwrap();
 
         assert_eq!(
             status_of(&cat, "a.txt"),
