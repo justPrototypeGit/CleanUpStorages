@@ -261,9 +261,15 @@ impl ScanQueue {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
                 .as_secs() as i64;
-            // Loaded here (and reused for the post-scan snapshot below) rather than inside the
-            // scanner, so a config-load failure surfaces at the same point it always did: before
-            // any scanning work happens.
+            // One config load, used for both the scan and the snapshot. This DOES change one
+            // thing: a Config::default_paths() failure now aborts before run_scan, so it no
+            // longer leaves a scan_runs row with status="failed" the way it did when the failure
+            // happened inside the scanner. That is deliberate -- if the configuration cannot
+            // load, no scan ever started, and a row claiming one ran and failed records something
+            // that did not happen. The failure still reaches the user as a job error in the
+            // queue's `recent` list (see `error_result` below).
+            // It also removes a real race: the two old calls could disagree if the config changed
+            // between them.
             let cfg = crate::config::Config::default_paths()?;
             let limits = crate::archive::ArchiveLimits::from_config(&cfg);
             let progress: &dyn crate::scanner::Progress = counters_for_job.as_ref();
