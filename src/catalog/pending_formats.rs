@@ -2,6 +2,14 @@
 //!
 //! The scanner will not guess: a five-day unattended run cannot ask, so an unfamiliar zip-format
 //! extension is left whole and recorded here for the user to approve or dismiss.
+//!
+//! Keyed per FILE (`volume_id`, `relative_path`), not per scan: a rescan of an unchanged file never
+//! reaches this code at all (the skip path must never open a file), so there is nothing to
+//! re-derive on every pass. A row is written once when a file is first hashed and found unfamiliar,
+//! and simply persists -- upserted in place if the same file is hashed again (a real rescan with
+//! `force`, or the file having actually changed). That also means there is no scan-start clear:
+//! with per-file keying there is nothing to reset, and a stopped scan just contributes whatever it
+//! reached, with the rest arriving on a later pass.
 
 use crate::catalog::Catalog;
 use rusqlite::params;
@@ -15,21 +23,31 @@ pub struct PendingFormat {
 }
 
 impl Catalog {
+    /// Record (or refresh) one unfamiliar file. Upserts on `(volume_id, relative_path)`, so
+    /// re-hashing the same file (an incremental rescan that found it changed, or a forced rescan)
+    /// replaces its row instead of adding another -- double-counting is impossible by construction.
     pub fn record_pending_format(
         &self,
         volume_id: &str,
+        relative_path: &str,
         extension: &str,
         size_bytes: i64,
         now: i64,
     ) -> anyhow::Result<()> {
         self.conn.execute(
-            "INSERT INTO pending_archive_formats(extension, volume_id, count, total_bytes, first_seen_at)
-             VALUES (?1,?2,1,?3,?4)
-             ON CONFLICT(extension, volume_id) DO UPDATE SET
-                 count = count + 1,
-                 total_bytes = total_bytes + excluded.total_bytes,
+            "INSERT INTO pending_archive_formats(volume_id, relative_path, extension, size_bytes, first_seen_at)
+             VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT(volume_id, relative_path) DO UPDATE SET
+                 extension = excluded.extension,
+                 size_bytes = excluded.size_bytes,
                  first_seen_at = MIN(first_seen_at, excluded.first_seen_at)",
-            params![extension.to_ascii_lowercase(), volume_id, size_bytes, now],
+            params![
+                volume_id,
+                relative_path,
+                extension.to_ascii_lowercase(),
+                size_bytes,
+                now
+            ],
         )?;
         Ok(())
     }
@@ -37,9 +55,9 @@ impl Catalog {
     /// Aggregated across volumes -- the decision is about a file format, not one drive.
     pub fn pending_formats(&self) -> anyhow::Result<Vec<PendingFormat>> {
         let mut stmt = self.conn.prepare(
-            "SELECT extension, SUM(count), SUM(total_bytes), MIN(first_seen_at)
+            "SELECT extension, COUNT(*), SUM(size_bytes), MIN(first_seen_at)
                FROM pending_archive_formats GROUP BY extension
-              ORDER BY SUM(total_bytes) DESC, extension",
+              ORDER BY SUM(size_bytes) DESC, extension",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(PendingFormat {
@@ -58,14 +76,6 @@ impl Catalog {
             params![extension.to_ascii_lowercase()],
         )?)
     }
-
-    /// Drop one volume's rows, so a rescan re-counts instead of accumulating.
-    pub fn clear_pending_formats_for_volume(&self, volume_id: &str) -> anyhow::Result<usize> {
-        Ok(self.conn.execute(
-            "DELETE FROM pending_archive_formats WHERE volume_id=?1",
-            params![volume_id],
-        )?)
-    }
 }
 
 #[cfg(test)]
@@ -76,10 +86,14 @@ mod tests {
     fn recording_the_same_extension_accumulates_per_volume_and_aggregates_across() {
         let t = tempfile::tempdir().unwrap();
         let cat = Catalog::open(&t.path().join("c.db")).unwrap();
-        cat.record_pending_format("v1", "bak", 100, 10).unwrap();
-        cat.record_pending_format("v1", "bak", 200, 20).unwrap();
-        cat.record_pending_format("v2", "bak", 400, 30).unwrap();
-        cat.record_pending_format("v1", "kra", 50, 40).unwrap();
+        cat.record_pending_format("v1", "a.bak", "bak", 100, 10)
+            .unwrap();
+        cat.record_pending_format("v1", "b.bak", "bak", 200, 20)
+            .unwrap();
+        cat.record_pending_format("v2", "c.bak", "bak", 400, 30)
+            .unwrap();
+        cat.record_pending_format("v1", "d.kra", "kra", 50, 40)
+            .unwrap();
 
         let rows = cat.pending_formats().unwrap();
         let bak = rows.iter().find(|r| r.extension == "bak").unwrap();
@@ -90,11 +104,27 @@ mod tests {
 
         assert_eq!(
             cat.clear_pending_format("bak").unwrap(),
-            2,
-            "both volumes' rows go"
+            3,
+            "all three bak rows go, across both volumes"
         );
         let rows = cat.pending_formats().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].extension, "kra");
+    }
+
+    #[test]
+    fn re_recording_the_same_file_replaces_its_row_instead_of_accumulating() {
+        // The bug this keying exists to make impossible: hashing the same file twice (e.g. a
+        // forced rescan) must not double-count it.
+        let t = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(&t.path().join("c.db")).unwrap();
+        cat.record_pending_format("v1", "a.bak", "bak", 100, 10)
+            .unwrap();
+        cat.record_pending_format("v1", "a.bak", "bak", 100, 20)
+            .unwrap();
+        let rows = cat.pending_formats().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].count, 1, "same file, one row");
+        assert_eq!(rows[0].first_seen_at, 10, "earliest sighting still wins");
     }
 }
