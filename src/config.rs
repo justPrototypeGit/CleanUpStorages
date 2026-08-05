@@ -20,7 +20,7 @@ pub struct Config {
 
 /// Zip-format files that are documents or packages, not archives worth exploding into parts.
 /// Extending this needs no release -- it is editable in settings.json and on the Scan page.
-const DEFAULT_DENY: &[&str] = &[
+pub(crate) const DEFAULT_DENY: &[&str] = &[
     "docx", "xlsx", "pptx", "docm", "xlsm", "pptm", "jar", "apk", "war", "ear", "epub", "odt",
     "ods", "odp", "nupkg", "vsix", "ipa",
 ];

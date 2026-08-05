@@ -608,6 +608,10 @@ impl Catalog {
             "DELETE FROM scan_errors WHERE volume_id=?1",
             params![volume_id],
         )?;
+        self.conn.execute(
+            "DELETE FROM pending_archive_formats WHERE volume_id=?1",
+            params![volume_id],
+        )?;
         self.conn
             .execute("DELETE FROM volumes WHERE volume_id=?1", params![volume_id])?;
         self.log_action(

@@ -366,6 +366,11 @@ mod tests {
             total_buffer_bytes: 2 * 1024 * 1024 * 1024,
             entry_max_bytes: Some(64 * 1024 * 1024 * 1024),
             ratio_cap: 10_000,
+            deny_extensions: crate::config::DEFAULT_DENY
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            allow_extensions: Vec::new(),
         }
     }
 
