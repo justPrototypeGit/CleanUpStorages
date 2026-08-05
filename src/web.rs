@@ -76,6 +76,8 @@ pub fn build_router_with(state: AppState) -> Router {
             "/api/settings",
             get(api_settings_get).post(api_settings_post),
         )
+        .route("/api/pending-formats", get(api_pending_formats))
+        .route("/api/pending-formats/resolve", post(api_resolve_format))
         .route("/review", get(review))
         .route("/scan", get(scan_page_h))
         .route("/drives", get(drives_page_h))
@@ -929,6 +931,8 @@ struct SettingsDto {
     archive_total_buffer_bytes: u64,
     archive_entry_max_bytes: Option<u64>,
     archive_ratio_cap: u64,
+    archive_deny_extensions: Vec<String>,
+    archive_allow_extensions: Vec<String>,
 }
 
 /// The effective configuration, re-read from disk. Shared by both handlers so a write responds
@@ -941,11 +945,90 @@ fn effective_settings() -> Result<SettingsDto, (StatusCode, String)> {
         archive_total_buffer_bytes: cfg.archive_total_buffer_bytes,
         archive_entry_max_bytes: cfg.archive_entry_max_bytes,
         archive_ratio_cap: cfg.archive_ratio_cap,
+        archive_deny_extensions: cfg.archive_deny_extensions,
+        archive_allow_extensions: cfg.archive_allow_extensions,
     })
 }
 
 async fn api_settings_get() -> Result<Json<SettingsDto>, (StatusCode, String)> {
     Ok(Json(effective_settings()?))
+}
+
+/// Unfamiliar zip-format extensions found during scans, aggregated for the user to approve
+/// ("descend" -> treat as an archive) or dismiss ("document" -> treat as a document/package).
+///
+/// Opens the catalog READ-ONLY: `Catalog::open_readonly` runs no schema DDL, so a catalog
+/// created before this branch has no `pending_archive_formats` table yet. Rather than 500 on
+/// "no such table" (which would break the Scan page on every pre-existing install until the
+/// user's next write-opening operation creates the table), this degrades to an empty list --
+/// there is nothing pending to report until a scan using the new code records a row, at which
+/// point the table already exists because `Catalog::open` (used by the scanner) always runs
+/// `schema::apply`.
+async fn api_pending_formats(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<crate::catalog::pending_formats::PendingFormat>>, (StatusCode, String)> {
+    let cat = match Catalog::open_readonly(&state.catalog_path) {
+        Ok(c) => c,
+        Err(_) => return Ok(Json(Vec::new())),
+    };
+    match cat.pending_formats() {
+        Ok(rows) => Ok(Json(rows)),
+        Err(e) if e.to_string().contains("no such table") => Ok(Json(Vec::new())),
+        Err(e) => Err(err500(e)),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ResolveFormat {
+    extension: String,
+    /// "descend" -> allow-list; "document" -> deny-list.
+    action: String,
+}
+
+/// Merges the resolved extension into the stored settings (never overwrites the other fields),
+/// then clears the pending rows for it. Idempotent: resolving the same extension twice adds it
+/// only once, and seeds from the EFFECTIVE list (compiled-in default when nothing is stored) so
+/// one click cannot silently discard the rest of the deny-list.
+async fn api_resolve_format(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ResolveFormat>,
+) -> Result<Json<Vec<crate::catalog::pending_formats::PendingFormat>>, (StatusCode, String)> {
+    check_csrf(&headers, &state)?;
+    let ext = body.extension.to_ascii_lowercase();
+    if ext.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "extension is required".into()));
+    }
+    let cfg = crate::config::Config::default_paths().map_err(err500)?;
+    let path = cfg.settings_path();
+    // Merge, never overwrite: the other settings must survive.
+    let mut s = crate::config::load_settings(&path);
+    let list = match body.action.as_str() {
+        "descend" => &mut s.archive_allow_extensions,
+        "document" => &mut s.archive_deny_extensions,
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("unknown action {other:?}; expected \"descend\" or \"document\""),
+            ))
+        }
+    };
+    // The trap: when the stored settings have no explicit list, the EFFECTIVE list is the
+    // compiled-in default (`cfg`, already resolved). Seed from that -- not an empty vec -- before
+    // appending, or resolving one format silently discards the whole default deny-list.
+    let mut v = list.take().unwrap_or_else(|| match body.action.as_str() {
+        "document" => cfg.archive_deny_extensions.clone(),
+        _ => cfg.archive_allow_extensions.clone(),
+    });
+    if !v.iter().any(|e| e.eq_ignore_ascii_case(&ext)) {
+        v.push(ext.clone());
+    }
+    *list = Some(v);
+    crate::config::save_settings(&path, &s).map_err(err500)?;
+
+    let cat = Catalog::open(&state.catalog_path).map_err(err500)?;
+    cat.clear_pending_format(&ext).map_err(err500)?;
+    Ok(Json(cat.pending_formats().map_err(err500)?))
 }
 
 /// A quarter of RAM: the scan leans on the OS file cache, and `browse` runs the web server in this
@@ -3258,6 +3341,176 @@ mod tests {
         assert!(
             msg.contains("archive_total_buffer_bytes"),
             "the refusal must name the stored limit it was checked against: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_formats_are_listed_and_resolving_updates_the_lists() {
+        let _scope = ScopedDataDir::new();
+        let (_t, db, state) = seed_dupes();
+        {
+            let cat = Catalog::open(&db).unwrap();
+            cat.record_pending_format("vol-1", "a.bak", "bak", 4096, 10)
+                .unwrap();
+        }
+        let v = get_json(&db, "/api/pending-formats").await;
+        assert_eq!(v[0]["extension"], "bak");
+        assert_eq!(v[0]["count"], 1);
+
+        let token = state.csrf_token.clone();
+        let app = build_router_with(state);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/pending-formats/resolve")
+                    .header("content-type", "application/json")
+                    .header("x-cleanup-token", token)
+                    .body(Body::from(r#"{"extension":"bak","action":"descend"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+
+        let v = get_json(&db, "/api/pending-formats").await;
+        assert!(
+            v.as_array().unwrap().is_empty(),
+            "resolved formats stop being reported"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolving_a_format_without_a_csrf_token_is_refused() {
+        let _scope = ScopedDataDir::new();
+        let (_t, _db, state) = seed_dupes();
+        let app = build_router_with(state);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/pending-formats/resolve")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"extension":"bak","action":"descend"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn resolving_a_format_keeps_the_default_deny_list() {
+        // The trap: with no stored list, the EFFECTIVE deny-list is the compiled-in default. If the
+        // handler appends to an empty vec instead of seeding from that default, one click silently
+        // drops .docx/.jar back onto the descend path -- invisible until a later scan explodes
+        // every Office document into its parts.
+        let _scope = ScopedDataDir::new();
+        let (_t, db, state) = seed_dupes();
+        {
+            let cat = Catalog::open(&db).unwrap();
+            cat.record_pending_format("vol-1", "a.kra", "kra", 10, 10)
+                .unwrap();
+        }
+        let token = state.csrf_token.clone();
+        let app = build_router_with(state);
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/pending-formats/resolve")
+                    .header("content-type", "application/json")
+                    .header("x-cleanup-token", token)
+                    .body(Body::from(r#"{"extension":"kra","action":"document"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+
+        let cfg = crate::config::Config::default_paths().unwrap();
+        let stored = crate::config::load_settings(&cfg.settings_path());
+        let deny = stored
+            .archive_deny_extensions
+            .expect("the list was written");
+        assert!(
+            deny.iter().any(|e| e == "kra"),
+            "the resolved format was added"
+        );
+        assert!(
+            deny.iter().any(|e| e == "docx"),
+            "the compiled-in defaults must survive: got {deny:?}"
+        );
+        assert!(deny.iter().any(|e| e == "jar"), "got {deny:?}");
+    }
+
+    #[tokio::test]
+    async fn resolving_a_format_twice_does_not_duplicate_it() {
+        let _scope = ScopedDataDir::new();
+        let (_t, db, state) = seed_dupes();
+        {
+            let cat = Catalog::open(&db).unwrap();
+            cat.record_pending_format("vol-1", "a.bak", "bak", 10, 10)
+                .unwrap();
+        }
+        let token = state.csrf_token.clone();
+        let app = build_router_with(state);
+        for _ in 0..2 {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/pending-formats/resolve")
+                        .header("content-type", "application/json")
+                        .header("x-cleanup-token", token.clone())
+                        .body(Body::from(r#"{"extension":"bak","action":"descend"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), axum::http::StatusCode::OK);
+        }
+
+        let cfg = crate::config::Config::default_paths().unwrap();
+        let stored = crate::config::load_settings(&cfg.settings_path());
+        let allow = stored.archive_allow_extensions.unwrap();
+        assert_eq!(
+            allow.iter().filter(|e| *e == "bak").count(),
+            1,
+            "resolving twice must not duplicate: got {allow:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_formats_endpoint_degrades_gracefully_on_a_pre_migration_catalog() {
+        // Catalogs created before this branch have no pending_archive_formats table.
+        // `Catalog::open_readonly` runs no schema DDL, so the GET handler must not 500 on a
+        // "no such table" error -- it degrades to an empty list.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("old.db");
+        {
+            // A minimal catalog with no pending_archive_formats table at all.
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch("CREATE TABLE dummy(x INTEGER);")
+                .unwrap();
+        }
+        let v = get_json(&db, "/api/pending-formats").await;
+        assert!(
+            v.as_array().unwrap().is_empty(),
+            "a pre-migration catalog should report no pending formats, not 500: {v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_endpoint_exposes_archive_extension_lists() {
+        let _scope = ScopedDataDir::new();
+        let (_t, db, _state) = seed_dupes();
+        let v = get_json(&db, "/api/settings").await;
+        let deny = v["archive_deny_extensions"].as_array().unwrap();
+        assert!(
+            deny.iter().any(|e| e == "docx"),
+            "the effective deny-list must include the compiled-in default: {deny:?}"
         );
     }
 }
