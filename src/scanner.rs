@@ -257,11 +257,18 @@ pub fn scan_volume_with_progress(
         // triggers is db_write (it is the fsync #26 targets), so the guard must be dead before
         // rotate_batch runs — otherwise a rescan books 100% of its fsyncs to skip_check and reads
         // as seek-bound.
+        //
+        // Also captures what the catalogue knew about this path BEFORE this pass touches it, for
+        // the archive-detection fallback further down: `upsert_file` below unconditionally writes
+        // this path's own row, so a query made AFTER it would find a row for every path -- even one
+        // seen for the very first time -- and could never fall through to the extension test.
+        let mut prior_meta: Option<crate::catalog::store::FileMeta> = None;
         let is_unchanged = if force {
             false
         } else {
             let _t = metrics.timer(crate::scan_metrics::Phase::SkipCheck);
-            match cat.get_file_meta(&identity.volume_id, &rel)? {
+            prior_meta = cat.get_file_meta(&identity.volume_id, &rel)?;
+            match prior_meta {
                 Some((old_size, old_mtime, has_archive_entries, revive_floor))
                     if old_size == size && old_mtime == mtime.unwrap_or(0) =>
                 {
@@ -385,9 +392,7 @@ pub fn scan_volume_with_progress(
                     // archive": that would leave `descend_archive` unrun with no error logged, and
                     // the entries inside would be swept to `missing` with no way to self-heal on a
                     // later clean rescan (the archive's own row stays `active`, so the revive floor
-                    // is `None`). Log it so #6's completeness audit surfaces it, and fall back to
-                    // the extension test rather than to `false` so a momentarily-locked `.zip` is
-                    // still treated as an archive.
+                    // is `None`). Log it so #6's completeness audit surfaces it.
                     cat.log_scan_error(
                         Some(&identity.volume_id),
                         &rel,
@@ -400,7 +405,14 @@ pub fn scan_volume_with_progress(
                     if let Some(p) = progress {
                         p.on_error();
                     }
-                    ext_looks_like_zip
+                    // Fall back on what the catalogue already knew BEFORE this scan touched this
+                    // path (`prior_meta`, captured above), not on the filename: it is right for a
+                    // renamed zip and for a .docx alike. Only when there is no prior row at all (a
+                    // new file we could not open) does the extension remain the last resort.
+                    match prior_meta {
+                        Some((_, _, has_archive_entries, _)) => has_archive_entries,
+                        None => ext_looks_like_zip,
+                    }
                 }
             }
         };
@@ -1913,6 +1925,68 @@ mod tests {
             "active",
             "the archive's entry must not be swept to missing just because detection had to \
              fall back on the extension test"
+        );
+    }
+
+    #[test]
+    fn a_detection_failure_on_a_catalogued_archive_keeps_its_entries() {
+        // The archive is named .bak, so the old extension-based fallback said "not an archive",
+        // descend never ran, and the sweep took its entries -- with no way to self-heal.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        let zip_bytes = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut zw = zip::ZipWriter::new(&mut buf);
+                let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                zw.start_file("inside.txt", opts).unwrap();
+                std::io::Write::write_all(&mut zw, b"payload").unwrap();
+                zw.finish().unwrap();
+            }
+            buf.into_inner()
+        };
+        std::fs::write(root.join("backup.bak"), &zip_bytes).unwrap();
+
+        // Approve .bak so the first scan descends and the entry exists. Task 3 made the limits an
+        // argument, so this needs no environment or settings file.
+        let limits = crate::archive::ArchiveLimits {
+            allow_extensions: vec!["bak".to_string()],
+            ..test_limits()
+        };
+        let stop = crate::scan_control::StopFlag::new();
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let ident = ident();
+        scan_volume_with_progress(&cat, &root, &ident, false, 100, None, &m, &stop, &limits)
+            .unwrap();
+        let active = || -> i64 {
+            cat.conn
+                .query_row(
+                    "SELECT count(*) FROM files WHERE container_chain IS NOT NULL AND status='active'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(active(), 1, "the entry is catalogued");
+
+        // Now force the detection open to fail, with the file's content changed so the skip path
+        // does not short-circuit.
+        std::fs::write(root.join("backup.bak"), [&zip_bytes[..], b"x"].concat()).unwrap();
+        FORCE_DETECTION_OPEN_ERROR.with(|f| f.set(true));
+        let m2 = crate::scan_metrics::ScanMetrics::new();
+        let r =
+            scan_volume_with_progress(&cat, &root, &ident, false, 300, None, &m2, &stop, &limits);
+        // Reset before unwrapping, so a failure cannot leave the hook set for other tests on this
+        // thread.
+        FORCE_DETECTION_OPEN_ERROR.with(|f| f.set(false));
+        r.unwrap();
+
+        assert_eq!(
+            active(),
+            1,
+            "a detection failure must not cost the archive its entries"
         );
     }
 
