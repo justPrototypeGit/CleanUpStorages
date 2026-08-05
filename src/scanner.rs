@@ -262,12 +262,19 @@ pub fn scan_volume_with_progress(
         // the archive-detection fallback further down: `upsert_file` below unconditionally writes
         // this path's own row, so a query made AFTER it would find a row for every path -- even one
         // seen for the very first time -- and could never fall through to the extension test.
-        let mut prior_meta: Option<crate::catalog::store::FileMeta> = None;
+        //
+        // Fetched unconditionally, `force` or not: `force` governs only whether the SKIP decision
+        // below is allowed to fire, not whether we learn what the catalogue already knew. A forced
+        // scan already re-hashes every byte of every file, so one more indexed lookup is noise
+        // beside that -- and skipping the fetch under `force` is exactly what silently reopened
+        // this defect for the documented `--force` recovery path.
+        let prior_meta: Option<crate::catalog::store::FileMeta> = {
+            let _t = metrics.timer(crate::scan_metrics::Phase::SkipCheck);
+            cat.get_file_meta(&identity.volume_id, &rel)?
+        };
         let is_unchanged = if force {
             false
         } else {
-            let _t = metrics.timer(crate::scan_metrics::Phase::SkipCheck);
-            prior_meta = cat.get_file_meta(&identity.volume_id, &rel)?;
             match prior_meta {
                 Some((old_size, old_mtime, has_archive_entries, revive_floor))
                     if old_size == size && old_mtime == mtime.unwrap_or(0) =>
@@ -1987,6 +1994,68 @@ mod tests {
             active(),
             1,
             "a detection failure must not cost the archive its entries"
+        );
+    }
+
+    /// The `--force` variant of the above. `--force` is the documented recovery path for a stale
+    /// catalogue, so a detection failure under `--force` must ALSO consult the catalogue rather
+    /// than the filename -- otherwise the one recovery mechanism this defect tells users to reach
+    /// for reopens the exact same loss it is supposed to fix.
+    #[test]
+    fn a_detection_failure_under_force_also_keeps_a_catalogued_archives_entries() {
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        let zip_bytes = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut zw = zip::ZipWriter::new(&mut buf);
+                let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                zw.start_file("inside.txt", opts).unwrap();
+                std::io::Write::write_all(&mut zw, b"payload").unwrap();
+                zw.finish().unwrap();
+            }
+            buf.into_inner()
+        };
+        std::fs::write(root.join("backup.bak"), &zip_bytes).unwrap();
+
+        let limits = crate::archive::ArchiveLimits {
+            allow_extensions: vec!["bak".to_string()],
+            ..test_limits()
+        };
+        let stop = crate::scan_control::StopFlag::new();
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let ident = ident();
+        scan_volume_with_progress(&cat, &root, &ident, false, 100, None, &m, &stop, &limits)
+            .unwrap();
+        let active = || -> i64 {
+            cat.conn
+                .query_row(
+                    "SELECT count(*) FROM files WHERE container_chain IS NOT NULL AND status='active'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(active(), 1, "the entry is catalogued");
+
+        // Content need not even change here: `force=true` re-hashes and re-runs detection
+        // regardless of size/mtime, which is the whole point of `--force`.
+        FORCE_DETECTION_OPEN_ERROR.with(|f| f.set(true));
+        let m2 = crate::scan_metrics::ScanMetrics::new();
+        let r =
+            scan_volume_with_progress(&cat, &root, &ident, true, 300, None, &m2, &stop, &limits);
+        // Reset before unwrapping, so a failure cannot leave the hook set for other tests on this
+        // thread.
+        FORCE_DETECTION_OPEN_ERROR.with(|f| f.set(false));
+        r.unwrap();
+
+        assert_eq!(
+            active(),
+            1,
+            "a detection failure under --force must not cost the archive its entries either -- \
+             --force is the documented recovery path for this defect"
         );
     }
 
