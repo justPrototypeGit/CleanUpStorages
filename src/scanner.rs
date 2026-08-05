@@ -160,8 +160,6 @@ pub fn scan_volume_with_progress(
     // held back from the missing-sweep below (#7) — unreadable is not the same as gone.
     let mut unreadable_dirs: Vec<String> = Vec::new();
     cat.conn.execute_batch("BEGIN")?;
-    // Re-count from scratch for this volume, so a rescan does not accumulate.
-    cat.clear_pending_formats_for_volume(&identity.volume_id)?;
 
     let mut walker = WalkDir::new(root).into_iter();
     loop {
@@ -434,7 +432,7 @@ pub fn scan_volume_with_progress(
                 archive::Descent::Leaf => {}
                 archive::Descent::Unrecognised => {
                     // Left whole AND recorded: the user decides, the scanner does not guess.
-                    cat.record_pending_format(&identity.volume_id, &descent_ext, size, now)?;
+                    cat.record_pending_format(&identity.volume_id, &rel, &descent_ext, size, now)?;
                 }
             }
         }
@@ -2245,7 +2243,9 @@ mod tests {
     }
 
     #[test]
-    fn a_rescan_does_not_double_count_pending_formats() {
+    fn a_forced_rescan_does_not_double_count_pending_formats() {
+        // force=true: the file is re-hashed every pass, so record_pending_format is called again --
+        // the per-file upsert must replace the row, not add a second one.
         let (tmp, cat) = setup();
         let root = tmp.path().join("drive");
         std::fs::create_dir_all(&root).unwrap();
@@ -2281,7 +2281,158 @@ mod tests {
         let pending = cat.pending_formats().unwrap();
         assert_eq!(
             pending[0].count, 1,
-            "a rescan re-counts, it does not accumulate"
+            "a forced rescan re-hashes the file but must not accumulate a second row"
+        );
+    }
+
+    #[test]
+    fn an_incremental_rescan_still_reports_the_pending_format() {
+        // THE bug this round fixes: an ordinary (force=false) second scan finds the file unchanged
+        // and takes the skip path, which never opens the file and therefore never calls
+        // record_pending_format again. With no clear-at-scan-start, the row from the first scan must
+        // simply persist -- the report must not go blank just because nothing changed on disk.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        let zip_bytes = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut zw = zip::ZipWriter::new(&mut buf);
+                let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                zw.start_file("inside.txt", opts).unwrap();
+                std::io::Write::write_all(&mut zw, b"payload").unwrap();
+                zw.finish().unwrap();
+            }
+            buf.into_inner()
+        };
+        std::fs::write(root.join("backup.bak"), &zip_bytes).unwrap();
+        let stop = crate::scan_control::StopFlag::new();
+
+        let m1 = crate::scan_metrics::ScanMetrics::new();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m1,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
+        let pending = cat.pending_formats().unwrap();
+        assert_eq!(pending.len(), 1, "the first scan reports it");
+        assert_eq!(pending[0].count, 1);
+
+        // Second scan: nothing on disk changed, so this is the skip path.
+        let m2 = crate::scan_metrics::ScanMetrics::new();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            200,
+            None,
+            &m2,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
+        let pending = cat.pending_formats().unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "an incremental rescan must not empty the report"
+        );
+        assert_eq!(pending[0].extension, "bak");
+        assert_eq!(pending[0].count, 1, "still exactly one file");
+    }
+
+    #[test]
+    fn scanning_one_volume_does_not_touch_another_volumes_pending_formats() {
+        let (tmp, cat) = setup();
+        let root_a = tmp.path().join("drive-a");
+        let root_b = tmp.path().join("drive-b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        let zip_bytes = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            {
+                let mut zw = zip::ZipWriter::new(&mut buf);
+                let opts: zip::write::FileOptions<()> = zip::write::FileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored);
+                zw.start_file("inside.txt", opts).unwrap();
+                std::io::Write::write_all(&mut zw, b"payload").unwrap();
+                zw.finish().unwrap();
+            }
+            buf.into_inner()
+        };
+        std::fs::write(root_a.join("a.bak"), &zip_bytes).unwrap();
+        std::fs::write(root_b.join("b.kra"), &zip_bytes).unwrap();
+
+        let ident_a = VolumeIdentity {
+            volume_id: "vol-a".into(),
+            label: "A".into(),
+            identified_by: "marker".into(),
+        };
+        let ident_b = VolumeIdentity {
+            volume_id: "vol-b".into(),
+            label: "B".into(),
+            identified_by: "marker".into(),
+        };
+        cat.upsert_volume(&Volume {
+            volume_id: "vol-a".into(),
+            label: "A".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
+        cat.upsert_volume(&Volume {
+            volume_id: "vol-b".into(),
+            label: "B".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
+        let stop = crate::scan_control::StopFlag::new();
+        let m = crate::scan_metrics::ScanMetrics::new();
+        scan_volume_with_progress(
+            &cat,
+            &root_a,
+            &ident_a,
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
+        let m2 = crate::scan_metrics::ScanMetrics::new();
+        scan_volume_with_progress(
+            &cat,
+            &root_b,
+            &ident_b,
+            false,
+            200,
+            None,
+            &m2,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
+
+        let pending = cat.pending_formats().unwrap();
+        let exts: std::collections::BTreeSet<String> =
+            pending.iter().map(|p| p.extension.clone()).collect();
+        assert_eq!(
+            exts,
+            ["bak".to_string(), "kra".to_string()].into_iter().collect(),
+            "scanning volume B must not clear or otherwise disturb volume A's report"
         );
     }
 }
