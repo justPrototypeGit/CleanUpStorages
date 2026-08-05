@@ -70,6 +70,21 @@ impl Catalog {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// `(volume_id, relative_path)` for every file currently pending under this extension --
+    /// exactly the files that need their scan fingerprint invalidated when the extension is
+    /// approved for descent (`api_resolve_format`, action `"descend"`), so the next ordinary
+    /// rescan re-hashes them instead of taking the skip path. Read this BEFORE `clear_pending_format`
+    /// deletes the rows.
+    pub fn pending_format_paths(&self, extension: &str) -> anyhow::Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT volume_id, relative_path FROM pending_archive_formats WHERE extension=?1",
+        )?;
+        let rows = stmt.query_map(params![extension.to_ascii_lowercase()], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn clear_pending_format(&self, extension: &str) -> anyhow::Result<usize> {
         Ok(self.conn.execute(
             "DELETE FROM pending_archive_formats WHERE extension=?1",

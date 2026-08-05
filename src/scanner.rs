@@ -2386,6 +2386,97 @@ mod tests {
     }
 
     #[test]
+    fn approving_a_reported_extension_descends_it_on_the_very_next_ordinary_rescan() {
+        // SC3: "Approving a reported extension descends into those files on the next scan." This
+        // reproduces F-1 from the archive-descent-policy final review: without invalidating the
+        // cached fingerprint, an unchanged file's (size, mtime) still matches the catalogue, so the
+        // skip path at the top of this loop never re-opens it and `descend_archive` never runs --
+        // only `--force` (a second multi-day pass over the whole drive) would descend it.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        std::fs::create_dir_all(&root).unwrap();
+        let zip_bytes = make_zip(&[("inside.txt", b"payload")]);
+        std::fs::write(root.join("backup.bak"), &zip_bytes).unwrap();
+
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let stop = crate::scan_control::StopFlag::new();
+        scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false,
+            100,
+            None,
+            &m,
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
+
+        let pending = cat.pending_formats().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].extension, "bak");
+
+        // What `api_resolve_format` (action "descend") does: invalidate the cached fingerprint for
+        // every file pending under this extension, then clear the pending rows. The extension
+        // joining the allow-list (the settings.json write in the real handler) is modeled here by
+        // handing the second scan a `limits` value with "bak" already in `allow_extensions`.
+        for (volume_id, relative_path) in cat.pending_format_paths("bak").unwrap() {
+            cat.invalidate_scan_fingerprint(&volume_id, &relative_path)
+                .unwrap();
+        }
+        cat.clear_pending_format("bak").unwrap();
+
+        let mut limits2 = test_limits();
+        limits2.allow_extensions = vec!["bak".to_string()];
+
+        let m = crate::scan_metrics::ScanMetrics::new();
+        let stop = crate::scan_control::StopFlag::new();
+        let summary = scan_volume_with_progress(
+            &cat,
+            &root,
+            &ident(),
+            false, // ordinary rescan -- NOT --force. This is the criterion.
+            200,
+            None,
+            &m,
+            &stop,
+            &limits2,
+        )
+        .unwrap();
+
+        assert_eq!(
+            summary.skipped, 0,
+            "the cached fingerprint must be invalidated, or backup.bak takes the skip path and is \
+             never re-opened"
+        );
+        assert_eq!(summary.hashed, 1);
+
+        let entries: Vec<String> = cat
+            .conn
+            .prepare(
+                "SELECT relative_path FROM files WHERE container_chain IS NOT NULL \
+                 ORDER BY relative_path",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            entries,
+            vec!["backup.bak".to_string()],
+            "approving the extension must descend it on an ORDINARY (force=false) rescan"
+        );
+
+        let pending_after = cat.pending_formats().unwrap();
+        assert!(
+            pending_after.is_empty(),
+            "the approved extension must not still be reported as pending"
+        );
+    }
+
+    #[test]
     fn a_forced_rescan_does_not_double_count_pending_formats() {
         // force=true: the file is re-hashed every pass, so record_pending_format is called again --
         // the per-file upsert must replace the row, not add a second one.

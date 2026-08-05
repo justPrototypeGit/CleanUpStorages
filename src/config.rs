@@ -389,6 +389,71 @@ mod tests {
     }
 
     #[test]
+    fn a_zero_max_depth_in_the_file_is_refused_and_falls_back() {
+        // M3 (final review, F-2): `check_ranges`/`drop_out_of_range` match "max_archive_depth" as a
+        // hand-written string literal in two places; a typo in either leaves this field silently
+        // unvalidated with the full suite still green. This test exists so that class of typo fails.
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("settings.json");
+        std::fs::write(
+            &p,
+            br#"{"max_archive_depth": 0, "archive_ratio_cap": 5000}"#,
+        )
+        .unwrap();
+        let s = load_settings(&p);
+        assert_eq!(
+            s.max_archive_depth, None,
+            "the bad field falls back to the default"
+        );
+        assert_eq!(
+            s.archive_ratio_cap,
+            Some(5000),
+            "a VALID field beside it must survive"
+        );
+    }
+
+    #[test]
+    fn a_zero_ratio_cap_in_the_file_is_refused_and_falls_back() {
+        // M3 (final review, F-2): same exposure as above for "archive_ratio_cap". A `0` ratio cap
+        // that slipped through would suppress archive descent wholesale.
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("settings.json");
+        std::fs::write(&p, br#"{"archive_ratio_cap": 0, "max_archive_depth": 3}"#).unwrap();
+        let s = load_settings(&p);
+        assert_eq!(
+            s.archive_ratio_cap, None,
+            "the bad field falls back to the default"
+        );
+        assert_eq!(
+            s.max_archive_depth,
+            Some(3),
+            "a VALID field beside it must survive"
+        );
+    }
+
+    #[test]
+    fn a_zero_total_buffer_in_the_file_is_refused_and_falls_back() {
+        // M3 (final review, F-2): same exposure as above for "archive_total_buffer_bytes".
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("settings.json");
+        std::fs::write(
+            &p,
+            br#"{"archive_total_buffer_bytes": 0, "max_archive_depth": 3}"#,
+        )
+        .unwrap();
+        let s = load_settings(&p);
+        assert_eq!(
+            s.archive_total_buffer_bytes, None,
+            "the bad field falls back to the default"
+        );
+        assert_eq!(
+            s.max_archive_depth,
+            Some(3),
+            "a VALID field beside it must survive"
+        );
+    }
+
+    #[test]
     fn an_explicit_null_ceiling_is_still_unlimited_not_out_of_range() {
         // `null` means "the user chose unlimited" and must survive the range check untouched.
         let t = tempfile::tempdir().unwrap();
