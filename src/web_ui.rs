@@ -1273,7 +1273,11 @@ document.addEventListener('click', async e=>{
       b.dataset.action==='descend'
         ? `${label} will be opened on the next scan.`
         : `${label} will be catalogued whole.`;
+    // A resolve moves the extension onto one of the settings lists -- refresh the chips too, or
+    // the pending row vanishes with nothing visibly taking its place, which reads as "did
+    // nothing" (or worse, "threw the file away") rather than "moved to the other list".
     await loadPendingFormats();
+    await refreshLimits();
   }catch(err){ $("#pendingfmtmsg").textContent="Failed: "+err.message; }
 });
 const LIMITS=[
@@ -1330,12 +1334,19 @@ document.addEventListener('click', async e=>{
     await loadLimits();
   }catch(err){ $("#limitsmsg").textContent="Failed: "+err.message; }
 });
+// Shared by the details-toggle handler below and by anything that changes a setting the section
+// displays (resolving a pending format) so the two never drift out of sync. Sets the "loaded" flag
+// only once the load succeeds, so a failure leaves the section retryable on the next collapse/
+// expand -- and so a caller who refreshes while the section has never been opened correctly marks
+// it as already fresh, instead of the next open silently re-fetching (harmless) or, if the flag
+// were set unconditionally, silently skipping a real reload after a failed one (not harmless).
+function refreshLimits(){
+  return loadLimits().then(()=>{ $("#limits").dataset.loaded='1'; })
+    .catch(()=>{ $("#limitsbody").textContent='Could not load the limits.'; });
+}
 document.addEventListener('toggle', e=>{
   if(e.target.id==='limits' && e.target.open && !e.target.dataset.loaded){
-    // Set the flag only once the load succeeds, so a failure leaves the section retryable on the
-    // next collapse/expand instead of stuck on the error message forever.
-    loadLimits().then(()=>{ e.target.dataset.loaded='1'; })
-      .catch(()=>{ $("#limitsbody").textContent='Could not load the limits.'; });
+    refreshLimits();
   }
 }, true);
 document.addEventListener('click', async e=>{
