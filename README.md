@@ -144,10 +144,22 @@ and a warning is logged — a bad settings file never stops a scan.
 
 ![Archive limits on the Scan page](docs/screenshots/scan-limits.png)
 
-Archives are recognised by **their content, not their extension**. A zip renamed to something else is
-catalogued properly, and a file that merely ends in `.zip` — such as a macOS `._name.zip` sidecar — is
-not mistaken for one. Note the consequence: any file in zip format is an archive, including `.docx`,
-`.xlsx`, `.jar` and `.epub`.
+Archives are recognised by **their content, not their extension**, so a zip renamed to something else
+is not missed, and a file that merely ends in `.zip` — such as a macOS `._name.zip` sidecar — is not
+mistaken for one.
+
+Being zip format is not enough to be opened, though. `.docx`, `.xlsx`, `.jar`, `.epub` and similar are
+zip files, but they are documents and packages rather than archives, so they are catalogued **whole**
+rather than exploded into their internal parts. That list lives in `settings.json` as
+`archive_deny_extensions` and is editable on the Scan page.
+
+A zip file with an extension in neither list — say a backup renamed to `.bak` — is also catalogued
+whole, but it is **reported** rather than guessed at. The Scan page shows a row per unrecognised
+extension, with the file count, total size, and two buttons: **Descend into these** (adds it to
+`archive_allow_extensions`) and **Treat as documents** (adds it to `archive_deny_extensions`). Both
+lists also show as removable chips there, so a resolution can be undone. Approving one opens those
+files on the next scan; a long unattended scan can never ask, so in the meantime it takes the
+conservative option and tells you afterwards.
 
 ### Is the catalogue complete?
 
