@@ -1402,6 +1402,17 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt; // for `oneshot`
 
+    /// Limits for tests: the compiled-in defaults, with NO ambient environment read.
+    fn test_limits() -> crate::archive::ArchiveLimits {
+        crate::archive::ArchiveLimits {
+            max_depth: 8,
+            buffer_max_bytes: 2 * 1024 * 1024 * 1024,
+            total_buffer_bytes: 2 * 1024 * 1024 * 1024,
+            entry_max_bytes: Some(64 * 1024 * 1024 * 1024),
+            ratio_cap: 10_000,
+        }
+    }
+
     #[test]
     fn app_state_new_live_has_token_and_live_mounts() {
         let s = AppState::new_live(PathBuf::from("x.db"));
@@ -2312,7 +2323,7 @@ mod tests {
                 label: "D".into(),
                 identified_by: "marker".into(),
             };
-            crate::scanner::scan_volume(&cat, &drive, &ident, false, 100).unwrap();
+            crate::scanner::scan_volume(&cat, &drive, &ident, false, 100, &test_limits()).unwrap();
         }
         let mut mounts = std::collections::HashMap::new();
         mounts.insert("vol-1".to_string(), drive.clone());
@@ -2439,7 +2450,7 @@ mod tests {
                 label: "D".into(),
                 identified_by: "marker".into(),
             };
-            crate::scanner::scan_volume(&cat, &drive, &ident, false, 100).unwrap();
+            crate::scanner::scan_volume(&cat, &drive, &ident, false, 100, &test_limits()).unwrap();
         }
         let mut mounts = std::collections::HashMap::new();
         mounts.insert("vol-1".to_string(), drive.clone());

@@ -75,10 +75,8 @@ pub fn cmd_scan(
     let stop = crate::scan_control::install_signal_handler();
     let progress = crate::scan_control::CliProgress::new();
 
-    println!(
-        "{}",
-        crate::archive::ArchiveLimits::from_config(&cfg).summary_line()
-    );
+    let limits = crate::archive::ArchiveLimits::from_config(&cfg);
+    println!("{}", limits.summary_line());
 
     if !no_count {
         eprintln!("Counting files…");
@@ -105,6 +103,7 @@ pub fn cmd_scan(
         now,
         Some(&progress),
         &stop,
+        &limits,
     );
     progress.finish();
     match outcome? {
