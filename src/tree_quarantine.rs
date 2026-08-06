@@ -101,7 +101,7 @@ pub fn quarantine_tree(
         anyhow::bail!("{} does not exist on disk", src.display());
     }
 
-    let dest_rel = tree_dest(mount_root, tree_path);
+    let dest_rel = tree_dest(cat, mount_root, expected_volume_id, tree_path)?;
     let dest = mount_root.join(&dest_rel);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
@@ -125,18 +125,55 @@ pub fn quarantine_tree(
         )
     })?;
 
-    let mut files_updated = 0usize;
-    for (id, rel, chain, _) in &rows {
-        let suffix = rel.strip_prefix(tree_path).unwrap_or(rel);
-        let new_rel = format!("{dest_rel}{suffix}");
-        match chain {
-            // Still inside its archive: keep the chain, or every entry would collapse onto the
-            // container's own path and break the loose-identity unique index.
-            Some(_) => cat.mark_quarantined_in_place(*id, &new_rel, rel, now)?,
-            None => cat.mark_quarantined(*id, &new_rel, rel, now)?,
+    // All rows or none. A partial update would leave the catalogue describing a tree that is half
+    // in _ToDelete and half not, which is worse than either outcome -- and the loop can genuinely
+    // fail partway (a stale row claiming a destination path violates the loose-identity index).
+    let update = || -> anyhow::Result<usize> {
+        let tx = cat.conn.unchecked_transaction()?;
+        let mut n = 0usize;
+        for (id, rel, chain, _) in &rows {
+            let suffix = rel.strip_prefix(tree_path).unwrap_or(rel);
+            let new_rel = format!("{dest_rel}{suffix}");
+            match chain {
+                // Still inside its archive: keep the chain, or every entry would collapse onto the
+                // container's own path and break the loose-identity unique index.
+                Some(_) => cat.mark_quarantined_in_place(*id, &new_rel, rel, now)?,
+                None => cat.mark_quarantined(*id, &new_rel, rel, now)?,
+            }
+            n += 1;
         }
-        files_updated += 1;
-    }
+        tx.commit()?;
+        Ok(n)
+    };
+
+    let files_updated = match update() {
+        Ok(n) => n,
+        Err(e) => {
+            // The rename already happened. Put it back, so disk and catalogue agree again on the
+            // pre-move state rather than being left inconsistent.
+            match std::fs::rename(&dest, &src) {
+                Ok(()) => anyhow::bail!(
+                    "could not update the catalogue for {tree_path}: {e}. The folder was moved back \
+                     to its original place; nothing was changed."
+                ),
+                Err(back) => {
+                    cat.log_action(
+                        "quarantine_tree_stranded",
+                        &serde_json::json!({"volume_id": expected_volume_id, "from": tree_path,
+                                            "to": dest_rel, "error": e.to_string(),
+                                            "rollback_error": back.to_string()})
+                        .to_string(),
+                        now,
+                    )?;
+                    anyhow::bail!(
+                        "could not update the catalogue for {tree_path}: {e}. The folder is now at \
+                         {dest_rel} and could NOT be moved back ({back}). Your files are intact at \
+                         that path; re-scan this drive to resynchronise the catalogue."
+                    )
+                }
+            }
+        }
+    };
 
     cat.log_action(
         "quarantine_tree",
@@ -175,16 +212,46 @@ fn enclosing_archive(
         .max_by_key(|a| a.len()))
 }
 
-/// `_ToDelete/<tree_path>`, suffixed ` (n)` if that path is already taken.
-fn tree_dest(mount_root: &Path, tree_path: &str) -> String {
+/// `_ToDelete/<tree_path>`, suffixed ` (n)` if that destination is already taken.
+///
+/// A candidate is acceptable only when NEITHER the path exists on disk NOR any catalogue row still
+/// claims a loose path beneath it. The catalogue half matters: a purged row keeps its
+/// `_ToDelete/...` relative_path while the file itself is gone from disk, so a disk-only check
+/// would pick a destination the loose-identity unique index already refuses -- and the failure
+/// would land *after* the rename. This mirrors `quarantine::quarantine_dest`, which learned the
+/// same lesson for single files.
+fn tree_dest(
+    cat: &Catalog,
+    mount_root: &Path,
+    volume_id: &str,
+    tree_path: &str,
+) -> anyhow::Result<String> {
     let base = format!("{}/{tree_path}", crate::volume::QUARANTINE_DIR);
-    if !mount_root.join(&base).exists() {
-        return base;
+    let taken = |cand: &str| -> anyhow::Result<bool> {
+        if mount_root.join(cand).exists() {
+            return Ok(true);
+        }
+        let like = cand
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+            + "/%";
+        let n: i64 = cat.conn.query_row(
+            "SELECT COUNT(*) FROM files
+              WHERE volume_id=?1 AND container_chain IS NULL
+                AND (relative_path=?2 OR relative_path LIKE ?3 ESCAPE '\\')",
+            rusqlite::params![volume_id, cand, like],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    };
+    if !taken(&base)? {
+        return Ok(base);
     }
     for n in 1.. {
         let cand = format!("{base} ({n})");
-        if !mount_root.join(&cand).exists() {
-            return cand;
+        if !taken(&cand)? {
+            return Ok(cand);
         }
     }
     unreachable!()
@@ -464,6 +531,68 @@ mod tests {
             )
             .unwrap();
         assert_eq!(still_missing, 0);
+    }
+
+    #[test]
+    fn a_destination_still_claimed_by_a_purged_row_is_not_reused() {
+        // A purged row keeps its _ToDelete/... relative_path while the file is gone from disk. A
+        // disk-only collision check would therefore pick a destination the loose-identity unique
+        // index already refuses -- and the failure would land AFTER the rename, with the files
+        // moved and the catalogue not updated.
+        let (_t, cat, root) = drive_with_tree();
+        cat.conn
+            .execute(
+                "INSERT INTO files(volume_id, relative_path, filename, extension, size_bytes,
+                     content_hash, category, container_chain, status, first_seen_at, last_seen_at)
+                 VALUES ('vol-1','_ToDelete/copy/a.txt','a.txt','txt',3,'OLD','document',NULL,
+                         'purged',1,1)",
+                [],
+            )
+            .unwrap();
+
+        let out = quarantine_tree(&cat, &root, "vol-1", "copy", 200).unwrap();
+        assert_ne!(
+            out.dest_relative_path, "_ToDelete/copy",
+            "the destination claimed by a purged row must not be reused"
+        );
+        assert!(root.join(&out.dest_relative_path).is_dir());
+        // And the move really completed: rows updated, files on disk, old claim untouched.
+        assert_eq!(out.files_updated, 2);
+        assert!(!root.join("copy").exists());
+    }
+
+    #[test]
+    fn a_failed_catalogue_update_puts_the_folder_back() {
+        // The rename happens before the rows can be updated, so a failure there must not leave the
+        // disk moved and the catalogue describing the old location.
+        let (_t, cat, root) = drive_with_tree();
+        // Make the UPDATE fail: a trigger that rejects any attempt to quarantine this tree's rows.
+        cat.conn
+            .execute_batch(
+                "CREATE TRIGGER block_q BEFORE UPDATE ON files
+                   WHEN new.status='quarantined'
+                   BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+            )
+            .unwrap();
+
+        let err = quarantine_tree(&cat, &root, "vol-1", "copy", 200).unwrap_err();
+        assert!(
+            err.to_string().contains("moved back"),
+            "the user must be told the move was undone; got: {err}"
+        );
+        assert!(
+            root.join("copy/a.txt").is_file() && root.join("copy/sub/b.txt").is_file(),
+            "the tree must be back where it started"
+        );
+        let quarantined: i64 = cat
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE status='quarantined'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(quarantined, 0, "no row may be left half-updated");
     }
 
     #[test]
