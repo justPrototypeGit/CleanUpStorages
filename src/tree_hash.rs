@@ -28,6 +28,24 @@ pub struct DirNode {
     pub dir_hash: String,
     pub file_count: i64,
     pub total_bytes: i64,
+    /// The archive this node lives *inside*, if any.
+    ///
+    /// `Some(..)` means the node CANNOT be quarantined: a file inside a zip cannot be renamed out
+    /// of it, and the only correct remedy is the verified repack path. A node that IS the archive
+    /// holds `None`, because moving the whole container is an ordinary single-file rename.
+    ///
+    /// Derived from which paths actually have entry rows, NOT from a list of archive extensions.
+    /// The scanner's descent policy is user-configurable (the allow-list can add `.kra`, `.3mf`,
+    /// anything), so a hard-coded suffix list would silently misclassify every format added after
+    /// this was written.
+    pub archive_root: Option<String>,
+}
+
+impl DirNode {
+    /// The archive containing this node, or `None` when it can be moved as an ordinary path.
+    pub fn archive_container(&self) -> Option<&str> {
+        self.archive_root.as_deref()
+    }
 }
 
 #[derive(Clone)]
@@ -43,18 +61,28 @@ enum Child {
 pub fn build_dir_hashes(rows: Vec<TreeInput>) -> Vec<DirNode> {
     // An archive that HAS entries is a directory; its own file row must not also appear as a leaf.
     // Getting this wrong makes the archive its own sibling and corrupts every ancestor hash.
+    // EVERY ancestor, not just the immediate parent: an archive's entries are usually nested
+    // (`backup.zip/Project/.git/config`), so checking only the immediate parent would fail to
+    // recognise the archive at all -- leaving it both a leaf file and a directory, which is
+    // precisely the corruption this replacement exists to prevent.
     let mut has_children: HashSet<(String, String)> = HashSet::new();
     for r in &rows {
-        if let Some((parent, _)) = r.path.rsplit_once('/') {
-            has_children.insert((r.volume_id.clone(), parent.to_string()));
+        let parts: Vec<&str> = r.path.split('/').collect();
+        for i in 1..parts.len() {
+            has_children.insert((r.volume_id.clone(), parts[..i].join("/")));
         }
     }
 
     let mut children: HashMap<(String, String), BTreeMap<String, Child>> = HashMap::new();
     let mut dirs: HashSet<(String, String)> = HashSet::new();
+    // Paths that turned out to be real archives: a loose row whose entries also exist. Recorded
+    // from the data rather than from an extension list, so a newly allow-listed format is handled
+    // without a code change.
+    let mut archive_roots: HashSet<(String, String)> = HashSet::new();
 
     for r in rows {
         if r.is_archive_root && has_children.contains(&(r.volume_id.clone(), r.path.clone())) {
+            archive_roots.insert((r.volume_id.clone(), r.path.clone()));
             continue; // replaced by its entry tree
         }
         let parts: Vec<&str> = r.path.split('/').collect();
@@ -128,6 +156,13 @@ pub fn build_dir_hashes(rows: Vec<TreeInput>) -> Vec<DirNode> {
         let dir_hash = blake3::hash(lines.join("\n").as_bytes())
             .to_hex()
             .to_string();
+        // The innermost archive that is a STRICT ancestor. The archive itself is not "inside" one:
+        // moving a whole redundant .zip is a single rename, and must stay offerable.
+        let archive_root = archive_roots
+            .iter()
+            .filter(|(v, a)| *v == key.0 && key.1.starts_with(&format!("{a}/")))
+            .map(|(_, a)| a.clone())
+            .max_by_key(|a| a.len());
         out.insert(
             key.clone(),
             DirNode {
@@ -136,6 +171,7 @@ pub fn build_dir_hashes(rows: Vec<TreeInput>) -> Vec<DirNode> {
                 dir_hash,
                 file_count: nf,
                 total_bytes: nb,
+                archive_root,
             },
         );
     }
@@ -290,6 +326,33 @@ mod tests {
     }
 
     #[test]
+    fn an_archive_whose_entries_are_deeply_nested_is_still_replaced() {
+        // Regression: recognising an archive by its entries' IMMEDIATE parent only works when the
+        // entries sit directly inside it. Real archives nest (backup.zip/Project/.git/config), and
+        // failing to recognise them leaves the .zip as BOTH a leaf file and a directory -- which
+        // corrupts every ancestor hash silently. The live catalogue is full of this shape.
+        let nodes = build_dir_hashes(vec![
+            TreeInput {
+                volume_id: "v".into(),
+                path: "x/backup.zip".into(),
+                content_hash: "ZIPBYTES".into(),
+                size_bytes: 9999,
+                is_archive_root: true,
+            },
+            f("v", "x/backup.zip/Project/.git/config", "H1", 10),
+        ]);
+        let x = nodes.iter().find(|n| n.path == "x").unwrap();
+        assert_eq!(
+            x.file_count, 1,
+            "the .zip's own row must not be counted alongside its entries"
+        );
+        assert_eq!(
+            x.total_bytes, 10,
+            "bytes must come from the entries, not the container's compressed size"
+        );
+    }
+
+    #[test]
     fn an_archive_with_no_entries_stays_an_ordinary_file() {
         // A zip we never descended into (deny-listed .docx, or unreadable) has no entry rows. It
         // must remain a leaf with its own content hash, not vanish.
@@ -381,6 +444,49 @@ mod tests {
     fn a_folder_without_a_twin_is_not_a_group() {
         let nodes = build_dir_hashes(vec![f("v", "lonely/x.txt", "H1", 1)]);
         assert!(maximal_groups(&nodes).is_empty());
+    }
+
+    #[test]
+    fn a_folder_inside_an_archive_is_flagged_for_repack() {
+        // 1,966 of the collapsed folders in the live catalogue are this case. A file inside a zip
+        // cannot be renamed out of it, so offering a delete here would be offering an action the
+        // tool cannot safely perform.
+        let nodes = build_dir_hashes(vec![
+            TreeInput {
+                volume_id: "v".into(),
+                path: "x/backup.zip".into(),
+                content_hash: "Z".into(),
+                size_bytes: 1,
+                is_archive_root: true,
+            },
+            f("v", "x/backup.zip/Photos/a.jpg", "H1", 10),
+        ]);
+        let inner = nodes
+            .iter()
+            .find(|n| n.path == "x/backup.zip/Photos")
+            .unwrap();
+        assert_eq!(inner.archive_container(), Some("x/backup.zip"));
+
+        // The archive ITSELF can be moved as one file, so it must not be flagged.
+        let zip = nodes.iter().find(|n| n.path == "x/backup.zip").unwrap();
+        assert_eq!(zip.archive_container(), None);
+
+        // Nor may an ordinary folder be flagged, whatever it is called.
+        let plain = nodes.iter().find(|n| n.path == "x").unwrap();
+        assert_eq!(plain.archive_container(), None);
+    }
+
+    #[test]
+    fn a_folder_merely_named_like_an_archive_is_not_flagged() {
+        // Guards against classifying by extension: this is a real directory called "stuff.zip"
+        // with no entry rows, so nothing about it needs a repack.
+        let nodes = build_dir_hashes(vec![f("v", "stuff.zip/inner/a.txt", "H1", 1)]);
+        let inner = nodes.iter().find(|n| n.path == "stuff.zip/inner").unwrap();
+        assert_eq!(
+            inner.archive_container(),
+            None,
+            "no entry rows means no archive, whatever the name suggests"
+        );
     }
 
     #[test]
