@@ -15,6 +15,7 @@ pub mod scan_metrics;
 pub mod scan_queue;
 pub mod scanner;
 pub mod tree_hash;
+pub mod tree_quarantine;
 pub mod verify;
 pub mod volume;
 pub mod web;

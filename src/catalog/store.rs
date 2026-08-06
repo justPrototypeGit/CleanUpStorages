@@ -569,6 +569,28 @@ impl Catalog {
         Ok(())
     }
 
+    /// Quarantine a row while KEEPING its `container_chain`.
+    ///
+    /// `mark_quarantined` clears the chain, which is right when an entry has been extracted into a
+    /// real file. It is wrong when a whole archive is moved: the entries are still inside it, and
+    /// clearing every chain would collapse them all onto the archive's own relative_path and
+    /// violate the loose-identity unique index. Here the archive keeps its shape and only its
+    /// location changes.
+    pub fn mark_quarantined_in_place(
+        &self,
+        id: i64,
+        new_relative_path: &str,
+        original_path: &str,
+        now: i64,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE files SET status='quarantined', relative_path=?2, original_path=?3,
+                 last_seen_at=?4 WHERE id=?1",
+            params![id, new_relative_path, original_path, now],
+        )?;
+        Ok(())
+    }
+
     /// An archive's currently-catalogued entries (active rows filed under this
     /// relative_path with a non-null container_chain).
     pub fn archive_entries(
