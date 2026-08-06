@@ -206,6 +206,50 @@ Reproduce with:
 .\scripts\bench-write-path.ps1 -Label <your-label> -DefenderExcluded $false
 ```
 
+### Task 2: `prepare_cached` on the per-file statements — kept
+
+Converted the five statements that run at least once per file (`get_file_meta`, `upsert_file`,
+`touch_seen`, `upsert_archive_entry`, `touch_archive_entries`) in `src/catalog/store.rs` from
+`conn.execute`/`conn.query_row` to `conn.prepare_cached(SQL)?.execute(...)` (or the `prepare_cached`
++ `query_row` equivalent). SQL text and parameters are unchanged; only the prepare step is cached
+across calls, avoiding a re-parse/re-plan per file. Everything else in the module (`forget_volume`,
+snapshots, settings, pending-format handlers) still uses plain `execute` — those run at most once
+per scan, so caching them buys nothing.
+
+Conditions: same machine, same corpus, same release build process, Windows Defender **not**
+excluded, OS file cache warm, corpus primed with two discarded runs first (same trap as the
+baseline — the first hashing-path run after the corpus was last touched came in anomalously slow,
+149.5 s wall with hash at 96.2% of the total, and was discarded along with a second priming run
+that settled back to the ~29-33 s steady state before any figures were recorded).
+
+`scan --force` (hashing path — every file new):
+
+| run | wall | walk | skip_check | hash | db_write | archive | accounted |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| prepare_cached-1 | 29.3 s | 214 ms (0.7%) | 132 ms (0.5%) | 24,043 ms (82.8%) | **2,700 ms (9.3%)** | 0 ms | 93.3% |
+| prepare_cached-2 | 30.9 s | 217 ms (0.7%) | 133 ms (0.4%) | 25,456 ms (83.2%) | **2,787 ms (9.1%)** | 0 ms | 93.4% |
+| prepare_cached-3 | 32.6 s | 212 ms (0.7%) | 131 ms (0.4%) | 27,199 ms (83.9%) | **2,859 ms (8.8%)** | 0 ms | 93.8% |
+
+`scan` (plain rescan, immediately after — `skip_check` path, every file unchanged):
+
+| run | wall | walk | skip_check | hash | db_write | archive | accounted |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| prepare_cached-1 | 0.8 s | 90 ms (11.1%) | 57 ms (7.0%) | 0 ms | **245 ms (30.2%)** | 0 ms | 48.3% |
+| prepare_cached-2 | 0.8 s | 92 ms (11.4%) | 55 ms (6.8%) | 0 ms | **247 ms (30.5%)** | 0 ms | 48.6% |
+| prepare_cached-3 | 0.8 s | 87 ms (11.1%) | 55 ms (7.0%) | 0 ms | **236 ms (30.0%)** | 0 ms | 48.0% |
+
+**Comparison against the baseline (`db_write_ms`, the figure this change is judged on):**
+
+- Hashing path: baseline mean 4,066 ms (4,104 / 4,071 / 4,024) → new mean 2,782 ms (2,700 / 2,787 /
+  2,859) — **31.6% lower**, far outside the baseline's documented ~2% run-to-run band.
+- Rescan path: baseline mean 312 ms (304 / 300 / 332) → new mean 243 ms (245 / 247 / 236) —
+  **22.2% lower**, outside the baseline's documented ~10% band.
+
+**Decision: kept.** Both paths improve well beyond run-to-run variance, so this is a real win, not
+noise — the opposite of the "cheap win that doesn't show up" failure mode this branch is guarding
+against. No SQL, parameters, schema, or the stop/resume contract changed; `cargo test` passed
+unmodified.
+
 ## Parallel scanning was tried and abandoned (#23)
 
 A walker → workers → writer pipeline was fully built, reviewed and measured against this drive. It
