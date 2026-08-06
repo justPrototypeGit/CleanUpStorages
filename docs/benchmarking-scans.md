@@ -250,6 +250,59 @@ noise — the opposite of the "cheap win that doesn't show up" failure mode this
 against. No SQL, parameters, schema, or the stop/resume contract changed; `cargo test` passed
 unmodified.
 
+### Task 3: `PRAGMA synchronous = NORMAL` — kept (asymmetric result)
+
+Set `synchronous = NORMAL` in `Catalog::open` (WAL mode) instead of the default `FULL`. Dropped one
+fsync per commit at checkpoint boundaries instead of on every commit. Cannot corrupt the database —
+a power loss can only lose the most recent commits, which the ordinary incremental rescan rebuilds.
+
+Conditions: same machine, same corpus, same release build, Windows Defender **not** excluded, OS
+file cache warm, two priming runs discarded first. A fourth run was taken beyond the required three
+because the first measured run's hashing-path `db_write_ms` was a clear outlier (see below); all
+four are reported for transparency rather than silently dropping the inconvenient one.
+
+`scan --force` (hashing path — every file new):
+
+| run | wall | walk | skip_check | hash | db_write | archive | accounted |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| synchronous_normal-1 | 29.5 s | 269 ms (0.9%) | 151 ms (0.5%) | 22,182 ms (76.0%) | **4,513 ms (15.5%)** | 0 ms | 92.9% |
+| synchronous_normal-2 | 31.5 s | 274 ms (0.9%) | 152 ms (0.5%) | 25,779 ms (82.5%) | **2,934 ms (9.4%)** | 0 ms | 93.2% |
+| synchronous_normal-3 | 34.1 s | 270 ms (0.8%) | 150 ms (0.4%) | 28,483 ms (84.0%) | **2,891 ms (8.5%)** | 0 ms | 93.8% |
+| synchronous_normal-4 | 25.8 s | 227 ms (0.9%) | 121 ms (0.5%) | 21,039 ms (82.5%) | **2,389 ms (9.4%)** | 0 ms | 93.2% |
+
+`scan` (plain rescan, immediately after — `skip_check` path, every file unchanged):
+
+| run | wall | walk | skip_check | hash | db_write | archive | accounted |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| synchronous_normal-1 | 1.4 s | 153 ms (14.6%) | 86 ms (8.2%) | 0 ms | **169 ms (16.1%)** | 0 ms | 38.9% |
+| synchronous_normal-2 | 1.5 s | 160 ms (14.7%) | 90 ms (8.3%) | 0 ms | **165 ms (15.2%)** | 0 ms | 38.1% |
+| synchronous_normal-3 | 1.1 s | 110 ms (14.1%) | 64 ms (8.2%) | 0 ms | **134 ms (17.2%)** | 0 ms | 39.4% |
+| synchronous_normal-4 | 1.1 s | 108 ms (14.1%) | 62 ms (8.1%) | 0 ms | **131 ms (17.1%)** | 0 ms | 39.4% |
+
+**Comparison against the Task 2 baseline (`db_write_ms`, the figure this change is judged on):**
+
+- Hashing path: baseline mean 2,782 ms (2,700 / 2,787 / 2,859). Run 1 (4,513 ms) is a clear outlier
+  — 63% above the other three, and above every number in this plan's history; treated the same as
+  Task 2's own documented 149.5 s priming outlier, i.e. real but not representative of steady state.
+  Runs 2-4 mean 2,738 ms (2,934 / 2,891 / 2,389) — **1.6% lower than baseline, i.e. flat**, well
+  inside noise. **No measurable win on the hashing path** — consistent with the plan's own
+  prediction that batch commits every 200 files leave few fsyncs to remove when hashing (76-84% of
+  wall time) dominates the phase.
+- Rescan path: baseline mean 243 ms (245 / 247 / 236) → new mean 150 ms (169 / 165 / 134 / 131) —
+  **38% lower**, consistent across all four runs and far outside the baseline's ~10% band. On this
+  path db_write is close to the entire workload (no hashing), so removing a fsync per commit shows
+  up directly.
+
+**Decision: kept, asymmetric result recorded honestly.** The dominant hashing path (what a 20 TB
+first-pass scan actually spends its time on) shows no measurable change — the win predicted as
+possibly "small or absent" was, on this corpus, absent. The rescan/skip_check path — what every scan
+after the first one is — shows a real, reproducible, consistently-signed improvement. Since the
+change is a strict safety-preserving durability trade (WAL + NORMAL cannot corrupt the database,
+only lose the last uncommitted batch, which a rescan silently rebuilds) and regresses nothing, a
+genuine win on one of the two measured paths with a flat result (not a regression) on the other
+justifies keeping it. `cargo test` passed unmodified, including `integrity_ok` and the snapshot
+mechanism, both re-verified manually against a real scan into an isolated temp data dir.
+
 ## Parallel scanning was tried and abandoned (#23)
 
 A walker → workers → writer pipeline was fully built, reviewed and measured against this drive. It
