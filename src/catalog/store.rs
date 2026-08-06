@@ -682,6 +682,12 @@ impl Catalog {
             "DELETE FROM pending_archive_formats WHERE volume_id=?1",
             params![volume_id],
         )?;
+        // Not merely tidiness: directory_trees carries a foreign key to volumes, so with
+        // foreign_keys=ON the DELETE below would FAIL outright while these rows existed.
+        self.conn.execute(
+            "DELETE FROM directory_trees WHERE volume_id=?1",
+            params![volume_id],
+        )?;
         self.conn
             .execute("DELETE FROM volumes WHERE volume_id=?1", params![volume_id])?;
         self.log_action(
@@ -2002,6 +2008,29 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM directory_trees", [], |r| r.get(0))
             .unwrap();
         assert_eq!(stored as usize, second, "no duplicate rows left behind");
+    }
+
+    #[test]
+    fn forgetting_a_volume_drops_its_directory_trees() {
+        // directory_trees has a foreign key to volumes, so leaving these rows behind does not just
+        // orphan them -- it makes `forget` fail outright under foreign_keys=ON.
+        let (_t, cat) = open_tmp();
+        put(&cat, "vol-1", "d/a.txt", "H1", 1, 100);
+        cat.rebuild_directory_trees("vol-1", 100).unwrap();
+        assert!(
+            cat.conn
+                .query_row("SELECT COUNT(*) FROM directory_trees", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap()
+                > 0
+        );
+
+        cat.forget_volume("vol-1", 200).unwrap();
+        let left: i64 = cat
+            .conn
+            .query_row("SELECT COUNT(*) FROM directory_trees", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "a forgotten volume must leave no phantom trees");
     }
 
     #[test]
