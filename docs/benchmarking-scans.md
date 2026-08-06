@@ -110,6 +110,102 @@ Note also that during a fast-forward the ETA is erratic by nature (observed swin
 → 17s): skipped bytes complete in bursts at several GB/s, so the rolling rate has nothing steady to
 lock onto. The ETA is meaningful while hashing, which is the case it was built for.
 
+## Write-path tuning (#26)
+
+Epic #26 makes small changes to the scan's per-file SQLite write path (cached statements,
+`synchronous = NORMAL`, a byte-bounded commit trigger) before a 20 TB, five-day scan. Every change
+is measured against the baseline below and reverted if it does not measurably help — see the
+"Global Constraints" in `docs/superpowers/plans/2026-08-05-sqlite-write-path.md`.
+
+### The corpus
+
+`scripts/make-write-path-corpus.ps1` builds a fixed, rebuildable corpus of **20,000 files, 6.44 GB**
+(default parameters ask for 50,000; 20,000 was chosen instead — see "A slow first attempt" below).
+Sizes are weighted toward the small end (60% under 4 KiB, 25% 4–64 KiB, 12% 64 KiB–1 MiB, 3%
+1–16 MiB) to mirror the "88.3% under 64 KB" shape measured elsewhere in this doc, because #26 is
+about *per-file* overhead — many small files stress that path far more than a few large ones.
+Files are spread across 1,000 leaf directories (40×25) so `walk` does real traversal. The corpus
+lives under `Documents\cleanup-write-path-corpus`, never inside the real catalog directory.
+
+`scripts/bench-write-path.ps1 -Label <name> -CacheCondition <cold|warm> -DefenderExcluded <bool>`
+runs both code paths against that corpus:
+- `scan --force` on a **fresh** `CLEANUPSTORAGES_DATA_DIR` — the hashing path, every file new.
+- an immediate plain rescan against the same fresh catalog — the `skip_check` path, every file
+  unchanged.
+
+These are never averaged together (trap #3): the script prints both `Phase` breakdowns separately
+and labels the run with the cache condition and Defender state so figures can't be silently mixed.
+
+### A slow first attempt, and a repeatability problem — both fixed
+
+Two issues came up building this baseline, worth recording so the next person doesn't re-discover
+them:
+
+1. **50,000 files was originally attempted and was far too slow to generate.** The first version of
+   `make-write-path-corpus.ps1` filled each file's bytes via PowerShell range-slicing
+   (`$buffer[0..($size-1)]`), which builds a new array one element at a time through the pipeline —
+   effectively O(size) per element, not O(size). Rewritten to fill an exact-size array per file with
+   a single `NextBytes` call and `WriteAllBytes`, which is what let the corpus build in ~2 minutes.
+   Even after the fix, 20,000 files (not 50,000) was kept — it fits comfortably in a few minutes and
+   is already enough files to make `db_write` legible, per the plan's own "20,000 is perfectly
+   adequate" guidance.
+
+2. **The very first hashing-path run after generating the corpus was not representative.** A run
+   taken immediately after `make-write-path-corpus.ps1` finished came in anomalously fast (17.1 s)
+   compared to every run after it (~26–35 s) — the corpus's pages were still warm in the OS write
+   cache from having just been created, which is a sharper version of trap #2. Two throwaway
+   "priming" runs (same `scan --force` over the corpus, discarded) were enough to settle the
+   machine into a steady state; **all baselines below were taken after that priming**, and any
+   future comparison run should prime once first if the corpus was just rebuilt.
+
+Even after priming, hashing-path wall clock still varies **~10% run to run** on this machine, which
+is consistent with — not contradictory to — the Defender trap documented above (Defender's
+on-access scan cost is not perfectly deterministic even for unmodified files). `db_write_ms`, the
+number #26 actually cares about, is far tighter: **within 2%** across the three runs below. The
+`skip_check` (plain rescan) path is tighter still on every figure, because it does no hashing at
+all and so is least exposed to Defender's per-open variance.
+
+### Baseline (current code, before any #26 change)
+
+Conditions: release build (`cargo build --release`), Windows Defender **not** excluded (the user
+was AFK and this session was told not to change Defender settings — see the trap above), OS file
+cache warm, corpus primed with two discarded runs first. All figures are wall clock for the whole
+CLI invocation (process launch to exit), so they include the counting pass and snapshot as well as
+the phases below.
+
+**These are A/B figures for judging #26's changes under one machine's constant conditions — not
+absolute throughput numbers.** Compare later runs only to this table, never to numbers taken
+elsewhere in this doc (different Defender/cache state) or to a different code path.
+
+`scan --force` (hashing path — every file new):
+
+| run | wall | walk | skip_check | hash | db_write | archive | accounted |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| baseline-1 | 29.3 s | 208 ms (0.7%) | 924 ms (3.2%) | 22,016 ms (75.7%) | **4,104 ms (14.1%)** | 0 ms | 93.7% |
+| baseline-2 | 32.6 s | 192 ms (0.6%) | 917 ms (2.8%) | 25,296 ms (78.2%) | **4,071 ms (12.6%)** | 0 ms | 94.3% |
+| baseline-3 | 32.3 s | 187 ms (0.6%) | 910 ms (2.8%) | 25,102 ms (78.3%) | **4,024 ms (12.5%)** | 0 ms | 94.3% |
+
+`scan` (plain rescan, immediately after — `skip_check` path, every file unchanged):
+
+| run | wall | walk | skip_check | hash | db_write | archive | accounted |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| baseline-1 | 1.8 s | 129 ms (8.5%) | 357 ms (23.5%) | 0 ms | **304 ms (20.0%)** | 0 ms | 51.9% |
+| baseline-2 | 1.6 s | 110 ms (8.0%) | 312 ms (22.8%) | 0 ms | **300 ms (21.9%)** | 0 ms | 52.7% |
+| baseline-3 | 1.7 s | 119 ms (8.3%) | 323 ms (22.4%) | 0 ms | **332 ms (23.1%)** | 0 ms | 53.8% |
+
+**Repeatable, with one caveat stated plainly:** `db_write_ms` — the figure #26's changes are judged
+on — agrees within 2% on the hashing path and within 10% on the rescan path. Total wall clock on
+the hashing path varies up to ~10% run to run, which is Defender's per-open scan cost, not this
+benchmark's own noise (see point 2 above); it does not change which path dominates or move the
+`db_write` share enough to affect any decision this plan will make.
+
+Reproduce with:
+```powershell
+.\scripts\make-write-path-corpus.ps1              # once, or after any corpus change
+.\scripts\bench-write-path.ps1 -Label priming -DefenderExcluded $false   # discard, run twice if just rebuilt
+.\scripts\bench-write-path.ps1 -Label <your-label> -DefenderExcluded $false
+```
+
 ## Parallel scanning was tried and abandoned (#23)
 
 A walker → workers → writer pipeline was fully built, reviewed and measured against this drive. It
