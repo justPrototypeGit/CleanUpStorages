@@ -806,6 +806,87 @@ impl Catalog {
             original_path: r.get("original_path")?,
         })
     }
+
+    /// Recompute this volume's directory hashes from its active rows.
+    ///
+    /// Derived data: dropped and rebuilt wholesale, never migrated. Cheap because every content
+    /// hash is already stored -- this reads rows and sorts, it does not touch the drive, so it
+    /// works for a volume that is not currently plugged in.
+    pub fn rebuild_directory_trees(&self, volume_id: &str, now: i64) -> anyhow::Result<usize> {
+        let rows: Vec<crate::tree_hash::TreeInput> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT relative_path, container_chain, content_hash, size_bytes
+                   FROM files WHERE volume_id=?1 AND status='active'",
+            )?;
+            let mapped = stmt.query_map(params![volume_id], |r| {
+                let rel: String = r.get(0)?;
+                let chain: Option<String> = r.get(1)?;
+                Ok(crate::tree_hash::TreeInput {
+                    volume_id: volume_id.to_string(),
+                    path: match &chain {
+                        Some(c) => format!("{rel}/{c}"),
+                        None => rel,
+                    },
+                    content_hash: r.get(2)?,
+                    size_bytes: r.get(3)?,
+                    // A loose row is only a *candidate* archive root; `build_dir_hashes` drops it
+                    // solely when entry rows actually exist beneath the same path.
+                    is_archive_root: chain.is_none(),
+                })
+            })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        let nodes = crate::tree_hash::build_dir_hashes(rows);
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM directory_trees WHERE volume_id=?1",
+            params![volume_id],
+        )?;
+        {
+            let mut ins = tx.prepare(
+                "INSERT INTO directory_trees(volume_id, path, dir_hash, file_count, total_bytes,
+                                             archive_root, computed_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            )?;
+            for n in &nodes {
+                ins.execute(params![
+                    n.volume_id,
+                    n.path,
+                    n.dir_hash,
+                    n.file_count,
+                    n.total_bytes,
+                    n.archive_root,
+                    now
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(nodes.len())
+    }
+
+    /// Maximal identical-tree groups across every volume, ranked by reclaimable bytes.
+    pub fn tree_duplicate_groups(&self) -> anyhow::Result<Vec<crate::tree_hash::TreeGroup>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT volume_id, path, dir_hash, file_count, total_bytes, archive_root
+               FROM directory_trees
+              WHERE dir_hash IN (SELECT dir_hash FROM directory_trees
+                                  GROUP BY dir_hash HAVING COUNT(*)>1)",
+        )?;
+        let nodes = stmt
+            .query_map([], |r| {
+                Ok(crate::tree_hash::DirNode {
+                    volume_id: r.get(0)?,
+                    path: r.get(1)?,
+                    dir_hash: r.get(2)?,
+                    file_count: r.get(3)?,
+                    total_bytes: r.get(4)?,
+                    archive_root: r.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(crate::tree_hash::maximal_groups(&nodes))
+    }
 }
 
 #[cfg(test)]
@@ -1815,5 +1896,127 @@ mod tests {
         );
         assert_eq!(bundle_floor, None);
         assert!(cat.get_file_meta("v", "absent.bin").unwrap().is_none());
+    }
+
+    fn put(cat: &Catalog, vol: &str, path: &str, hash: &str, size: i64, now: i64) {
+        cat.upsert_file(
+            &NewFile {
+                volume_id: vol.into(),
+                relative_path: path.into(),
+                filename: path.rsplit('/').next().unwrap().into(),
+                extension: "txt".into(),
+                size_bytes: size,
+                content_hash: hash.into(),
+                created_time: None,
+                modified_time: None,
+                accessed_time: None,
+                category: Category::Document,
+                container_chain: None,
+            },
+            now,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rebuilding_directory_trees_finds_an_identical_pair() {
+        let (_t, cat) = open_tmp();
+        for (path, hash, size) in [
+            ("orig/a.txt", "H1", 10i64),
+            ("orig/b.txt", "H2", 20),
+            ("copy/a.txt", "H1", 10),
+            ("copy/b.txt", "H2", 20),
+            ("unique/z.txt", "H9", 5),
+        ] {
+            put(&cat, "vol-1", path, hash, size, 100);
+        }
+        let n = cat.rebuild_directory_trees("vol-1", 100).unwrap();
+        assert!(n >= 3, "root plus three folders, got {n}");
+
+        let groups = cat.tree_duplicate_groups().unwrap();
+        assert_eq!(groups.len(), 1, "orig and copy, and nothing else");
+        let mut paths: Vec<&str> = groups[0].members.iter().map(|m| m.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["copy", "orig"]);
+        assert_eq!(groups[0].reclaimable_bytes, 30);
+    }
+
+    #[test]
+    fn a_quarantined_file_removes_its_folder_from_the_groups() {
+        // Only active rows participate: once a twin is quarantined the pair is no longer a
+        // duplicate, and continuing to offer it would invite quarantining the last copy.
+        let (_t, cat) = open_tmp();
+        put(&cat, "vol-1", "orig/a.txt", "H1", 10, 100);
+        put(&cat, "vol-1", "copy/a.txt", "H1", 10, 100);
+        cat.rebuild_directory_trees("vol-1", 100).unwrap();
+        assert_eq!(cat.tree_duplicate_groups().unwrap().len(), 1);
+
+        let id: i64 = cat
+            .conn
+            .query_row(
+                "SELECT id FROM files WHERE volume_id='vol-1' AND relative_path='copy/a.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        cat.mark_quarantined(id, "_ToDelete/copy/a.txt", "copy/a.txt", 200)
+            .unwrap();
+        cat.rebuild_directory_trees("vol-1", 200).unwrap();
+        assert!(
+            cat.tree_duplicate_groups().unwrap().is_empty(),
+            "the pair is gone once one side is quarantined"
+        );
+    }
+
+    #[test]
+    fn rebuilding_twice_is_idempotent() {
+        let (_t, cat) = open_tmp();
+        put(&cat, "vol-1", "d/a.txt", "H1", 1, 100);
+        let first = cat.rebuild_directory_trees("vol-1", 100).unwrap();
+        let second = cat.rebuild_directory_trees("vol-1", 200).unwrap();
+        assert_eq!(first, second, "a rebuild must replace, not accumulate");
+        let stored: i64 = cat
+            .conn
+            .query_row("SELECT COUNT(*) FROM directory_trees", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored as usize, second, "no duplicate rows left behind");
+    }
+
+    #[test]
+    fn an_archive_entry_tree_is_stored_with_its_container() {
+        // The archive_root column is what lets the review UI refuse to offer a rename for a folder
+        // that lives inside a zip.
+        let (_t, cat) = open_tmp();
+        put(&cat, "vol-1", "x/backup.zip", "ZIPHASH", 999, 100);
+        cat.conn
+            .execute(
+                "INSERT INTO files(volume_id, relative_path, filename, extension, size_bytes,
+                     content_hash, category, container_chain, status, first_seen_at, last_seen_at)
+                 VALUES ('vol-1','x/backup.zip','cfg','txt',7,'HI','document',
+                         'Project/.git/config','active',100,100)",
+                [],
+            )
+            .unwrap();
+        cat.rebuild_directory_trees("vol-1", 100).unwrap();
+
+        let root: Option<String> = cat
+            .conn
+            .query_row(
+                "SELECT archive_root FROM directory_trees WHERE path='x/backup.zip/Project'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(root.as_deref(), Some("x/backup.zip"));
+
+        let own: Option<String> = cat
+            .conn
+            .query_row(
+                "SELECT archive_root FROM directory_trees WHERE path='x/backup.zip'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(own, None, "the archive itself is movable as one file");
     }
 }
