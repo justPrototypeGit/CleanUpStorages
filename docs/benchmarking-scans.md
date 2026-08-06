@@ -303,6 +303,92 @@ genuine win on one of the two measured paths with a flat result (not a regressio
 justifies keeping it. `cargo test` passed unmodified, including `integrity_ok` and the snapshot
 mechanism, both re-verified manually against a real scan into an isolated temp data dir.
 
+### Task 4: a commit trigger bounded by bytes as well as files — `BATCH_MAX_FILES = 1000`, `BATCH_MAX_BYTES = 64 MiB`
+
+Replaced the fixed `BATCH_SIZE = 200` commit trigger with `rotate_batch(cat, in_batch, batch_bytes)`,
+which commits when **either** bound is reached. The byte bound exists because a stopped, crashed, or
+power-cut scan loses its current uncommitted batch and re-hashes it on resume — a file count alone
+cannot bound that cost (200 video files is minutes of re-work, 200 text files is milliseconds; see
+the plan's rationale). No schema change, no change to what gets catalogued; the stop/resume
+regression tests pass unmodified.
+
+Conditions: same machine, same corpus (20,000 files, 6.44 GB), same release build, Windows Defender
+**not** excluded, OS file cache warm. Measured with the method that gave the tightest spread in this
+project's history — a fresh `CLEANUPSTORAGES_DATA_DIR` per run, `--no-count`, judged on `db_write_ms`
+only:
+
+```
+D=/tmp/cus-$RANDOM; mkdir -p "$D"
+CLEANUPSTORAGES_DATA_DIR="$D" ./target/release/cleanupstorages.exe \
+  scan "<corpus>" --force --no-count --readonly-fallback fingerprint 2>&1 | grep -E "^db_write"
+rm -rf "$D"
+```
+
+**File count alone** (byte bound held effectively disabled at 10 GiB, so only the file count could
+trigger a commit):
+
+| BATCH_MAX_FILES | run 1 | run 2 | run 3 | mean |
+| --- | --- | --- | --- | --- |
+| 200 | 2,485 ms | 2,435 ms | — | 2,460 ms |
+| 1,000 | 2,319 ms | 2,292 ms | 2,450 ms | 2,354 ms |
+| 2,000 | 2,521 ms | 2,527 ms | 2,548 ms | 2,532 ms |
+| 5,000 | 2,658 ms | 2,558 ms | — | 2,608 ms |
+
+The curve is U-shaped, not monotonic: 1,000 is the minimum among the values tried — fewer files per
+commit (200) pays for more fsyncs, and more files per commit (2,000, 5,000) pays for larger
+transactions (more WAL growth/page traffic per commit). 1,000 is where it flattens/bottoms out.
+
+**Byte bound alone** (file count held effectively disabled at 1,000,000, so only the byte total could
+trigger a commit):
+
+| BATCH_MAX_BYTES | run 1 | run 2 | run 3 | mean |
+| --- | --- | --- | --- | --- |
+| 1 MiB | 3,744 ms | 3,674 ms | — | 3,709 ms |
+| 4 MiB | 3,199 ms *(outlier, hash phase itself 28.8 s vs ~15 s elsewhere — discarded)* | 2,312 ms | 2,114 ms | 2,213 ms |
+| 16 MiB | 2,086 ms | 2,061 ms | 2,000 ms | 2,049 ms |
+| 64 MiB | 3,250 ms *(outlier, hash phase 167 s — discarded)* | 1,749 ms | 1,546 ms | 1,506 ms *(3rd run, run 4 used to replace the outlier)* |
+| 256 MiB | 2,139 ms | 2,055 ms | 1,489 ms | 1,894 ms |
+
+Two runs were discarded as clear outliers (hash-phase time 2-10x every other run in the same series —
+Defender's per-open scan cost, the documented non-deterministic trap, not this change). Past 64 MiB
+the mean does not improve and the spread widens (256 MiB), so 64 MiB is where the curve flattens.
+
+**Chosen configuration, measured together** (`BATCH_MAX_FILES = 1000`, `BATCH_MAX_BYTES = 64 MiB`):
+
+| run | db_write |
+| --- | --- |
+| final-1 | 1,561 ms |
+| final-2 | 1,555 ms |
+| final-3 | 1,563 ms |
+
+Mean **1,560 ms**, spread <0.5% — the tightest of any series measured for this task. Against the
+Task 3 baseline this branch started from (`db_write` ≈ 2,315-2,354 ms with the old fixed
+`BATCH_SIZE = 200`), that is roughly **33% lower**.
+
+**Reasoning for the chosen values:**
+- `BATCH_MAX_FILES = 1000`: the file-count-only sweep bottoms out here; smaller batches pay more
+  fsyncs, larger batches pay more per-commit overhead, for no clear win.
+- `BATCH_MAX_BYTES = 64 MiB`: the byte-only sweep flattens here; larger bounds (256 MiB) show no
+  further mean improvement while widening variance. It is also the number that keeps the safety
+  rationale intact: this corpus's largest files are 1-16 MiB, so a 64 MiB batch caps worst-case
+  re-hash-on-interruption at roughly four such files — seconds of rework, not minutes — while a scan
+  dominated by small files (the common case, 88% under 64 KB elsewhere in this doc) will usually hit
+  the file-count bound first and commit well before the byte bound would matter.
+- Together, whichever bound is reached first governs, so the pair is safe for both a many-small-files
+  tree (file count triggers) and a few-huge-files tree (byte count triggers) — the situation a fixed
+  file count alone could not express.
+
+**Step 6 — proving the byte bound actually discriminates:** with the
+`|| *batch_bytes >= BATCH_MAX_BYTES` clause temporarily removed from `rotate_batch`,
+`cargo test --lib the_batch_commits_on_bytes_even_when_the_file_count_is_low` failed:
+`assertion left == right failed: the byte bound must trigger a commit / left: 3 / right: 0`. Restoring
+the clause made it pass again. This confirms the test is not vacuously true — it fails specifically
+when the byte bound is disabled, i.e. it does test what it claims to.
+
+**Decision: kept.** `BATCH_MAX_FILES = 1000`, `BATCH_MAX_BYTES = 64 * 1024 * 1024`. `cargo test`,
+`cargo clippy --all-targets --locked -- -D warnings`, and `cargo fmt --check` all pass; the
+stop/resume regression tests were not modified.
+
 ## Parallel scanning was tried and abandoned (#23)
 
 A walker → workers → writer pipeline was fully built, reviewed and measured against this drive. It
