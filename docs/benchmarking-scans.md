@@ -389,6 +389,110 @@ when the byte bound is disabled, i.e. it does test what it claims to.
 `cargo clippy --all-targets --locked -- -D warnings`, and `cargo fmt --check` all pass; the
 stop/resume regression tests were not modified.
 
+### Task 5: the combined result, measured together
+
+All three kept changes (`prepare_cached`, `synchronous = NORMAL`, the byte-bounded commit trigger)
+present at once, measured the same way as Task 4 — fresh `CLEANUPSTORAGES_DATA_DIR` per run,
+`--no-count`, two priming runs discarded first, judged on `db_write_ms`. Same corpus (20,000 files,
+6.44 GB), same release build, Windows Defender **not** excluded.
+
+`scan --force` (hashing path — every file new):
+
+| run | db_write |
+| --- | --- |
+| combined-1 | 1,594 ms |
+| combined-2 | 5,374 ms *(outlier — discarded from the mean, reported for transparency; hash phase itself was not anomalous, so this is the same per-open Defender variance documented throughout this doc, landing on `db_write` this time instead of `hash`)* |
+| combined-3 | 1,671 ms |
+| combined-4 | 1,618 ms *(extra run taken to replace the discarded outlier, per the same practice as Task 3)* |
+
+Steady-state mean (runs 1, 3, 4): **1,628 ms**.
+
+`scan` (plain rescan, immediately after — `skip_check` path, every file unchanged):
+
+| run | db_write |
+| --- | --- |
+| combined-1 | 112 ms |
+| combined-2 | 117 ms |
+| combined-3 | 115 ms |
+
+Mean **115 ms**, spread <5% — the tightest rescan-path series measured on this branch.
+
+**Against the original baseline (before any #26 change):**
+
+- Hashing path: 4,066 ms → 1,628 ms — **≈60% lower**. This is close to, but not identical to, Task
+  4's own final figure (1,560 ms) — a ~4% gap consistent with ordinary run-to-run variance on this
+  path, not a sign the changes interact badly with each other.
+- Rescan path: 312 ms → 115 ms — **≈63% lower**.
+
+Both paths land within a few percent of the cumulative figures the earlier tasks' own measurements
+already implied, so nothing cancelled and nothing needed reverting when combined — the concern this
+task exists to check.
+
+**A discrepancy worth naming rather than smoothing over:** the Task 3 section above, taken from the
+first-pass measurement including the 4,513 ms outlier, concludes "no measurable win on the hashing
+path." A corrected clean A/B run later in this branch (three runs each side, outlier excluded,
+recorded in the plan's implementation notes rather than restated here) found the opposite — a real
+**-7.7%** on `db_write` from `synchronous = NORMAL` alone (2,508 ms without it vs 2,315 ms with it).
+The **2,315 ms figure in the task-brief's cumulative table is the corrected one**, and this task's
+own combined measurement (1,628 ms after also adding Task 4's batching) is consistent with that
+corrected trajectory, not with Task 3's "flat" conclusion. The Task 3 section is left as originally
+written rather than edited after the fact — the point of recording it here is that the next person
+should trust the cumulative table's numbers over Task 3's prose if the two ever seem to disagree.
+
+**What this means for the 20 TB first scan — the number that matters:**
+
+`db_write` was 12.5–14.1% of the hashing-path pass in the original baseline (call it ~13%). Cutting
+that slice by ~60% removes roughly **13% × 60% ≈ 8% of total scan wall time** — not 60% of the scan,
+because `db_write` was never more than an eighth of it to begin with. On a five-day (~120 hour) 20 TB
+scan, 8% is on the order of **9–10 hours** — real, worth having, but not transformative. That is the
+number to plan from, not the 60% figure above, which describes only the slice that changed.
+
+**The 30–44% headline in issue #26 does not transfer here, and this is worth stating plainly for
+anyone reading the issue later.** That figure was measured on a **fast-forward pass** (a rescan of an
+already-catalogued tree, which does no hashing at all — see `docs/superpowers/specs/2026-08-05-sqlite-write-path-design.md`).
+With no hashing to compete against, `db_write` naturally dominates a fast-forward's wall time. A first
+scan of 20 TB is not a fast-forward — it is almost entirely hashing (75–84% of the pass throughout
+this document) — so the *share* of the pass this branch could ever touch was ~13%, not ~40%, before a
+single line of code was written. This document's own rescan-path figures (63% lower `db_write`, 115 ms
+mean) are closer in spirit to that fast-forward number, and even they are not directly comparable to
+issue #26's original figure since the corpus, Defender state, and code have all since changed.
+
+**Nothing was reverted.** All three changes measured individually — `prepare_cached` (Task 2),
+`synchronous = NORMAL` (Task 3, once correctly measured), and the byte-bounded commit trigger
+(Task 4) — showed a real, reproducible improvement on at least one of the two paths, and none
+regressed the other. The combined measurement above confirms they compose rather than cancel.
+
+**The one number in this whole document that dwarfs everything above:** Windows Defender was **not**
+excluded for any figure on this branch, by design (constant conditions for A/B comparison, and the
+user was AFK). The separately-measured Defender exclusion earlier in this document is **~30% faster
+wall clock** on a real scan — nearly four times the ~8% this entire branch is worth on the hashing
+path. If only one lever gets pulled before the 20 TB run, it should be the Defender exclusion, not
+anything in #26.
+
+**Two measurement traps cost real time building this section and are worth recording so nobody
+re-discovers them:**
+
+1. **The first run after building the binary or touching the corpus is an outlier from OS write-cache
+   residue**, not a code effect — this is Task 2's finding restated: two throwaway priming runs
+   (discarded) are a prerequisite before any recorded run, every time the corpus or binary changes.
+2. **Without `--no-count` and a fresh `CLEANUPSTORAGES_DATA_DIR` per run, spread reached 47%** in an
+   early Task 3 measurement (one 4,513 ms outlier against a ~2,738 ms mean) — wide enough that a real
+   -7.7% effect read as "flat, inside noise." The fix, used for every measurement from Task 4 onward:
+   a fresh data directory per run (so no run inherits another's catalogue) plus `--no-count` (so the
+   counting pass, itself variable under cold-cache conditions, is not part of what's being measured).
+
+Reproduce with the same commands as Task 4, run three (or four, if an outlier appears) times per path:
+
+```
+D=/tmp/cus-$RANDOM; mkdir -p "$D"
+CLEANUPSTORAGES_DATA_DIR="$D" ./target/release/cleanupstorages.exe \
+  scan "<corpus>" --force --no-count --readonly-fallback fingerprint 2>&1 | grep -E "^db_write"
+rm -rf "$D"
+```
+
+Drop `--force` (and scan the same fresh data dir twice, discarding the first scan's output) for the
+rescan/`skip_check` path.
+
 ## Parallel scanning was tried and abandoned (#23)
 
 A walker → workers → writer pipeline was fully built, reviewed and measured against this drive. It
