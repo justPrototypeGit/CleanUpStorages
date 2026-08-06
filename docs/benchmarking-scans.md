@@ -538,3 +538,58 @@ work.
 The code is preserved at git tag `experiment/parallel-scan` with the full reasoning in
 `docs/superpowers/specs/2026-07-24-parallel-scan-design.md`. Do not re-attempt this for spinning
 drives without new evidence. (It does help on NVMe, where overlap measured 385% accounted.)
+
+## Identical-tree collapse (#38) — measured against the live catalogue
+
+The point of collapsing identical folders is to cut the *number of decisions*, so the number that
+matters is how many duplicate groups stop needing an individual answer.
+
+Measured on a read-only copy of the live catalogue: 3 volumes, 808,588 rows, 535,313 of them loose.
+
+| | archives as leaves | **archives descended (shipped)** |
+| --- | --- | --- |
+| maximal identical-tree groups | 1,773 | **1,458** |
+| folders involved | 3,984 | **4,251** |
+| duplicate groups explained by them | 109,023 (86.5%) | 84,449 (58.5%) |
+| groups left needing per-file review | 16,954 | 59,924 |
+| reclaimable by collapsing | 29.7 GB | **53.2 GB** |
+| members inside an archive (needs repack) | 0 | **1,911** |
+
+Against 125,977 duplicate groups reviewed one at a time — roughly 350 hours at ten seconds a
+decision — 1,458 decisions is about five hours.
+
+**Read the two columns together.** Descending into archives nearly doubles the space collapsing
+recovers (29.7 → 53.2 GB), which is why it was chosen. It also triples the residual per-file queue,
+because it surfaces duplicates that exist only *inside* archives. Those are not independently
+actionable — deleting one entry means repacking its container — so they are excluded from the
+per-file duplicate view and reachable only through their archive.
+
+Collapsing recovers 53.2 GB of the 72.1 GB total reclaimable. It is a decision-count win first and a
+space win second.
+
+### The Rust implementation was checked against an independent one
+
+`scripts/measure-tree-collapse.py` computes the same thing in Python, and is committed so the
+numbers can be re-derived rather than trusted. Run over the same catalogue copy, the two agree
+exactly on directory nodes (80,202), maximal groups (1,458), folders involved (4,251) and
+reclaimable bytes (53.2 GB).
+
+They disagreed on one figure, and **the Python was the wrong one**: it counted a node as "inside an
+archive" when the path equalled the archive as well as when it was beneath it, so all 55 archive
+roots were miscounted (1,966 rather than 1,911). Those are precisely the case that CAN be moved by a
+single rename. The discrepancy was resolved by finding which implementation was wrong, not by
+adjusting either to match the other.
+
+### Caveats, so the ratio is not over-read
+
+- This is the **partial catalogue**, not the full 20 TB. The ratio is directional, not a promise.
+- The maximal rule suppresses a folder whenever its parent is duplicated. That is exact in the
+  common case but can miss a folder paired with a different partner than its parent's, so 1,458 is a
+  slight **under**count. For a UI offering a destructive action, under-reporting is the right
+  direction to be wrong in.
+- A first draft of the Python measurement had a real bug: an archive is both a file row and a set of
+  entry rows, and the script kept whichever it saw first, silently orphaning some entry trees. The
+  same class of bug then turned up in the Rust — recognising an archive by its entries' *immediate*
+  parent works only when entries sit directly inside it, and real archives nest. Both are fixed and
+  both have regression tests. **An archive appearing as both a leaf and a directory is the failure
+  mode to check first if these numbers ever move.**
