@@ -65,7 +65,14 @@ impl Catalog {
         volume_id: &str,
         relative_path: &str,
     ) -> anyhow::Result<Option<FileMeta>> {
-        let row = self.conn.query_row(
+        // These five statements run once or more PER FILE -- on a 20 TB corpus, on the order of 50
+        // million times each -- so they use `prepare_cached` to avoid re-parsing/re-planning the
+        // same SQL on every call. Everything else in this module (`forget_volume`, snapshots,
+        // settings and pending-format handlers) runs at most once per scan and keeps plain
+        // `execute`: caching a once-per-scan statement buys nothing and widens the diff for no
+        // reason. The SQL text below must stay byte-identical to before, since the cache is keyed on
+        // the exact string.
+        let mut stmt = self.conn.prepare_cached(
             "SELECT size_bytes, IFNULL(modified_time,0),
                     EXISTS(SELECT 1 FROM files e
                             WHERE e.volume_id=?1 AND e.relative_path=?2
@@ -73,16 +80,15 @@ impl Catalog {
                     CASE WHEN status='missing' THEN last_seen_at ELSE NULL END
                FROM files
               WHERE volume_id=?1 AND relative_path=?2 AND container_chain IS NULL",
-            params![volume_id, relative_path],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)? != 0,
-                    r.get::<_, Option<i64>>(3)?,
-                ))
-            },
-        );
+        )?;
+        let row = stmt.query_row(params![volume_id, relative_path], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)? != 0,
+                r.get::<_, Option<i64>>(3)?,
+            ))
+        });
         match row {
             Ok(v) => Ok(Some(v)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -126,8 +132,9 @@ impl Catalog {
 
     /// Insert or update one loose file; sets status=active and last_seen_at=now.
     pub fn upsert_file(&self, f: &NewFile, now: i64) -> anyhow::Result<()> {
-        self.conn.execute(
-            "INSERT INTO files(volume_id, relative_path, filename, extension, size_bytes,
+        self.conn
+            .prepare_cached(
+                "INSERT INTO files(volume_id, relative_path, filename, extension, size_bytes,
                  content_hash, created_time, modified_time, accessed_time, category,
                  container_chain, status, first_seen_at, last_seen_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'active',?12,?12)
@@ -137,7 +144,8 @@ impl Catalog {
                  created_time=excluded.created_time, modified_time=excluded.modified_time,
                  accessed_time=excluded.accessed_time, category=excluded.category,
                  status='active', last_seen_at=excluded.last_seen_at",
-            params![
+            )?
+            .execute(params![
                 f.volume_id,
                 f.relative_path,
                 f.filename,
@@ -150,8 +158,7 @@ impl Catalog {
                 f.category.as_str(),
                 f.container_chain,
                 now
-            ],
-        )?;
+            ])?;
         Ok(())
     }
 
@@ -162,11 +169,13 @@ impl Catalog {
         relative_path: &str,
         now: i64,
     ) -> anyhow::Result<bool> {
-        let n = self.conn.execute(
-            "UPDATE files SET last_seen_at=?3, status='active'
+        let n = self
+            .conn
+            .prepare_cached(
+                "UPDATE files SET last_seen_at=?3, status='active'
              WHERE volume_id=?1 AND relative_path=?2 AND container_chain IS NULL",
-            rusqlite::params![volume_id, relative_path, now],
-        )?;
+            )?
+            .execute(rusqlite::params![volume_id, relative_path, now])?;
         Ok(n > 0)
     }
 
@@ -220,8 +229,9 @@ impl Catalog {
         archive_modified: Option<i64>,
         now: i64,
     ) -> anyhow::Result<()> {
-        self.conn.execute(
-            "INSERT INTO files(volume_id, relative_path, filename, extension, size_bytes,
+        self.conn
+            .prepare_cached(
+                "INSERT INTO files(volume_id, relative_path, filename, extension, size_bytes,
                  content_hash, created_time, modified_time, accessed_time, category,
                  container_chain, status, first_seen_at, last_seen_at)
              VALUES (?1,?2,?3,?4,?5,?6,NULL,?7,NULL,?8,?9,'active',?10,?10)
@@ -231,7 +241,8 @@ impl Catalog {
                  size_bytes=excluded.size_bytes, content_hash=excluded.content_hash,
                  modified_time=excluded.modified_time,
                  category=excluded.category, status='active', last_seen_at=excluded.last_seen_at",
-            params![
+            )?
+            .execute(params![
                 volume_id,
                 archive_rel_path,
                 e.filename,
@@ -242,8 +253,7 @@ impl Catalog {
                 Category::from_extension(&e.extension).as_str(),
                 e.container_chain,
                 now
-            ],
-        )?;
+            ])?;
         Ok(())
     }
 
@@ -274,18 +284,22 @@ impl Catalog {
         revive_floor: Option<i64>,
     ) -> anyhow::Result<usize> {
         let n = match revive_floor {
-            Some(floor) => self.conn.execute(
-                "UPDATE files SET last_seen_at=?3, status='active'
+            Some(floor) => self
+                .conn
+                .prepare_cached(
+                    "UPDATE files SET last_seen_at=?3, status='active'
                  WHERE volume_id=?1 AND relative_path=?2 AND container_chain IS NOT NULL
                    AND (status='active' OR (status='missing' AND last_seen_at>=?4))",
-                params![volume_id, archive_rel_path, now, floor],
-            )?,
-            None => self.conn.execute(
-                "UPDATE files SET last_seen_at=?3, status='active'
+                )?
+                .execute(params![volume_id, archive_rel_path, now, floor])?,
+            None => self
+                .conn
+                .prepare_cached(
+                    "UPDATE files SET last_seen_at=?3, status='active'
                  WHERE volume_id=?1 AND relative_path=?2 AND container_chain IS NOT NULL
                    AND status='active'",
-                params![volume_id, archive_rel_path, now],
-            )?,
+                )?
+                .execute(params![volume_id, archive_rel_path, now])?,
         };
         Ok(n)
     }
