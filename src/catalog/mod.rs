@@ -24,6 +24,13 @@ impl Catalog {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // NORMAL, not the default FULL: in WAL this drops one fsync per COMMIT and *cannot corrupt
+        // the database* -- a power loss can lose the most recent commits, never leave a torn file.
+        // What that costs here is at most the last batch of files, which are simply not yet
+        // catalogued; the next scan re-hashes them through the ordinary incremental skip. No file on
+        // disk is touched and nothing is marked missing, which is why a durability reduction is
+        // acceptable here and would not be elsewhere in this project.
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         schema::apply(&conn)?;
         Ok(Catalog { conn })
@@ -70,5 +77,24 @@ mod tests {
         let stats = ro.volume_stats().unwrap();
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].0, "vol-1");
+    }
+
+    #[test]
+    fn the_catalog_opens_in_wal_with_synchronous_normal() {
+        // WAL + NORMAL is the pairing that makes dropping the per-commit fsync safe: it cannot
+        // corrupt the file, only lose the most recent commits -- which a rescan rebuilds.
+        let t = tempfile::tempdir().unwrap();
+        let cat = Catalog::open(&t.path().join("c.db")).unwrap();
+        let journal: String = cat
+            .conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(journal.to_lowercase(), "wal");
+        // 1 == NORMAL. FULL (2) would keep the fsync we are removing; OFF (0) would be unsafe.
+        let sync: i64 = cat
+            .conn
+            .query_row("PRAGMA synchronous", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sync, 1, "expected NORMAL");
     }
 }

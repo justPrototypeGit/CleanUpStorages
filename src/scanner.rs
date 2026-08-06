@@ -8,7 +8,29 @@ use crate::category::Category;
 use crate::hashing;
 use crate::volume::VolumeIdentity;
 
-const BATCH_SIZE: usize = 200;
+/// Commit when EITHER bound is reached.
+///
+/// The byte bound is what makes a larger file count safe. A stopped or interrupted scan loses the
+/// current uncommitted batch and re-hashes those files on resume; a file count alone cannot bound
+/// that cost, because 200 video files and 200 text files are wildly different amounts of work.
+///
+/// Two limits on that, stated because the bound is easy to over-read:
+///
+/// - It cannot cap the re-work below **one file**. Bytes are added after a file is hashed, so a
+///   single file larger than the bound already exceeds it alone — a 4 GB video is re-hashed in full
+///   if the scan dies mid-file, and no batch policy can prevent that. What the bound does give is
+///   that such a file is committed immediately afterwards instead of riding along in an open
+///   transaction with its neighbours.
+/// - Skipped files count toward it too, though re-doing a skipped file costs a stat and an indexed
+///   lookup rather than a hash. That makes a large-file rescan commit more often than the
+///   re-hashing rationale alone would require — conservative, never unsafe, and it matches the
+///   file counter, which has always counted skips. The measurements below were taken with this
+///   behaviour in place.
+///
+/// See docs/benchmarking-scans.md, "Write-path tuning (#26)", Task 4, for the measurements behind
+/// both values.
+const BATCH_MAX_FILES: usize = 1000;
+const BATCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Optional live-progress sink for a scan. Each method fires once per counted event.
 pub trait Progress: Send + Sync {
@@ -85,11 +107,12 @@ fn relative_path(path: &Path, root: &Path) -> Option<String> {
         .map(|r| r.to_string_lossy().replace('\\', "/"))
 }
 
-/// Commit the current transaction and open the next one, resetting the in-batch counter.
-fn rotate_batch(cat: &Catalog, in_batch: &mut usize) -> anyhow::Result<()> {
-    if *in_batch >= BATCH_SIZE {
+/// Commit the current transaction and open the next one, resetting both accumulators.
+fn rotate_batch(cat: &Catalog, in_batch: &mut usize, batch_bytes: &mut u64) -> anyhow::Result<()> {
+    if *in_batch >= BATCH_MAX_FILES || *batch_bytes >= BATCH_MAX_BYTES {
         cat.conn.execute_batch("COMMIT; BEGIN")?;
         *in_batch = 0;
+        *batch_bytes = 0;
     }
     Ok(())
 }
@@ -156,6 +179,7 @@ pub fn scan_volume_with_progress(
     let scan_started_at = now;
     let mut summary = ScanSummary::default();
     let mut in_batch = 0usize;
+    let mut batch_bytes = 0u64;
     // Directories this pass could not enumerate. Their contents were never visited, so they must be
     // held back from the missing-sweep below (#7) — unreadable is not the same as gone.
     let mut unreadable_dirs: Vec<String> = Vec::new();
@@ -306,9 +330,10 @@ pub fn scan_volume_with_progress(
                 p.on_skipped();
             }
             in_batch += 1;
+            batch_bytes += size as u64;
             {
                 let _t = metrics.timer(crate::scan_metrics::Phase::DbWrite);
-                rotate_batch(cat, &mut in_batch)?;
+                rotate_batch(cat, &mut in_batch, &mut batch_bytes)?;
             }
             continue;
         }
@@ -363,7 +388,8 @@ pub fn scan_volume_with_progress(
             let _t = metrics.timer(crate::scan_metrics::Phase::DbWrite);
             cat.upsert_file(&nf, now)?;
             in_batch += 1;
-            rotate_batch(cat, &mut in_batch)?;
+            batch_bytes += size as u64;
+            rotate_batch(cat, &mut in_batch, &mut batch_bytes)?;
         }
         summary.hashed += 1;
         if let Some(p) = progress {
@@ -445,6 +471,7 @@ pub fn scan_volume_with_progress(
                         now,
                         &mut summary,
                         &mut in_batch,
+                        &mut batch_bytes,
                         progress,
                     )?;
                 }
@@ -624,6 +651,7 @@ fn descend_archive(
     now: i64,
     summary: &mut ScanSummary,
     in_batch: &mut usize,
+    batch_bytes: &mut u64,
     progress: Option<&dyn Progress>,
 ) -> anyhow::Result<()> {
     let file = match std::fs::File::open(path) {
@@ -652,7 +680,8 @@ fn descend_archive(
             p.on_archive_entry();
         }
         *in_batch += 1;
-        rotate_batch(cat, in_batch)?;
+        *batch_bytes += entry.size_bytes as u64;
+        rotate_batch(cat, in_batch, batch_bytes)?;
     }
     for (ctx, reason) in &res.errors {
         let where_ = if ctx.is_empty() {
@@ -2668,5 +2697,67 @@ mod tests {
             ["bak".to_string(), "kra".to_string()].into_iter().collect(),
             "scanning volume B must not clear or otherwise disturb volume A's report"
         );
+    }
+
+    #[test]
+    fn the_batch_commits_on_bytes_even_when_the_file_count_is_low() {
+        // The point of the byte bound: a handful of large files must still commit, or a stopped
+        // scan would have to re-hash all of them. A count-only trigger cannot express this.
+        let (tmp, cat) = setup();
+        cat.conn.execute_batch("BEGIN").unwrap();
+        // Written inside the open transaction, so it is invisible to any other connection until a
+        // COMMIT actually happens. Reading it back from a SECOND connection is what makes this test
+        // prove a commit rather than merely a counter reset -- an implementation that zeroed the
+        // accumulators without committing would pass the assertions below on their own.
+        cat.upsert_file(
+            &NewFile {
+                volume_id: "vol-1".into(),
+                relative_path: "big.bin".into(),
+                filename: "big.bin".into(),
+                extension: "bin".into(),
+                size_bytes: 1,
+                content_hash: "h".into(),
+                created_time: None,
+                modified_time: None,
+                accessed_time: None,
+                category: Category::Other,
+                container_chain: None,
+            },
+            1,
+        )
+        .unwrap();
+        // Well below BATCH_MAX_FILES, well above BATCH_MAX_BYTES. Declared at their final values:
+        // assigning then overwriting would trip `unused_assignments` under `-D warnings`.
+        let mut in_batch = 3usize;
+        let mut batch_bytes = BATCH_MAX_BYTES + 1;
+        rotate_batch(&cat, &mut in_batch, &mut batch_bytes).unwrap();
+        assert_eq!(in_batch, 0, "the byte bound must trigger a commit");
+        assert_eq!(batch_bytes, 0, "and reset the byte accumulator");
+
+        let other = Catalog::open_readonly(&tmp.path().join("c.db")).unwrap();
+        let visible: i64 = other
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE relative_path='big.bin'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            visible, 1,
+            "the byte bound must actually COMMIT, not just reset the counters"
+        );
+        cat.conn.execute_batch("COMMIT").ok();
+    }
+
+    #[test]
+    fn the_batch_still_commits_on_the_file_count() {
+        let mut in_batch = BATCH_MAX_FILES;
+        let mut batch_bytes = 0u64;
+        let (_t, cat) = setup();
+        cat.conn.execute_batch("BEGIN").unwrap();
+        rotate_batch(&cat, &mut in_batch, &mut batch_bytes).unwrap();
+        assert_eq!(in_batch, 0);
+        cat.conn.execute_batch("COMMIT").ok();
     }
 }
