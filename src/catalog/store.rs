@@ -850,7 +850,6 @@ impl Catalog {
                 let rel: String = r.get(0)?;
                 let chain: Option<String> = r.get(1)?;
                 Ok(crate::tree_hash::TreeInput {
-                    volume_id: volume_id.to_string(),
                     path: match &chain {
                         Some(c) => format!("{rel}/{c}"),
                         None => rel,
@@ -864,7 +863,7 @@ impl Catalog {
             })?;
             mapped.collect::<Result<Vec<_>, _>>()?
         };
-        let nodes = crate::tree_hash::build_dir_hashes(rows);
+        let nodes = crate::tree_hash::build_dir_hashes(volume_id, rows);
 
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(

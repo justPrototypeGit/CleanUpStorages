@@ -593,3 +593,26 @@ adjusting either to match the other.
   parent works only when entries sit directly inside it, and real archives nest. Both are fixed and
   both have regression tests. **An archive appearing as both a leaf and a directory is the failure
   mode to check first if these numbers ever move.**
+
+### Memory: this does not yet scale to 20 TB, and that is measured not guessed
+
+`rebuild_directory_trees` materialises every active row for a volume before hashing. Peak working
+set on the live catalogue copy (808,588 rows, 3 volumes):
+
+| | peak |
+| --- | --- |
+| first implementation | 194 MB |
+| after removing the per-row volume id and moving hashes instead of cloning them | **160 MB** (-17.5%) |
+
+That works out at roughly **198 bytes per row**. The design spec for the write path puts the 20 TB
+corpus at *"on the order of 50 million"* files, which projects to about **9.9 GB** for a single
+rebuild — down from ~12 GB, and still far too much for the machine this runs on.
+
+**So the current implementation is fine for the catalogue as it stands and is NOT fine for the full
+20 TB scan.** The fix is to stream rather than materialise: read rows ordered by path and fold them
+with a stack, so only the current root-to-leaf spine is in memory. That is a redesign of
+`build_dir_hashes`, deliberately not bolted onto the end of the feature branch — see the tracking
+issue.
+
+Re-measure with `examples/validate_trees.rs` against a catalogue copy; it prints the same aggregate
+figures the Python script does, so a memory change that alters behaviour is immediately visible.
