@@ -284,23 +284,43 @@ four are reported for transparency rather than silently dropping the inconvenien
 - Hashing path: baseline mean 2,782 ms (2,700 / 2,787 / 2,859). Run 1 (4,513 ms) is a clear outlier
   — 63% above the other three, and above every number in this plan's history; treated the same as
   Task 2's own documented 149.5 s priming outlier, i.e. real but not representative of steady state.
-  Runs 2-4 mean 2,738 ms (2,934 / 2,891 / 2,389) — **1.6% lower than baseline, i.e. flat**, well
-  inside noise. **No measurable win on the hashing path** — consistent with the plan's own
-  prediction that batch commits every 200 files leave few fsyncs to remove when hashing (76-84% of
-  wall time) dominates the phase.
+  Runs 2-4 mean 2,738 ms (2,934 / 2,891 / 2,389) — 1.6% lower than baseline, i.e. flat, well inside
+  noise. This was originally written up as **"no measurable win on the hashing path"**.
+
+  **That conclusion was wrong, and it was wrong because the measurement was too noisy to support
+  it.** The four runs above spread 47% (2,389 to 4,513 ms), against ~2% in Task 1 — a
+  measurement-quality collapse, not a property of the change. With that much noise neither "no win"
+  nor "a real win" is distinguishable, and the honest reading at the time was "this measurement
+  cannot answer the question", not "the answer is no".
+
+  A clean re-measurement settled it. Two priming runs discarded, `--no-count` to remove the counting
+  pass as a variable, a fresh data dir per run, three runs per side:
+
+  | | `db_write_ms`, hashing path |
+  | --- | --- |
+  | with `synchronous = NORMAL` | 2,253 / 2,341 / 2,352 → mean **2,315** |
+  | without (default `FULL`) | 2,492 / 2,504 / 2,527 → mean **2,508** |
+
+  **−7.7%, with within-group spread of only 1.4–4.4%.** So there *is* a real win on the hashing path
+  — smaller than on the rescan path, but outside noise and on the path that governs a first scan.
+  The cumulative table in the Task 5 section uses this corrected 2,315 ms figure.
+
+  The lesson is worth more than the number: a null result from a noisy measurement is not a null
+  result, it is an absent one. Two priming runs and `--no-count` were what turned a 47% spread into
+  a 4% one.
 - Rescan path: baseline mean 243 ms (245 / 247 / 236) → new mean 150 ms (169 / 165 / 134 / 131) —
   **38% lower**, consistent across all four runs and far outside the baseline's ~10% band. On this
   path db_write is close to the entire workload (no hashing), so removing a fsync per commit shows
   up directly.
 
-**Decision: kept, asymmetric result recorded honestly.** The dominant hashing path (what a 20 TB
-first-pass scan actually spends its time on) shows no measurable change — the win predicted as
-possibly "small or absent" was, on this corpus, absent. The rescan/skip_check path — what every scan
-after the first one is — shows a real, reproducible, consistently-signed improvement. Since the
-change is a strict safety-preserving durability trade (WAL + NORMAL cannot corrupt the database,
-only lose the last uncommitted batch, which a rescan silently rebuilds) and regresses nothing, a
-genuine win on one of the two measured paths with a flat result (not a regression) on the other
-justifies keeping it. `cargo test` passed unmodified, including `integrity_ok` and the snapshot
+**Decision: kept — and after the re-measurement above, for a stronger reason than originally
+recorded.** Both paths improve: **−7.7%** on the hashing path (what a 20 TB first scan spends its
+time on) and **−38%** on the rescan/skip_check path (what every scan after the first one is). The
+asymmetry is expected — on the rescan path `db_write` is close to the entire workload, so removing
+an fsync per commit shows up directly, while hashing dominates the first pass.
+
+The change is also a strict safety-preserving durability trade: WAL + `NORMAL` cannot corrupt the
+database, only lose the last uncommitted batch, which a rescan silently rebuilds. `cargo test` passed unmodified, including `integrity_ok` and the snapshot
 mechanism, both re-verified manually against a real scan into an isolated temp data dir.
 
 ### Task 4: a commit trigger bounded by bytes as well as files — `BATCH_MAX_FILES = 1000`, `BATCH_MAX_BYTES = 64 MiB`
@@ -428,16 +448,20 @@ Both paths land within a few percent of the cumulative figures the earlier tasks
 already implied, so nothing cancelled and nothing needed reverting when combined — the concern this
 task exists to check.
 
-**A discrepancy worth naming rather than smoothing over:** the Task 3 section above, taken from the
-first-pass measurement including the 4,513 ms outlier, concludes "no measurable win on the hashing
-path." A corrected clean A/B run later in this branch (three runs each side, outlier excluded,
-recorded in the plan's implementation notes rather than restated here) found the opposite — a real
-**-7.7%** on `db_write` from `synchronous = NORMAL` alone (2,508 ms without it vs 2,315 ms with it).
-The **2,315 ms figure in the task-brief's cumulative table is the corrected one**, and this task's
-own combined measurement (1,628 ms after also adding Task 4's batching) is consistent with that
-corrected trajectory, not with Task 3's "flat" conclusion. The Task 3 section is left as originally
-written rather than edited after the fact — the point of recording it here is that the next person
-should trust the cumulative table's numbers over Task 3's prose if the two ever seem to disagree.
+**A discrepancy that was found here and has since been corrected above:** Task 3 was originally
+written up as "no measurable win on the hashing path", from a first-pass measurement whose runs
+spread 47%. A clean A/B (three runs each side, two priming runs, `--no-count`, fresh data dir per
+run) found the opposite — a real **−7.7%** from `synchronous = NORMAL` alone, 2,508 ms without it
+against 2,315 ms with it, at a within-group spread of 1.4–4.4%.
+
+The Task 3 section above now records both the original figures and the correction, so the document no
+longer contradicts itself. This task's combined measurement (1,628 ms after adding Task 4's batching)
+is consistent with the corrected trajectory.
+
+The generalisable lesson, and the reason this is written down rather than quietly fixed: **a null
+result from a noisy measurement is not a null result, it is an absent one.** The original conclusion
+was not merely unlucky — it drew a confident negative from data that could not support any
+conclusion. Two priming runs and `--no-count` were the difference between a 47% spread and a 4% one.
 
 **What this means for the 20 TB first scan — the number that matters:**
 
