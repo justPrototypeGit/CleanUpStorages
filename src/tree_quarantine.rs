@@ -72,6 +72,17 @@ pub fn quarantine_tree(
         mapped.collect::<Result<Vec<_>, _>>()?
     };
 
+    // A folder INSIDE an archive can never be renamed out of it; the only correct remedy is a
+    // repack. The UI already hides the button for these, but the guard belongs here too: the API is
+    // reachable without the UI, and "safe because the row query happens to return nothing" is not a
+    // safety property worth relying on.
+    if let Some(container) = enclosing_archive(cat, expected_volume_id, tree_path)? {
+        anyhow::bail!(
+            "{tree_path} is inside the archive {container}; it cannot be moved by renaming — \
+             use repack to remove entries from an archive"
+        );
+    }
+
     if rows.is_empty() {
         anyhow::bail!("no catalogued files under {tree_path:?} on volume {expected_volume_id}");
     }
@@ -139,6 +150,29 @@ pub fn quarantine_tree(
         files_updated,
         dest_relative_path: dest_rel,
     })
+}
+
+/// The archive strictly containing `tree_path`, if any.
+///
+/// Derived from the data -- a path with entry rows IS an archive -- rather than from a list of
+/// archive extensions, so a newly allow-listed format is covered without a code change, and a real
+/// directory that merely happens to be named `stuff.zip` is not.
+fn enclosing_archive(
+    cat: &Catalog,
+    volume_id: &str,
+    tree_path: &str,
+) -> anyhow::Result<Option<String>> {
+    let mut stmt = cat.conn.prepare(
+        "SELECT DISTINCT relative_path FROM files
+          WHERE volume_id=?1 AND container_chain IS NOT NULL",
+    )?;
+    let archives = stmt
+        .query_map(rusqlite::params![volume_id], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(archives
+        .into_iter()
+        .filter(|a| tree_path.starts_with(&format!("{a}/")))
+        .max_by_key(|a| a.len()))
 }
 
 /// `_ToDelete/<tree_path>`, suffixed ` (n)` if that path is already taken.
@@ -359,6 +393,114 @@ mod tests {
             )
             .unwrap();
         assert_eq!(still_entries, 2);
+    }
+
+    /// Limits for tests: the compiled-in defaults, with NO ambient environment read.
+    fn test_limits() -> crate::archive::ArchiveLimits {
+        crate::archive::ArchiveLimits {
+            max_depth: 8,
+            buffer_max_bytes: 2 * 1024 * 1024 * 1024,
+            total_buffer_bytes: 2 * 1024 * 1024 * 1024,
+            entry_max_bytes: Some(64 * 1024 * 1024 * 1024),
+            ratio_cap: 10_000,
+            deny_extensions: crate::config::DEFAULT_DENY
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            allow_extensions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_scan_after_a_tree_quarantine_reports_nothing_missing() {
+        // THE check that matters for the reliability constraint. A rename that left the catalogue
+        // stale would make the very next scan declare present files missing -- and "missing" is the
+        // state that makes a user go looking for data they think they have lost. Nothing short of
+        // running a real scan afterwards proves this.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("drive");
+        fs::create_dir_all(root.join("orig/sub")).unwrap();
+        fs::create_dir_all(root.join("copy/sub")).unwrap();
+        fs::write(root.join(".cleanupstorages_id"), "vol-1").unwrap();
+        for base in ["orig", "copy"] {
+            fs::write(root.join(base).join("a.txt"), b"SAME-A").unwrap();
+            fs::write(root.join(base).join("sub/b.txt"), b"SAME-B").unwrap();
+        }
+
+        let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
+        cat.upsert_volume(&Volume {
+            volume_id: "vol-1".into(),
+            label: "D".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
+        let ident = crate::volume::VolumeIdentity {
+            volume_id: "vol-1".into(),
+            label: "D".into(),
+            identified_by: "marker".into(),
+        };
+        crate::scanner::scan_volume(&cat, &root, &ident, false, 100, &test_limits()).unwrap();
+
+        quarantine_tree(&cat, &root, "vol-1", "copy", 200).unwrap();
+
+        // Scan again. The files are physically in _ToDelete now, and the catalogue must already
+        // say so -- so nothing is newly missing.
+        let s =
+            crate::scanner::scan_volume(&cat, &root, &ident, false, 300, &test_limits()).unwrap();
+        assert_eq!(
+            s.marked_missing, 0,
+            "a tree quarantine must leave the catalogue and the disk in agreement"
+        );
+        assert_eq!(s.errors, 0);
+
+        let still_missing: i64 = cat
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM files WHERE status='missing'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_missing, 0);
+    }
+
+    #[test]
+    fn refuses_a_folder_that_lives_inside_an_archive() {
+        // The UI hides the button for these, but the API is reachable without the UI. A file inside
+        // a zip cannot be renamed out of it, so this must be refused explicitly rather than left to
+        // fail incidentally because no rows happened to match.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("drive");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".cleanupstorages_id"), "vol-1").unwrap();
+        fs::write(root.join("backup.zip"), b"ZIP").unwrap();
+        let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
+        cat.upsert_volume(&Volume {
+            volume_id: "vol-1".into(),
+            label: "D".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
+        cat.conn
+            .execute(
+                "INSERT INTO files(volume_id, relative_path, filename, extension, size_bytes,
+                     content_hash, category, container_chain, status, first_seen_at, last_seen_at)
+                 VALUES ('vol-1','backup.zip','a.txt','txt',3,'H','document','Photos/a.txt',
+                         'active',100,100)",
+                [],
+            )
+            .unwrap();
+
+        let err = quarantine_tree(&cat, &root, "vol-1", "backup.zip/Photos", 200).unwrap_err();
+        assert!(
+            err.to_string().contains("inside the archive") && err.to_string().contains("repack"),
+            "the refusal must name the container and point at repack; got: {err}"
+        );
+        assert!(root.join("backup.zip").exists(), "nothing may move");
     }
 
     #[test]
