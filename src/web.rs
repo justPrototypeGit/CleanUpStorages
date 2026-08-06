@@ -59,6 +59,8 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/drives", get(api_drives))
         .route("/api/detected-drives", get(api_detected_drives))
         .route("/api/duplicates", get(api_duplicates))
+        .route("/api/tree-duplicates", get(api_tree_duplicates))
+        .route("/api/quarantine-tree", post(api_quarantine_tree))
         .route("/api/copies", get(api_copies))
         .route("/api/volumes/:id/errors", get(api_volume_errors))
         .route("/api/preview/:id", get(api_preview))
@@ -921,6 +923,133 @@ async fn api_repack(
     Ok(Json(RepackResultDto {
         removed_entry: out.removed_entry,
         retained_entries: out.retained_entries,
+    }))
+}
+
+#[derive(Serialize)]
+struct TreeMemberDto {
+    volume_id: String,
+    volume_label: String,
+    path: String,
+    total_bytes: i64,
+    /// True when this folder lives inside an archive. Such a folder CANNOT be quarantined -- a file
+    /// inside a zip cannot be renamed out of it -- so the UI must offer no delete for it.
+    needs_repack: bool,
+    archive: Option<String>,
+    /// Whether the drive is currently connected. A group is still worth showing for an unplugged
+    /// drive (the catalogue knows it), but nothing can be moved until it is attached.
+    mounted: bool,
+}
+
+#[derive(Serialize)]
+struct TreeGroupDto {
+    dir_hash: String,
+    reclaimable_bytes: i64,
+    file_count: i64,
+    members: Vec<TreeMemberDto>,
+}
+
+#[derive(Serialize)]
+struct TreeDuplicatesDto {
+    groups: Vec<TreeGroupDto>,
+}
+
+/// Maximal identical-folder groups, ranked by reclaimable bytes.
+///
+/// This is the primary duplicate view: on the live catalogue it turns 125,977 individual decisions
+/// into about 1,458. The per-file list remains for what does not collapse.
+async fn api_tree_duplicates(
+    State(state): State<AppState>,
+) -> Result<Json<TreeDuplicatesDto>, (StatusCode, String)> {
+    let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
+    let labels: std::collections::HashMap<String, String> = cat
+        .volume_stats()
+        .map_err(err500)?
+        .into_iter()
+        .map(|(id, label, _, _)| (id, label))
+        .collect();
+    let mounts = state.mounts.snapshot();
+    let groups = cat
+        .tree_duplicate_groups()
+        .map_err(err500)?
+        .into_iter()
+        .map(|g| TreeGroupDto {
+            dir_hash: g.dir_hash,
+            reclaimable_bytes: g.reclaimable_bytes,
+            // Every member of a group holds the same tree, so any member's count describes them all.
+            file_count: g.members.first().map(|m| m.file_count).unwrap_or(0),
+            members: g
+                .members
+                .iter()
+                .map(|m| TreeMemberDto {
+                    volume_label: labels
+                        .get(&m.volume_id)
+                        .cloned()
+                        .unwrap_or_else(|| m.volume_id.clone()),
+                    mounted: mounts.contains_key(&m.volume_id),
+                    needs_repack: m.archive_container().is_some(),
+                    archive: m.archive_container().map(|s| s.to_string()),
+                    volume_id: m.volume_id.clone(),
+                    path: m.path.clone(),
+                    total_bytes: m.total_bytes,
+                })
+                .collect(),
+        })
+        .collect();
+    Ok(Json(TreeDuplicatesDto { groups }))
+}
+
+#[derive(Deserialize)]
+struct QuarantineTreeReq {
+    volume_id: String,
+    path: String,
+}
+
+#[derive(Serialize)]
+struct QuarantineTreeResultDto {
+    files_updated: usize,
+    dest: String,
+}
+
+/// Move one redundant folder into `_ToDelete` with a single rename.
+///
+/// The mount is resolved from the volume id server-side rather than accepted from the client: a
+/// caller-supplied path would let a request rename a directory on any drive it could name.
+async fn api_quarantine_tree(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Json<QuarantineTreeReq>,
+) -> Result<Json<QuarantineTreeResultDto>, (StatusCode, String)> {
+    check_csrf(&headers, &state)?;
+
+    let mount = state
+        .mounts
+        .resolve(&body.volume_id)
+        .ok_or((StatusCode::CONFLICT, "drive not connected".to_string()))?;
+    let now = now_secs()?;
+
+    // A tree can hold six figures of rows; the rename is instant but the bookkeeping is not. Off
+    // the async worker, or the whole UI stops responding.
+    let (vid, path, cat_path) = (
+        body.volume_id.clone(),
+        body.path.clone(),
+        state.catalog_path.clone(),
+    );
+    let joined = tokio::task::spawn_blocking(move || {
+        let cat = Catalog::open(&cat_path)?;
+        let out = crate::tree_quarantine::quarantine_tree(&cat, &mount, &vid, &path, now)?;
+        // The group the user just acted on is stale now; rebuild before anyone reads it again.
+        cat.rebuild_directory_trees(&vid, now)?;
+        Ok::<_, anyhow::Error>(out)
+    })
+    .await
+    .map_err(|e| err500(anyhow::anyhow!("tree quarantine task failed: {e}")))?;
+
+    let out = joined.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    snapshot_best_effort(&state, now);
+    Ok(Json(QuarantineTreeResultDto {
+        files_updated: out.files_updated,
+        dest: out.dest_relative_path,
     }))
 }
 
@@ -3596,5 +3725,141 @@ mod tests {
             deny.iter().any(|e| e == "docx"),
             "the effective deny-list must include the compiled-in default: {deny:?}"
         );
+    }
+
+    // Two identical folders on one volume, plus a zip whose inside also duplicates a loose folder.
+    fn seed_identical_trees() -> (tempfile::TempDir, PathBuf, AppState) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("c.db");
+        let drive = tmp.path().join("driveA");
+        std::fs::create_dir_all(drive.join("orig")).unwrap();
+        std::fs::create_dir_all(drive.join("copy")).unwrap();
+        std::fs::write(drive.join(".cleanupstorages_id"), "vol-1").unwrap();
+        std::fs::write(drive.join("orig/a.txt"), b"SAME").unwrap();
+        std::fs::write(drive.join("copy/a.txt"), b"SAME").unwrap();
+        {
+            let cat = crate::catalog::Catalog::open(&db).unwrap();
+            cat.upsert_volume(&crate::catalog::models::Volume {
+                volume_id: "vol-1".into(),
+                label: "Photos HDD".into(),
+                identified_by: "marker".into(),
+                first_seen_at: 1,
+                last_seen_at: 1,
+            })
+            .unwrap();
+            let mk = |path: &str| crate::catalog::models::NewFile {
+                volume_id: "vol-1".into(),
+                relative_path: path.into(),
+                filename: path.rsplit('/').next().unwrap().into(),
+                extension: "txt".into(),
+                size_bytes: 4,
+                content_hash: "SAMEHASH".into(),
+                created_time: None,
+                modified_time: None,
+                accessed_time: None,
+                category: crate::category::Category::Document,
+                container_chain: None,
+            };
+            cat.upsert_file(&mk("orig/a.txt"), 100).unwrap();
+            cat.upsert_file(&mk("copy/a.txt"), 100).unwrap();
+            cat.rebuild_directory_trees("vol-1", 100).unwrap();
+        }
+        let mut mounts = HashMap::new();
+        mounts.insert("vol-1".to_string(), drive);
+        let state = AppState {
+            catalog_path: db.clone(),
+            mounts: crate::mounts::MountResolver::Fixed(mounts),
+            csrf_token: "T".into(),
+            scan_queue: crate::scan_queue::ScanQueue::new(db.clone()),
+        };
+        (tmp, db, state)
+    }
+
+    #[tokio::test]
+    async fn tree_duplicates_lists_a_group_with_its_blast_radius() {
+        let (_t, _db, state) = seed_identical_trees();
+        let v = get_json_state(state, "/api/tree-duplicates").await;
+        let groups = v["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "orig and copy hold the same file");
+        assert_eq!(groups[0]["members"].as_array().unwrap().len(), 2);
+        // The UI cannot show a blast radius without these two, and the whole mitigation for making
+        // decisions coarser is showing the blast radius before confirming.
+        assert!(groups[0]["file_count"].as_i64().unwrap() > 0);
+        assert!(groups[0]["reclaimable_bytes"].as_i64().unwrap() > 0);
+        let m = &groups[0]["members"][0];
+        assert_eq!(m["volume_label"], "Photos HDD");
+        assert_eq!(m["needs_repack"], false);
+        assert_eq!(m["mounted"], true);
+    }
+
+    #[tokio::test]
+    async fn quarantine_tree_requires_csrf_token() {
+        // Same contract as every other mutating endpoint.
+        let (_t, _db, state) = seed_identical_trees();
+        let app = build_router_with(state);
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/quarantine-tree")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        r#"{"volume_id":"vol-1","path":"copy"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::FORBIDDEN);
+        assert!(
+            _t.path().join("driveA/copy/a.txt").exists(),
+            "a rejected request must not have moved anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn quarantine_tree_moves_the_folder_and_clears_the_group() {
+        let (_t, db, state) = seed_identical_trees();
+        let app = build_router_with(state.clone());
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/quarantine-tree")
+                    .header("content-type", "application/json")
+                    .header("x-cleanup-token", "T")
+                    .body(axum::body::Body::from(
+                        r#"{"volume_id":"vol-1","path":"copy"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+        assert!(_t.path().join("driveA/_ToDelete/copy/a.txt").is_file());
+        assert!(!_t.path().join("driveA/copy").exists());
+
+        // The endpoint rebuilds the trees, so the group must be gone -- otherwise the UI would keep
+        // offering a pair whose other side is already in _ToDelete.
+        let v = get_json_state(state, "/api/tree-duplicates").await;
+        assert!(v["groups"].as_array().unwrap().is_empty());
+        let _ = db;
+    }
+
+    #[tokio::test]
+    async fn per_file_duplicates_exclude_entries_inside_archives() {
+        // Not actionable one at a time: you cannot delete a file inside a zip without repacking it.
+        // Already true of the dedup queries; this locks it so descending into archives for TREE
+        // matching never leaks 43,000 unactionable rows into the per-file queue.
+        let (_t, db) = seed_catalog();
+        let v = get_json(&db, "/api/duplicates").await;
+        for g in v["groups"].as_array().unwrap() {
+            for f in g["files"].as_array().unwrap_or(&vec![]) {
+                assert!(
+                    f["container_chain"].is_null(),
+                    "archive entries must not appear in the per-file duplicate queue: {f}"
+                );
+            }
+        }
     }
 }
