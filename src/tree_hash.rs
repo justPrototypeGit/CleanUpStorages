@@ -144,6 +144,63 @@ pub fn build_dir_hashes(rows: Vec<TreeInput>) -> Vec<DirNode> {
     v
 }
 
+#[derive(Debug, Clone)]
+pub struct TreeGroup {
+    pub dir_hash: String,
+    pub members: Vec<DirNode>,
+    pub reclaimable_bytes: i64,
+}
+
+/// Group identical directories, reporting only the MAXIMAL match in each tree.
+///
+/// A folder is suppressed when its parent is itself part of a duplicate group. That is safe rather
+/// than merely convenient: `dir_hash(parent)` includes every child hash, so a duplicated parent
+/// guarantees this child's twin sits inside the parent's twin. The one case it misses -- a folder
+/// paired with a DIFFERENT partner than its parent's -- under-reports rather than over-reports,
+/// which is the right direction for a UI that offers a destructive action.
+pub fn maximal_groups(nodes: &[DirNode]) -> Vec<TreeGroup> {
+    let mut by_hash: HashMap<&str, Vec<&DirNode>> = HashMap::new();
+    for n in nodes {
+        by_hash.entry(n.dir_hash.as_str()).or_default().push(n);
+    }
+    let twinned: HashSet<(&str, &str)> = by_hash
+        .values()
+        .filter(|v| v.len() > 1)
+        .flat_map(|v| v.iter().map(|n| (n.volume_id.as_str(), n.path.as_str())))
+        .collect();
+
+    let mut out = Vec::new();
+    for (hash, members) in by_hash {
+        if members.len() < 2 {
+            continue;
+        }
+        let maximal: Vec<DirNode> = members
+            .iter()
+            .filter(|n| match n.path.rsplit_once('/') {
+                Some((parent, _)) => !twinned.contains(&(n.volume_id.as_str(), parent)),
+                // A top-level folder's parent is the volume root, "".
+                None => !n.path.is_empty() && !twinned.contains(&(n.volume_id.as_str(), "")),
+            })
+            .map(|n| (*n).clone())
+            .collect();
+        if maximal.len() < 2 {
+            continue;
+        }
+        let reclaimable_bytes = maximal[0].total_bytes * (maximal.len() as i64 - 1);
+        out.push(TreeGroup {
+            dir_hash: hash.to_string(),
+            members: maximal,
+            reclaimable_bytes,
+        });
+    }
+    out.sort_by(|a, b| {
+        b.reclaimable_bytes
+            .cmp(&a.reclaimable_bytes)
+            .then(a.dir_hash.cmp(&b.dir_hash))
+    });
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,5 +336,62 @@ mod tests {
         let a: Vec<_> = nodes.iter().filter(|n| n.path == "A").collect();
         assert_eq!(a.len(), 2, "one node per volume");
         assert_eq!(a[0].dir_hash, a[1].dir_hash, "same contents, so same hash");
+    }
+
+    #[test]
+    fn only_the_topmost_matching_folder_is_reported() {
+        // A duplicated tree would otherwise report every subfolder inside it, which is exactly the
+        // 125,977-decision problem this feature exists to remove.
+        let nodes = build_dir_hashes(vec![
+            f("v", "orig/sub/deep/a.txt", "H1", 10),
+            f("v", "orig/sub/b.txt", "H2", 20),
+            f("v", "copy/sub/deep/a.txt", "H1", 10),
+            f("v", "copy/sub/b.txt", "H2", 20),
+        ]);
+        let groups = maximal_groups(&nodes);
+        let reported: Vec<&str> = groups
+            .iter()
+            .flat_map(|g| g.members.iter().map(|m| m.path.as_str()))
+            .collect();
+        assert_eq!(groups.len(), 1, "one decision, not three");
+        assert!(reported.contains(&"orig") && reported.contains(&"copy"));
+        assert!(
+            !reported.iter().any(|p| p.contains('/')),
+            "no subfolder may be reported: {reported:?}"
+        );
+    }
+
+    #[test]
+    fn reclaimable_bytes_keeps_one_copy() {
+        let nodes = build_dir_hashes(vec![
+            f("v", "a/x.bin", "H1", 100),
+            f("v", "b/x.bin", "H1", 100),
+            f("v", "c/x.bin", "H1", 100),
+        ]);
+        let groups = maximal_groups(&nodes);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].members.len(), 3);
+        assert_eq!(
+            groups[0].reclaimable_bytes, 200,
+            "3 copies of 100 bytes reclaims 200"
+        );
+    }
+
+    #[test]
+    fn a_folder_without_a_twin_is_not_a_group() {
+        let nodes = build_dir_hashes(vec![f("v", "lonely/x.txt", "H1", 1)]);
+        assert!(maximal_groups(&nodes).is_empty());
+    }
+
+    #[test]
+    fn groups_are_ranked_by_reclaimable_bytes() {
+        let nodes = build_dir_hashes(vec![
+            f("v", "small1/s.bin", "S", 1),
+            f("v", "small2/s.bin", "S", 1),
+            f("v", "big1/b.bin", "B", 5000),
+            f("v", "big2/b.bin", "B", 5000),
+        ]);
+        let groups = maximal_groups(&nodes);
+        assert_eq!(groups[0].reclaimable_bytes, 5000, "biggest win first");
     }
 }
