@@ -90,6 +90,21 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_pending_archive_formats_extension
             ON pending_archive_formats(extension);
 
+        -- Derived from `files`, never authoritative: safe to drop and recompute at any time.
+        -- `archive_root` is the container a node sits inside, recorded so the review UI can refuse
+        -- to offer a rename for something that lives in a zip.
+        CREATE TABLE IF NOT EXISTS directory_trees (
+            volume_id    TEXT NOT NULL REFERENCES volumes(volume_id),
+            path         TEXT NOT NULL,
+            dir_hash     TEXT NOT NULL,
+            file_count   INTEGER NOT NULL,
+            total_bytes  INTEGER NOT NULL,
+            archive_root TEXT,
+            computed_at  INTEGER NOT NULL,
+            PRIMARY KEY (volume_id, path)
+        );
+        CREATE INDEX IF NOT EXISTS idx_directory_trees_hash ON directory_trees(dir_hash);
+
         CREATE VIRTUAL TABLE IF NOT EXISTS files_fts
             USING fts5(filename, relative_path, container_chain,
                        content='files', content_rowid='id');
