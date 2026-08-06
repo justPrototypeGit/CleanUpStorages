@@ -11,7 +11,6 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 /// `relative_path + "/" + container_chain`, so an archive's insides form an ordinary subtree.
 #[derive(Debug, Clone)]
 pub struct TreeInput {
-    pub volume_id: String,
     pub path: String,
     pub content_hash: String,
     pub size_bytes: i64,
@@ -58,57 +57,65 @@ enum Child {
 ///
 /// `dir_hash(D) = BLAKE3(sorted (child_name, kind, child_hash) lines)`. The directory's own name is
 /// deliberately absent, so `Photos2019/` and `Photos 2019 copy/` match when their contents match.
-pub fn build_dir_hashes(rows: Vec<TreeInput>) -> Vec<DirNode> {
+pub fn build_dir_hashes(volume_id: &str, rows: Vec<TreeInput>) -> Vec<DirNode> {
+    // Keyed on path alone: a rebuild is always scoped to ONE volume, so carrying the volume id in
+    // every row and every map key cost a String clone per file for no information. On a 20 TB
+    // corpus that is tens of millions of redundant allocations.
+    //
     // An archive that HAS entries is a directory; its own file row must not also appear as a leaf.
     // Getting this wrong makes the archive its own sibling and corrupts every ancestor hash.
     // EVERY ancestor, not just the immediate parent: an archive's entries are usually nested
     // (`backup.zip/Project/.git/config`), so checking only the immediate parent would fail to
     // recognise the archive at all -- leaving it both a leaf file and a directory, which is
     // precisely the corruption this replacement exists to prevent.
-    let mut has_children: HashSet<(String, String)> = HashSet::new();
-    for r in &rows {
-        let parts: Vec<&str> = r.path.split('/').collect();
-        for i in 1..parts.len() {
-            has_children.insert((r.volume_id.clone(), parts[..i].join("/")));
-        }
-    }
-
-    let mut children: HashMap<(String, String), BTreeMap<String, Child>> = HashMap::new();
-    let mut dirs: HashSet<(String, String)> = HashSet::new();
     // Paths that turned out to be real archives: a loose row whose entries also exist. Recorded
     // from the data rather than from an extension list, so a newly allow-listed format is handled
     // without a code change.
-    let mut archive_roots: HashSet<(String, String)> = HashSet::new();
+    //
+    // Computed in its own scope so `has_children` can BORROW the paths -- it never outlives this
+    // block, which lets the main loop below CONSUME `rows` and move each content_hash instead of
+    // cloning it. Holding rows alive to keep a borrow costs a full extra copy of every hash.
+    let archive_roots: HashSet<String> = {
+        let mut has_children: HashSet<&str> = HashSet::new();
+        for r in &rows {
+            for (i, _) in r.path.match_indices('/') {
+                has_children.insert(&r.path[..i]);
+            }
+        }
+        rows.iter()
+            .filter(|r| r.is_archive_root && has_children.contains(r.path.as_str()))
+            .map(|r| r.path.clone())
+            .collect()
+    };
+
+    let mut children: HashMap<String, BTreeMap<String, Child>> = HashMap::new();
+    let mut dirs: HashSet<String> = HashSet::new();
 
     for r in rows {
-        if r.is_archive_root && has_children.contains(&(r.volume_id.clone(), r.path.clone())) {
-            archive_roots.insert((r.volume_id.clone(), r.path.clone()));
+        if archive_roots.contains(&r.path) {
             continue; // replaced by its entry tree
         }
         let parts: Vec<&str> = r.path.split('/').collect();
         let leaf_parent = parts[..parts.len() - 1].join("/");
-        children
-            .entry((r.volume_id.clone(), leaf_parent))
-            .or_default()
-            .insert(
-                parts[parts.len() - 1].to_string(),
-                Child::File {
-                    hash: r.content_hash,
-                    size: r.size_bytes,
-                },
-            );
+        children.entry(leaf_parent).or_default().insert(
+            parts[parts.len() - 1].to_string(),
+            Child::File {
+                hash: r.content_hash,
+                size: r.size_bytes,
+            },
+        );
         // Register every ancestor. `Dir` overwrites a `File` of the same name, which is exactly the
         // archive case: the .zip row was inserted as a leaf before its entries were seen.
         for i in (1..parts.len()).rev() {
             let me = parts[..i].join("/");
             let parent = parts[..i - 1].join("/");
-            dirs.insert((r.volume_id.clone(), me));
+            dirs.insert(me);
             children
-                .entry((r.volume_id.clone(), parent))
+                .entry(parent)
                 .or_default()
                 .insert(parts[i - 1].to_string(), Child::Dir);
         }
-        dirs.insert((r.volume_id.clone(), String::new()));
+        dirs.insert(String::new());
     }
 
     let depth = |p: &str| {
@@ -118,11 +125,11 @@ pub fn build_dir_hashes(rows: Vec<TreeInput>) -> Vec<DirNode> {
             p.matches('/').count() + 1
         }
     };
-    let mut ordered: Vec<(String, String)> = dirs.into_iter().collect();
+    let mut ordered: Vec<String> = dirs.into_iter().collect();
     // Deepest first, so a directory's children are always hashed before it is.
-    ordered.sort_by(|a, b| depth(&b.1).cmp(&depth(&a.1)).then(a.cmp(b)));
+    ordered.sort_by(|a, b| depth(b).cmp(&depth(a)).then(a.cmp(b)));
 
-    let mut out: HashMap<(String, String), DirNode> = HashMap::new();
+    let mut out: HashMap<String, DirNode> = HashMap::new();
     for key in ordered {
         let Some(kids) = children.get(&key) else {
             continue;
@@ -137,12 +144,12 @@ pub fn build_dir_hashes(rows: Vec<TreeInput>) -> Vec<DirNode> {
                     nb += size;
                 }
                 Child::Dir => {
-                    let sub = if key.1.is_empty() {
+                    let sub = if key.is_empty() {
                         name.clone()
                     } else {
-                        format!("{}/{name}", key.1)
+                        format!("{key}/{name}")
                     };
-                    if let Some(n) = out.get(&(key.0.clone(), sub)) {
+                    if let Some(n) = out.get(&sub) {
                         lines.push(format!("{name}\u{0}d\u{0}{}", n.dir_hash));
                         nf += n.file_count;
                         nb += n.total_bytes;
@@ -160,14 +167,18 @@ pub fn build_dir_hashes(rows: Vec<TreeInput>) -> Vec<DirNode> {
         // moving a whole redundant .zip is a single rename, and must stay offerable.
         let archive_root = archive_roots
             .iter()
-            .filter(|(v, a)| *v == key.0 && key.1.starts_with(&format!("{a}/")))
-            .map(|(_, a)| a.clone())
+            .filter(|a| {
+                key.len() > a.len()
+                    && key.starts_with(a.as_str())
+                    && key.as_bytes()[a.len()] == b'/'
+            })
+            .cloned()
             .max_by_key(|a| a.len());
         out.insert(
             key.clone(),
             DirNode {
-                volume_id: key.0,
-                path: key.1,
+                volume_id: volume_id.to_string(),
+                path: key,
                 dir_hash,
                 file_count: nf,
                 total_bytes: nb,
@@ -241,9 +252,8 @@ pub fn maximal_groups(nodes: &[DirNode]) -> Vec<TreeGroup> {
 mod tests {
     use super::*;
 
-    fn f(vol: &str, path: &str, hash: &str, size: i64) -> TreeInput {
+    fn f(_vol: &str, path: &str, hash: &str, size: i64) -> TreeInput {
         TreeInput {
-            volume_id: vol.into(),
             path: path.into(),
             content_hash: hash.into(),
             size_bytes: size,
@@ -261,12 +271,15 @@ mod tests {
     fn two_folders_with_the_same_contents_match_despite_different_names() {
         // The whole point: a copied folder is usually renamed, so the folder's OWN name must not
         // be an input to its hash.
-        let nodes = build_dir_hashes(vec![
-            f("v", "Photos2019/a.jpg", "H1", 10),
-            f("v", "Photos2019/b.jpg", "H2", 20),
-            f("v", "Photos 2019 copy/a.jpg", "H1", 10),
-            f("v", "Photos 2019 copy/b.jpg", "H2", 20),
-        ]);
+        let nodes = build_dir_hashes(
+            "v",
+            vec![
+                f("v", "Photos2019/a.jpg", "H1", 10),
+                f("v", "Photos2019/b.jpg", "H2", 20),
+                f("v", "Photos 2019 copy/a.jpg", "H1", 10),
+                f("v", "Photos 2019 copy/b.jpg", "H2", 20),
+            ],
+        );
         assert_eq!(
             hash_of(&nodes, "Photos2019"),
             hash_of(&nodes, "Photos 2019 copy")
@@ -277,10 +290,13 @@ mod tests {
     fn a_child_filename_difference_breaks_the_match() {
         // Children's names ARE part of the hash: same bytes under a different name is a different
         // folder, or renaming one file inside a backup would silently make it "identical".
-        let nodes = build_dir_hashes(vec![
-            f("v", "A/a.jpg", "H1", 10),
-            f("v", "B/renamed.jpg", "H1", 10),
-        ]);
+        let nodes = build_dir_hashes(
+            "v",
+            vec![
+                f("v", "A/a.jpg", "H1", 10),
+                f("v", "B/renamed.jpg", "H1", 10),
+            ],
+        );
         assert_ne!(hash_of(&nodes, "A"), hash_of(&nodes, "B"));
     }
 
@@ -292,7 +308,6 @@ mod tests {
         // compression) but identical contents, so they must match.
         let rows = vec![
             TreeInput {
-                volume_id: "v".into(),
                 path: "x/one.zip".into(),
                 content_hash: "ZIP_A".into(),
                 size_bytes: 99,
@@ -300,7 +315,6 @@ mod tests {
             },
             f("v", "x/one.zip/inner.txt", "H1", 10),
             TreeInput {
-                volume_id: "v".into(),
                 path: "y/two.zip".into(),
                 content_hash: "ZIP_B".into(),
                 size_bytes: 77,
@@ -308,7 +322,7 @@ mod tests {
             },
             f("v", "y/two.zip/inner.txt", "H1", 10),
         ];
-        let nodes = build_dir_hashes(rows);
+        let nodes = build_dir_hashes("v", rows);
         assert_eq!(
             hash_of(&nodes, "x/one.zip"),
             hash_of(&nodes, "y/two.zip"),
@@ -331,16 +345,18 @@ mod tests {
         // entries sit directly inside it. Real archives nest (backup.zip/Project/.git/config), and
         // failing to recognise them leaves the .zip as BOTH a leaf file and a directory -- which
         // corrupts every ancestor hash silently. The live catalogue is full of this shape.
-        let nodes = build_dir_hashes(vec![
-            TreeInput {
-                volume_id: "v".into(),
-                path: "x/backup.zip".into(),
-                content_hash: "ZIPBYTES".into(),
-                size_bytes: 9999,
-                is_archive_root: true,
-            },
-            f("v", "x/backup.zip/Project/.git/config", "H1", 10),
-        ]);
+        let nodes = build_dir_hashes(
+            "v",
+            vec![
+                TreeInput {
+                    path: "x/backup.zip".into(),
+                    content_hash: "ZIPBYTES".into(),
+                    size_bytes: 9999,
+                    is_archive_root: true,
+                },
+                f("v", "x/backup.zip/Project/.git/config", "H1", 10),
+            ],
+        );
         let x = nodes.iter().find(|n| n.path == "x").unwrap();
         assert_eq!(
             x.file_count, 1,
@@ -356,13 +372,15 @@ mod tests {
     fn an_archive_with_no_entries_stays_an_ordinary_file() {
         // A zip we never descended into (deny-listed .docx, or unreadable) has no entry rows. It
         // must remain a leaf with its own content hash, not vanish.
-        let nodes = build_dir_hashes(vec![TreeInput {
-            volume_id: "v".into(),
-            path: "d/report.docx".into(),
-            content_hash: "DOCX".into(),
-            size_bytes: 5,
-            is_archive_root: true,
-        }]);
+        let nodes = build_dir_hashes(
+            "v",
+            vec![TreeInput {
+                path: "d/report.docx".into(),
+                content_hash: "DOCX".into(),
+                size_bytes: 5,
+                is_archive_root: true,
+            }],
+        );
         let d = nodes.iter().find(|n| n.path == "d").unwrap();
         assert_eq!(d.file_count, 1);
         assert_eq!(d.total_bytes, 5);
@@ -374,43 +392,63 @@ mod tests {
 
     #[test]
     fn empty_directories_are_not_emitted() {
-        let nodes = build_dir_hashes(vec![f("v", "a/b/c.txt", "H1", 1)]);
+        let nodes = build_dir_hashes("v", vec![f("v", "a/b/c.txt", "H1", 1)]);
         assert!(nodes.iter().all(|n| n.file_count > 0));
     }
 
     #[test]
     fn counts_and_bytes_roll_up_through_subdirectories() {
-        let nodes = build_dir_hashes(vec![
-            f("v", "top/one.txt", "H1", 10),
-            f("v", "top/sub/two.txt", "H2", 20),
-            f("v", "top/sub/deep/three.txt", "H3", 30),
-        ]);
+        let nodes = build_dir_hashes(
+            "v",
+            vec![
+                f("v", "top/one.txt", "H1", 10),
+                f("v", "top/sub/two.txt", "H2", 20),
+                f("v", "top/sub/deep/three.txt", "H3", 30),
+            ],
+        );
         let top = nodes.iter().find(|n| n.path == "top").unwrap();
         assert_eq!(top.file_count, 3);
         assert_eq!(top.total_bytes, 60);
     }
 
     #[test]
-    fn volumes_do_not_bleed_into_each_other() {
-        let nodes = build_dir_hashes(vec![
-            f("v1", "A/a.txt", "H1", 1),
-            f("v2", "A/a.txt", "H1", 1),
-        ]);
-        let a: Vec<_> = nodes.iter().filter(|n| n.path == "A").collect();
-        assert_eq!(a.len(), 2, "one node per volume");
-        assert_eq!(a[0].dir_hash, a[1].dir_hash, "same contents, so same hash");
+    fn the_same_folder_on_two_drives_matches_across_them() {
+        // A rebuild is scoped to one volume, so cross-drive matching happens when the resulting
+        // nodes are grouped together. This is the case the whole project cares about: the same
+        // folder copied onto a second HDD.
+        let mut nodes = build_dir_hashes("v1", vec![f("", "A/a.txt", "H1", 1)]);
+        nodes.extend(build_dir_hashes(
+            "v2",
+            vec![f("", "Backup of A/a.txt", "H1", 1)],
+        ));
+
+        let a = nodes.iter().find(|n| n.path == "A").unwrap();
+        let b = nodes.iter().find(|n| n.path == "Backup of A").unwrap();
+        assert_eq!(a.volume_id, "v1");
+        assert_eq!(b.volume_id, "v2");
+        assert_eq!(
+            a.dir_hash, b.dir_hash,
+            "same contents on different drives must hash alike"
+        );
+
+        let groups = maximal_groups(&nodes);
+        assert_eq!(groups.len(), 1, "and must be reported as one decision");
+        assert_eq!(groups[0].members.len(), 2);
     }
 
     #[test]
     fn only_the_topmost_matching_folder_is_reported() {
         // A duplicated tree would otherwise report every subfolder inside it, which is exactly the
         // 125,977-decision problem this feature exists to remove.
-        let nodes = build_dir_hashes(vec![
-            f("v", "orig/sub/deep/a.txt", "H1", 10),
-            f("v", "orig/sub/b.txt", "H2", 20),
-            f("v", "copy/sub/deep/a.txt", "H1", 10),
-            f("v", "copy/sub/b.txt", "H2", 20),
-        ]);
+        let nodes = build_dir_hashes(
+            "v",
+            vec![
+                f("v", "orig/sub/deep/a.txt", "H1", 10),
+                f("v", "orig/sub/b.txt", "H2", 20),
+                f("v", "copy/sub/deep/a.txt", "H1", 10),
+                f("v", "copy/sub/b.txt", "H2", 20),
+            ],
+        );
         let groups = maximal_groups(&nodes);
         let reported: Vec<&str> = groups
             .iter()
@@ -426,11 +464,14 @@ mod tests {
 
     #[test]
     fn reclaimable_bytes_keeps_one_copy() {
-        let nodes = build_dir_hashes(vec![
-            f("v", "a/x.bin", "H1", 100),
-            f("v", "b/x.bin", "H1", 100),
-            f("v", "c/x.bin", "H1", 100),
-        ]);
+        let nodes = build_dir_hashes(
+            "v",
+            vec![
+                f("v", "a/x.bin", "H1", 100),
+                f("v", "b/x.bin", "H1", 100),
+                f("v", "c/x.bin", "H1", 100),
+            ],
+        );
         let groups = maximal_groups(&nodes);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].members.len(), 3);
@@ -442,7 +483,7 @@ mod tests {
 
     #[test]
     fn a_folder_without_a_twin_is_not_a_group() {
-        let nodes = build_dir_hashes(vec![f("v", "lonely/x.txt", "H1", 1)]);
+        let nodes = build_dir_hashes("v", vec![f("v", "lonely/x.txt", "H1", 1)]);
         assert!(maximal_groups(&nodes).is_empty());
     }
 
@@ -451,16 +492,18 @@ mod tests {
         // 1,966 of the collapsed folders in the live catalogue are this case. A file inside a zip
         // cannot be renamed out of it, so offering a delete here would be offering an action the
         // tool cannot safely perform.
-        let nodes = build_dir_hashes(vec![
-            TreeInput {
-                volume_id: "v".into(),
-                path: "x/backup.zip".into(),
-                content_hash: "Z".into(),
-                size_bytes: 1,
-                is_archive_root: true,
-            },
-            f("v", "x/backup.zip/Photos/a.jpg", "H1", 10),
-        ]);
+        let nodes = build_dir_hashes(
+            "v",
+            vec![
+                TreeInput {
+                    path: "x/backup.zip".into(),
+                    content_hash: "Z".into(),
+                    size_bytes: 1,
+                    is_archive_root: true,
+                },
+                f("v", "x/backup.zip/Photos/a.jpg", "H1", 10),
+            ],
+        );
         let inner = nodes
             .iter()
             .find(|n| n.path == "x/backup.zip/Photos")
@@ -480,7 +523,7 @@ mod tests {
     fn a_folder_merely_named_like_an_archive_is_not_flagged() {
         // Guards against classifying by extension: this is a real directory called "stuff.zip"
         // with no entry rows, so nothing about it needs a repack.
-        let nodes = build_dir_hashes(vec![f("v", "stuff.zip/inner/a.txt", "H1", 1)]);
+        let nodes = build_dir_hashes("v", vec![f("v", "stuff.zip/inner/a.txt", "H1", 1)]);
         let inner = nodes.iter().find(|n| n.path == "stuff.zip/inner").unwrap();
         assert_eq!(
             inner.archive_container(),
@@ -491,12 +534,15 @@ mod tests {
 
     #[test]
     fn groups_are_ranked_by_reclaimable_bytes() {
-        let nodes = build_dir_hashes(vec![
-            f("v", "small1/s.bin", "S", 1),
-            f("v", "small2/s.bin", "S", 1),
-            f("v", "big1/b.bin", "B", 5000),
-            f("v", "big2/b.bin", "B", 5000),
-        ]);
+        let nodes = build_dir_hashes(
+            "v",
+            vec![
+                f("v", "small1/s.bin", "S", 1),
+                f("v", "small2/s.bin", "S", 1),
+                f("v", "big1/b.bin", "B", 5000),
+                f("v", "big2/b.bin", "B", 5000),
+            ],
+        );
         let groups = maximal_groups(&nodes);
         assert_eq!(groups[0].reclaimable_bytes, 5000, "biggest win first");
     }
