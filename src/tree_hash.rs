@@ -1,0 +1,283 @@
+//! Merkle hash per directory, derived from content hashes the catalogue already holds.
+//!
+//! No filesystem access and no drive re-read: every input is a row already in `files`. That is what
+//! makes collapsing identical trees cheap, and what lets it work for drives that are not plugged in.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+/// One catalogued file, flattened into a path within its volume.
+///
+/// For a loose file `path` is `relative_path`. For an archive entry it is
+/// `relative_path + "/" + container_chain`, so an archive's insides form an ordinary subtree.
+#[derive(Debug, Clone)]
+pub struct TreeInput {
+    pub volume_id: String,
+    pub path: String,
+    pub content_hash: String,
+    pub size_bytes: i64,
+    /// True for a loose row, which is a *candidate* archive root. Such a row is dropped only when
+    /// entry rows actually exist for the same path, because the archive is then a directory rather
+    /// than a leaf.
+    pub is_archive_root: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirNode {
+    pub volume_id: String,
+    pub path: String,
+    pub dir_hash: String,
+    pub file_count: i64,
+    pub total_bytes: i64,
+}
+
+#[derive(Clone)]
+enum Child {
+    File { hash: String, size: i64 },
+    Dir,
+}
+
+/// Build a Merkle hash for every non-empty directory.
+///
+/// `dir_hash(D) = BLAKE3(sorted (child_name, kind, child_hash) lines)`. The directory's own name is
+/// deliberately absent, so `Photos2019/` and `Photos 2019 copy/` match when their contents match.
+pub fn build_dir_hashes(rows: Vec<TreeInput>) -> Vec<DirNode> {
+    // An archive that HAS entries is a directory; its own file row must not also appear as a leaf.
+    // Getting this wrong makes the archive its own sibling and corrupts every ancestor hash.
+    let mut has_children: HashSet<(String, String)> = HashSet::new();
+    for r in &rows {
+        if let Some((parent, _)) = r.path.rsplit_once('/') {
+            has_children.insert((r.volume_id.clone(), parent.to_string()));
+        }
+    }
+
+    let mut children: HashMap<(String, String), BTreeMap<String, Child>> = HashMap::new();
+    let mut dirs: HashSet<(String, String)> = HashSet::new();
+
+    for r in rows {
+        if r.is_archive_root && has_children.contains(&(r.volume_id.clone(), r.path.clone())) {
+            continue; // replaced by its entry tree
+        }
+        let parts: Vec<&str> = r.path.split('/').collect();
+        let leaf_parent = parts[..parts.len() - 1].join("/");
+        children
+            .entry((r.volume_id.clone(), leaf_parent))
+            .or_default()
+            .insert(
+                parts[parts.len() - 1].to_string(),
+                Child::File {
+                    hash: r.content_hash,
+                    size: r.size_bytes,
+                },
+            );
+        // Register every ancestor. `Dir` overwrites a `File` of the same name, which is exactly the
+        // archive case: the .zip row was inserted as a leaf before its entries were seen.
+        for i in (1..parts.len()).rev() {
+            let me = parts[..i].join("/");
+            let parent = parts[..i - 1].join("/");
+            dirs.insert((r.volume_id.clone(), me));
+            children
+                .entry((r.volume_id.clone(), parent))
+                .or_default()
+                .insert(parts[i - 1].to_string(), Child::Dir);
+        }
+        dirs.insert((r.volume_id.clone(), String::new()));
+    }
+
+    let depth = |p: &str| {
+        if p.is_empty() {
+            0
+        } else {
+            p.matches('/').count() + 1
+        }
+    };
+    let mut ordered: Vec<(String, String)> = dirs.into_iter().collect();
+    // Deepest first, so a directory's children are always hashed before it is.
+    ordered.sort_by(|a, b| depth(&b.1).cmp(&depth(&a.1)).then(a.cmp(b)));
+
+    let mut out: HashMap<(String, String), DirNode> = HashMap::new();
+    for key in ordered {
+        let Some(kids) = children.get(&key) else {
+            continue;
+        };
+        let mut lines = Vec::new();
+        let (mut nf, mut nb) = (0i64, 0i64);
+        for (name, child) in kids {
+            match child {
+                Child::File { hash, size } => {
+                    lines.push(format!("{name}\u{0}f\u{0}{hash}"));
+                    nf += 1;
+                    nb += size;
+                }
+                Child::Dir => {
+                    let sub = if key.1.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}/{name}", key.1)
+                    };
+                    if let Some(n) = out.get(&(key.0.clone(), sub)) {
+                        lines.push(format!("{name}\u{0}d\u{0}{}", n.dir_hash));
+                        nf += n.file_count;
+                        nb += n.total_bytes;
+                    }
+                }
+            }
+        }
+        if nf == 0 {
+            continue; // empty tree: they would all hash alike and mean nothing
+        }
+        let dir_hash = blake3::hash(lines.join("\n").as_bytes())
+            .to_hex()
+            .to_string();
+        out.insert(
+            key.clone(),
+            DirNode {
+                volume_id: key.0,
+                path: key.1,
+                dir_hash,
+                file_count: nf,
+                total_bytes: nb,
+            },
+        );
+    }
+    let mut v: Vec<DirNode> = out.into_values().collect();
+    v.sort_by(|a, b| (&a.volume_id, &a.path).cmp(&(&b.volume_id, &b.path)));
+    v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn f(vol: &str, path: &str, hash: &str, size: i64) -> TreeInput {
+        TreeInput {
+            volume_id: vol.into(),
+            path: path.into(),
+            content_hash: hash.into(),
+            size_bytes: size,
+            is_archive_root: false,
+        }
+    }
+    fn hash_of(nodes: &[DirNode], path: &str) -> Option<String> {
+        nodes
+            .iter()
+            .find(|n| n.path == path)
+            .map(|n| n.dir_hash.clone())
+    }
+
+    #[test]
+    fn two_folders_with_the_same_contents_match_despite_different_names() {
+        // The whole point: a copied folder is usually renamed, so the folder's OWN name must not
+        // be an input to its hash.
+        let nodes = build_dir_hashes(vec![
+            f("v", "Photos2019/a.jpg", "H1", 10),
+            f("v", "Photos2019/b.jpg", "H2", 20),
+            f("v", "Photos 2019 copy/a.jpg", "H1", 10),
+            f("v", "Photos 2019 copy/b.jpg", "H2", 20),
+        ]);
+        assert_eq!(
+            hash_of(&nodes, "Photos2019"),
+            hash_of(&nodes, "Photos 2019 copy")
+        );
+    }
+
+    #[test]
+    fn a_child_filename_difference_breaks_the_match() {
+        // Children's names ARE part of the hash: same bytes under a different name is a different
+        // folder, or renaming one file inside a backup would silently make it "identical".
+        let nodes = build_dir_hashes(vec![
+            f("v", "A/a.jpg", "H1", 10),
+            f("v", "B/renamed.jpg", "H1", 10),
+        ]);
+        assert_ne!(hash_of(&nodes, "A"), hash_of(&nodes, "B"));
+    }
+
+    #[test]
+    fn an_archive_becomes_a_directory_and_its_own_file_hash_is_ignored() {
+        // The trap this test exists for: an archive is BOTH a file row and a set of entry rows.
+        // If both fed the hash, the archive would appear as its own sibling and every ancestor's
+        // hash would be wrong. Here the two archives have DIFFERENT content_hash (different
+        // compression) but identical contents, so they must match.
+        let rows = vec![
+            TreeInput {
+                volume_id: "v".into(),
+                path: "x/one.zip".into(),
+                content_hash: "ZIP_A".into(),
+                size_bytes: 99,
+                is_archive_root: true,
+            },
+            f("v", "x/one.zip/inner.txt", "H1", 10),
+            TreeInput {
+                volume_id: "v".into(),
+                path: "y/two.zip".into(),
+                content_hash: "ZIP_B".into(),
+                size_bytes: 77,
+                is_archive_root: true,
+            },
+            f("v", "y/two.zip/inner.txt", "H1", 10),
+        ];
+        let nodes = build_dir_hashes(rows);
+        assert_eq!(
+            hash_of(&nodes, "x/one.zip"),
+            hash_of(&nodes, "y/two.zip"),
+            "identical contents, different compression, must still match"
+        );
+        let z = nodes.iter().find(|n| n.path == "x/one.zip").unwrap();
+        assert_eq!(
+            z.file_count, 1,
+            "the archive's own row must not be counted as a child file"
+        );
+        assert_eq!(
+            z.total_bytes, 10,
+            "bytes come from the entries, not the .zip's own size"
+        );
+    }
+
+    #[test]
+    fn an_archive_with_no_entries_stays_an_ordinary_file() {
+        // A zip we never descended into (deny-listed .docx, or unreadable) has no entry rows. It
+        // must remain a leaf with its own content hash, not vanish.
+        let nodes = build_dir_hashes(vec![TreeInput {
+            volume_id: "v".into(),
+            path: "d/report.docx".into(),
+            content_hash: "DOCX".into(),
+            size_bytes: 5,
+            is_archive_root: true,
+        }]);
+        let d = nodes.iter().find(|n| n.path == "d").unwrap();
+        assert_eq!(d.file_count, 1);
+        assert_eq!(d.total_bytes, 5);
+        assert!(
+            hash_of(&nodes, "d/report.docx").is_none(),
+            "no entries, so not a directory"
+        );
+    }
+
+    #[test]
+    fn empty_directories_are_not_emitted() {
+        let nodes = build_dir_hashes(vec![f("v", "a/b/c.txt", "H1", 1)]);
+        assert!(nodes.iter().all(|n| n.file_count > 0));
+    }
+
+    #[test]
+    fn counts_and_bytes_roll_up_through_subdirectories() {
+        let nodes = build_dir_hashes(vec![
+            f("v", "top/one.txt", "H1", 10),
+            f("v", "top/sub/two.txt", "H2", 20),
+            f("v", "top/sub/deep/three.txt", "H3", 30),
+        ]);
+        let top = nodes.iter().find(|n| n.path == "top").unwrap();
+        assert_eq!(top.file_count, 3);
+        assert_eq!(top.total_bytes, 60);
+    }
+
+    #[test]
+    fn volumes_do_not_bleed_into_each_other() {
+        let nodes = build_dir_hashes(vec![
+            f("v1", "A/a.txt", "H1", 1),
+            f("v2", "A/a.txt", "H1", 1),
+        ]);
+        let a: Vec<_> = nodes.iter().filter(|n| n.path == "A").collect();
+        assert_eq!(a.len(), 2, "one node per volume");
+        assert_eq!(a[0].dir_hash, a[1].dir_hash, "same contents, so same hash");
+    }
+}
