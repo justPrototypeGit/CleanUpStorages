@@ -1042,6 +1042,73 @@ mod tests {
         assert_eq!(cat.search("a", None, None, None).unwrap().len(), 1);
     }
 
+    /// Observes the heartbeat file from inside the scan, via the progress callback.
+    struct HeartbeatWatcher {
+        path: std::path::PathBuf,
+        seen_alive: std::sync::atomic::AtomicBool,
+    }
+    impl Progress for HeartbeatWatcher {
+        fn on_hashed(&self) {
+            if self.path.exists() {
+                self.seen_alive
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        fn on_skipped(&self) {}
+        fn on_error(&self) {}
+        fn on_archive_entry(&self) {}
+    }
+
+    #[test]
+    fn the_heartbeat_beats_for_the_whole_scan_and_is_gone_afterwards() {
+        // Guards a one-character regression: changing `let _heartbeat = ..` to `let _ = ..` in
+        // run_scan drops the Heartbeat immediately, which would silently report every scan as
+        // interrupted two minutes in (#36). Nothing else notices -- the scan still succeeds, the
+        // rows are still right -- so it has to be observed from INSIDE the scan.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("c.db");
+        let cat = Catalog::open(&db).unwrap();
+        let root = tmp.path().join("drive");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".cleanupstorages_id"), "vol-1").unwrap();
+        for i in 0..5 {
+            fs::write(root.join(format!("f{i}.txt")), format!("data-{i}")).unwrap();
+        }
+
+        // run_id 1 is the first row this fresh catalogue writes.
+        let watcher = HeartbeatWatcher {
+            path: db.parent().unwrap().join("scan-heartbeats").join("1"),
+            seen_alive: std::sync::atomic::AtomicBool::new(false),
+        };
+        let stop = crate::scan_control::StopFlag::new();
+        run_scan(
+            &cat,
+            &root,
+            false,
+            crate::volume::ReadonlyMode::Fingerprint,
+            100,
+            Some(&watcher),
+            &stop,
+            &test_limits(),
+        )
+        .unwrap();
+
+        assert!(
+            watcher
+                .seen_alive
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "the heartbeat file must exist WHILE the scan runs"
+        );
+        assert!(
+            !db.parent()
+                .unwrap()
+                .join("scan-heartbeats")
+                .join("1")
+                .exists(),
+            "and must be removed on a clean finish, so only a hard kill leaves one behind"
+        );
+    }
+
     #[test]
     fn a_missing_loose_file_revives_when_it_comes_back() {
         // The other half of the #46 guard, end to end. touch_seen may now only move a row between
