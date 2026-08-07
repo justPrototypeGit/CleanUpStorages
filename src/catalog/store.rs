@@ -143,7 +143,8 @@ impl Catalog {
                  size_bytes=excluded.size_bytes, content_hash=excluded.content_hash,
                  created_time=excluded.created_time, modified_time=excluded.modified_time,
                  accessed_time=excluded.accessed_time, category=excluded.category,
-                 status='active', last_seen_at=excluded.last_seen_at",
+                 status='active', last_seen_at=excluded.last_seen_at
+                 WHERE files.status IN ('active','missing')",
             )?
             .execute(params![
                 f.volume_id,
@@ -173,7 +174,8 @@ impl Catalog {
             .conn
             .prepare_cached(
                 "UPDATE files SET last_seen_at=?3, status='active'
-             WHERE volume_id=?1 AND relative_path=?2 AND container_chain IS NULL",
+             WHERE volume_id=?1 AND relative_path=?2 AND container_chain IS NULL
+               AND status IN ('active','missing')",
             )?
             .execute(rusqlite::params![volume_id, relative_path, now])?;
         Ok(n > 0)
@@ -240,7 +242,8 @@ impl Catalog {
                  filename=excluded.filename, extension=excluded.extension,
                  size_bytes=excluded.size_bytes, content_hash=excluded.content_hash,
                  modified_time=excluded.modified_time,
-                 category=excluded.category, status='active', last_seen_at=excluded.last_seen_at",
+                 category=excluded.category, status='active', last_seen_at=excluded.last_seen_at
+                 WHERE files.status IN ('active','missing')",
             )?
             .execute(params![
                 volume_id,
@@ -1970,6 +1973,137 @@ mod tests {
             now,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn touch_seen_and_upsert_file_must_not_revive_a_quarantined_loose_row() {
+        // The issue names touch_seen alongside upsert_archive_entry. Same question, same contract.
+        let (_t, cat) = open_tmp();
+        cat.upsert_file(&mk_file("vol-1", "photo.jpg", "H1"), 100)
+            .unwrap();
+        cat.conn
+            .execute(
+                "UPDATE files SET status='quarantined' WHERE relative_path='photo.jpg'",
+                [],
+            )
+            .unwrap();
+
+        cat.touch_seen("vol-1", "photo.jpg", 200).unwrap();
+        let after_touch: String = cat
+            .conn
+            .query_row(
+                "SELECT status FROM files WHERE relative_path='photo.jpg'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            after_touch, "quarantined",
+            "touch_seen revived a quarantined row"
+        );
+
+        cat.upsert_file(&mk_file("vol-1", "photo.jpg", "H1"), 300)
+            .unwrap();
+        let after_upsert: String = cat
+            .conn
+            .query_row(
+                "SELECT status FROM files WHERE relative_path='photo.jpg'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            after_upsert, "quarantined",
+            "upsert_file revived a quarantined row"
+        );
+    }
+
+    #[test]
+    fn upserting_an_archive_entry_must_not_revive_a_quarantined_row() {
+        // #46: the ON CONFLICT arm sets status='active' with no status filter, so re-descending an
+        // archive would flip an entry the user deliberately quarantined back to live. Exercised at
+        // the statement level, because that is where the defect is.
+        let (_t, cat) = open_tmp();
+        let e = mk_entry("inner.jpg", "H1");
+        cat.upsert_archive_entry("vol-1", "old.zip", &e, None, 100)
+            .unwrap();
+        cat.conn
+            .execute(
+                "UPDATE files SET status='quarantined' WHERE container_chain='inner.jpg'",
+                [],
+            )
+            .unwrap();
+
+        // A later scan re-descends the same archive and sees the same entry.
+        cat.upsert_archive_entry("vol-1", "old.zip", &e, None, 200)
+            .unwrap();
+
+        let status: String = cat
+            .conn
+            .query_row(
+                "SELECT status FROM files WHERE container_chain='inner.jpg'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "quarantined",
+            "a scan must never reverse the user's quarantine decision"
+        );
+    }
+
+    #[test]
+    fn upserting_an_archive_entry_must_not_revive_a_purged_row() {
+        // Purged is even more emphatic than quarantined: the file is gone from disk. Reviving it
+        // would have the catalogue claim a deleted file is live.
+        let (_t, cat) = open_tmp();
+        let e = mk_entry("gone.jpg", "H2");
+        cat.upsert_archive_entry("vol-1", "old.zip", &e, None, 100)
+            .unwrap();
+        cat.conn
+            .execute(
+                "UPDATE files SET status='purged' WHERE container_chain='gone.jpg'",
+                [],
+            )
+            .unwrap();
+        cat.upsert_archive_entry("vol-1", "old.zip", &e, None, 200)
+            .unwrap();
+        let status: String = cat
+            .conn
+            .query_row(
+                "SELECT status FROM files WHERE container_chain='gone.jpg'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "purged");
+    }
+
+    #[test]
+    fn upserting_an_archive_entry_still_revives_a_missing_row() {
+        // The other half of the contract: 'missing' MUST come back. An archive that vanished and
+        // returned is the ordinary case, and refusing to revive it would strand real files.
+        let (_t, cat) = open_tmp();
+        let e = mk_entry("back.jpg", "H3");
+        cat.upsert_archive_entry("vol-1", "old.zip", &e, None, 100)
+            .unwrap();
+        cat.conn
+            .execute(
+                "UPDATE files SET status='missing' WHERE container_chain='back.jpg'",
+                [],
+            )
+            .unwrap();
+        cat.upsert_archive_entry("vol-1", "old.zip", &e, None, 200)
+            .unwrap();
+        let status: String = cat
+            .conn
+            .query_row(
+                "SELECT status FROM files WHERE container_chain='back.jpg'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "active", "a returning file must come back to life");
     }
 
     #[test]
