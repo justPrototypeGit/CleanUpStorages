@@ -1409,43 +1409,27 @@ mod tests {
         assert!(stats.iter().any(|(id, _, _, _)| id == &identity.volume_id));
     }
 
-    #[derive(Clone)]
-    struct CaptureW(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for CaptureW {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(b);
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureW {
-        type Writer = CaptureW;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     #[test]
-    fn run_scan_logs_volume_resolution() {
-        // Serialize with other subscriber-installing tests (tracing's interest cache is global).
-        let _tracing_lock = crate::observability::tracing_test_guard();
+    fn run_scan_records_the_resolved_volume() {
+        // Was `run_scan_logs_volume_resolution`, which captured tracing output and failed
+        // intermittently under parallel execution (#39). tracing's max level is process-GLOBAL --
+        // the maximum over registered subscribers -- and a thread-local default does not raise it,
+        // so while other tests ran the `info!` could be filtered out before reaching this test's
+        // subscriber. The assertion then failed on an empty string rather than on wrong content.
+        //
+        // A test that fails randomly teaches people to re-run red builds instead of reading them,
+        // which on this project means the next real failure gets waved through as "the flaky one".
+        //
+        // So it asserts the same facts where they are actually durable. The log line reports
+        // volume_id, label and identified_by, and `upsert_volume` persists exactly those on the
+        // next statement -- with no dependence on global logging state.
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("drive");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("x.txt"), b"hi").unwrap();
         let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
 
-        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sub = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
-            .with_writer(CaptureW(buf.clone()))
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(sub);
-
-        run_scan(
+        let out = run_scan(
             &cat,
             &root,
             false,
@@ -1456,10 +1440,21 @@ mod tests {
             &test_limits(),
         )
         .unwrap();
-        let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+
+        let (identity, _summary) = out.expect("a writable drive must resolve to a volume");
+        let (stored_label, identified_by): (String, String) = cat
+            .conn
+            .query_row(
+                "SELECT label, identified_by FROM volumes WHERE volume_id=?1",
+                [&identity.volume_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("the resolved volume must be recorded in the catalogue");
+        assert_eq!(stored_label, identity.label);
+        assert_eq!(identified_by, identity.identified_by);
         assert!(
-            logged.to_lowercase().contains("volume"),
-            "expected a volume info line: {logged}"
+            !identity.volume_id.is_empty(),
+            "a resolved volume needs an id"
         );
     }
 
