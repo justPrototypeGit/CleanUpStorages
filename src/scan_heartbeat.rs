@@ -48,10 +48,24 @@ impl Heartbeat {
     /// scan the user wants.
     pub fn start(catalog_path: &Path, run_id: i64) -> Heartbeat {
         let path = heartbeat_path(catalog_path, run_id);
+        // Failures are warned about, not swallowed. A heartbeat that never establishes makes a
+        // perfectly healthy scan report as interrupted two minutes in, and the read path cannot
+        // tell that apart from a hard kill -- so the log line is the only way anyone would ever
+        // work out why.
         if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                tracing::warn!(
+                    "could not create {}: {e}; this scan will report as interrupted",
+                    dir.display()
+                );
+            }
         }
-        let _ = touch(&path);
+        if let Err(e) = touch(&path) {
+            tracing::warn!(
+                "could not write the scan heartbeat at {}: {e}; this scan will report as interrupted",
+                path.display()
+            );
+        }
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop);
