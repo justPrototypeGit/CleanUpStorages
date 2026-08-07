@@ -45,6 +45,23 @@ impl Catalog {
     }
 
     /// Run PRAGMA integrity_check; true if the DB reports "ok".
+    /// The file this catalogue is open on, asked of SQLite itself.
+    ///
+    /// Avoids threading a path through call chains that already hold a `Catalog` -- and cannot
+    /// drift from the connection the way a separately-passed path could.
+    pub fn db_path(&self) -> Option<std::path::PathBuf> {
+        self.conn
+            .query_row(
+                "SELECT file FROM pragma_database_list WHERE name='main'",
+                [],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from)
+    }
+
     pub fn integrity_ok(&self) -> anyhow::Result<bool> {
         let result: String = self
             .conn

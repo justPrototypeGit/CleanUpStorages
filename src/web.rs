@@ -3166,7 +3166,13 @@ mod tests {
                 ..Default::default()
             };
             cat.finish_scan_run(id, 150, "completed", None, &s).unwrap();
-            cat.start_scan_run(Some("vol-1"), "D:/two", 200, true)
+            // A current timestamp: this row represents a scan that is still running, and a row
+            // stamped 1970 with nothing beating for it is correctly reported interrupted (#36).
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            cat.start_scan_run(Some("vol-1"), "D:/two", now, true)
                 .unwrap();
         }
 

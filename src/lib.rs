@@ -11,6 +11,7 @@ pub mod purge;
 pub mod quarantine;
 pub mod repack;
 pub mod scan_control;
+pub mod scan_heartbeat;
 pub mod scan_metrics;
 pub mod scan_queue;
 pub mod scanner;
