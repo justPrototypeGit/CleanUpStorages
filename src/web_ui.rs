@@ -1298,8 +1298,12 @@ function runRow(r){
   // 100% and hide exactly the overlap #23 is meant to create.
   const pct=v=>m.wall_ms?Math.round(v*100/m.wall_ms):0;
   const when=r.started_at?fmtDate(r.started_at):"";
+  // "interrupted" is deliberately distinct from "cancelled": the user chose one and not the other,
+  // and after a five-day scan that difference is what tells them whether to worry.
   const status=r.status==="running"?'<span class="mut">running…</span>'
-    :r.status==="failed"?`<span style="color:var(--red)">failed</span>`:esc(r.status);
+    :r.status==="failed"?`<span style="color:var(--red)">failed</span>`
+    :r.status==="interrupted"?`<span style="color:var(--red)" title="The scan ended without finishing — power loss, the drive being removed, or the process being killed. Nothing was marked missing; re-run to continue.">interrupted</span>`
+    :esc(r.status);
   // Phase split as a single bar: the shape is the point, not the exact numbers.
   const bar=[["walk",m.walk_ms],["skip",m.skip_check_ms],["hash",m.hash_ms],
              ["db",m.db_write_ms],["arch",m.archive_ms]]
