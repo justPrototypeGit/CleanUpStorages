@@ -287,13 +287,14 @@ impl ScanQueue {
                 &stop_for_job,
                 &limits,
             )?;
-            // snapshot the catalog after a successful scan (best-effort)
-            let _ = crate::catalog::backup::snapshot(
-                &catalog_path,
-                &cfg.backups_dir(),
-                cfg.snapshot_retention,
-                now,
-            );
+            // Snapshot the catalog after a successful scan (best-effort).
+            //
+            // The destination is derived from `catalog_path` -- the catalogue this job actually
+            // scanned -- and NOT from `cfg`, which resolves the ambient data directory. Using the
+            // config here was the same defect as #44 in the web handlers: a job running against a
+            // temp catalogue wrote its snapshot next to the user's real one, and retention then
+            // evicted genuine snapshots. `cfg` is still right for the archive limits above.
+            let _ = crate::catalog::backup::snapshot_beside(&catalog_path, now);
             let (hashed, skipped, errors, archive_entries) = counters_for_job.snapshot();
             Ok(match scanned {
                 Some((_id, s)) => ScanResult {
