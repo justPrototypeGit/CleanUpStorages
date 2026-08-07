@@ -91,6 +91,14 @@ impl Catalog {
 
     /// Most recent runs, newest first.
     pub fn recent_scan_runs(&self, limit: usize) -> anyhow::Result<Vec<ScanRun>> {
+        // A 'running' row whose heartbeat has gone stale is REPORTED as interrupted here and
+        // nowhere else, so the Scan page and the CLI cannot disagree. Nothing is written back: a
+        // second process must never relabel a scan another process may still be running (#36).
+        let db_path = self.db_path();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
         let mut stmt = self.conn.prepare(
             "SELECT id, volume_id, root_path, started_at, finished_at, forced, status,
                     error_message, files_seen, hashed, skipped, errors, archive_entries,
@@ -114,7 +122,19 @@ impl Catalog {
                 started_at: r.get("started_at")?,
                 finished_at: r.get("finished_at")?,
                 forced: r.get::<_, i64>("forced")? != 0,
-                status: r.get("status")?,
+                status: {
+                    let id: i64 = r.get("id")?;
+                    let stored: String = r.get("status")?;
+                    let started_at: i64 = r.get("started_at")?;
+                    match &db_path {
+                        Some(p) => {
+                            crate::scan_heartbeat::display_status(p, id, &stored, started_at, now)
+                        }
+                        // An in-memory catalogue has no directory to hold heartbeats; report what
+                        // is stored rather than guessing.
+                        None => stored,
+                    }
+                },
                 error_message: r.get("error_message")?,
                 hashed: r.get("hashed")?,
                 skipped: r.get("skipped")?,
@@ -150,11 +170,20 @@ mod tests {
         (t, cat)
     }
 
+    fn now_secs() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
     #[test]
     fn a_started_run_is_visible_as_running_before_it_finishes() {
         let (_t, cat) = open();
+        // A real just-started run carries a current timestamp. With a 1970 one it would -- rightly
+        // -- be reported interrupted, since nothing has beaten for it in fifty years (#36).
         let id = cat
-            .start_scan_run(Some("v1"), "D:/drive", 100, false)
+            .start_scan_run(Some("v1"), "D:/drive", now_secs(), false)
             .unwrap();
         let runs = cat.recent_scan_runs(10).unwrap();
         assert_eq!(runs.len(), 1);
@@ -162,6 +191,45 @@ mod tests {
         assert_eq!(runs[0].status, "running");
         assert_eq!(runs[0].finished_at, None);
         assert_eq!(runs[0].root_path, "D:/drive");
+    }
+
+    #[test]
+    fn an_old_running_row_with_no_heartbeat_reads_as_interrupted() {
+        // The #36 case: a scan killed by power loss or Task Manager leaves status='running'
+        // forever. Nothing beats for it, so it is reported interrupted rather than appearing to
+        // run indefinitely. The STORED value is deliberately untouched -- another process may be
+        // running a scan of its own, and no process may relabel another's work.
+        let (_t, cat) = open();
+        let id = cat
+            .start_scan_run(Some("v1"), "D:/drive", now_secs() - 86_400, false)
+            .unwrap();
+        let runs = cat.recent_scan_runs(10).unwrap();
+        assert_eq!(runs[0].status, "interrupted");
+
+        let stored: String = cat
+            .conn
+            .query_row("SELECT status FROM scan_runs WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored, "running", "the stored value must not be rewritten");
+    }
+
+    #[test]
+    fn a_live_heartbeat_keeps_an_old_run_reported_as_running() {
+        // The case a SQLite-based heartbeat gets wrong: a scan that started long ago and is still
+        // working, holding its write transaction the whole time.
+        let (tmp, cat) = open();
+        let started = now_secs() - 86_400;
+        cat.start_scan_run(Some("v1"), "D:/drive", started, false)
+            .unwrap();
+        let db = tmp.path().join("c.db");
+        let _hb = crate::scan_heartbeat::Heartbeat::start(&db, 1);
+        let runs = cat.recent_scan_runs(10).unwrap();
+        assert_eq!(
+            runs[0].status, "running",
+            "a beating scan must keep reporting as running however long it has run"
+        );
     }
 
     #[test]
