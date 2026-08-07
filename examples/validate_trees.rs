@@ -17,6 +17,10 @@ fn main() -> anyhow::Result<()> {
         total += cat.rebuild_directory_trees(v, 1)?;
     }
     println!("volumes: {}  directory nodes: {}", vols.len(), total);
+    if std::env::var("REBUILD_ONLY").is_ok() {
+        println!("rebuild only; skipping the grouping query");
+        return Ok(());
+    }
     let groups = cat.tree_duplicate_groups()?;
     let reclaim: i64 = groups.iter().map(|g| g.reclaimable_bytes).sum();
     let members: usize = groups.iter().map(|g| g.members.len()).sum();
