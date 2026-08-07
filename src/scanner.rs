@@ -1035,6 +1035,52 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_loose_file_revives_when_it_comes_back() {
+        // The other half of the #46 guard, end to end. touch_seen may now only move a row between
+        // active and missing, and this is the case that guard must NOT break: a drive unplugged
+        // mid-scan, or a file temporarily unavailable, leaves rows 'missing', and the next scan has
+        // to bring them back. Getting this wrong would strand real files as permanently missing.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".cleanupstorages_id"), "vol-1").unwrap();
+        fs::write(root.join("a.txt"), b"HELLO").unwrap();
+        let ident = crate::volume::VolumeIdentity {
+            volume_id: "vol-1".into(),
+            label: "T".into(),
+            identified_by: "marker".into(),
+        };
+        scan_volume(&cat, &root, &ident, false, 100, &test_limits()).unwrap();
+
+        fs::remove_file(root.join("a.txt")).unwrap();
+        scan_volume(&cat, &root, &ident, false, 200, &test_limits()).unwrap();
+        let status: String = cat
+            .conn
+            .query_row(
+                "SELECT status FROM files WHERE relative_path='a.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "missing", "precondition: the file went missing");
+
+        fs::write(root.join("a.txt"), b"HELLO").unwrap();
+        scan_volume(&cat, &root, &ident, false, 300, &test_limits()).unwrap();
+        let status: String = cat
+            .conn
+            .query_row(
+                "SELECT status FROM files WHERE relative_path='a.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "active",
+            "a returning file MUST revive; the quarantine guard must not strand it"
+        );
+    }
+
+    #[test]
     fn deleted_file_becomes_missing() {
         let (tmp, cat) = setup();
         let root = tmp.path().join("drive");
