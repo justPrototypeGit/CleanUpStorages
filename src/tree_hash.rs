@@ -191,6 +191,211 @@ pub fn build_dir_hashes(volume_id: &str, rows: Vec<TreeInput>) -> Vec<DirNode> {
     v
 }
 
+/// Receives directory nodes as the streaming fold finalises them.
+///
+/// The point of the trait is that nodes never have to be collected: a sink can write each one
+/// straight to the database, so a 20 TB rebuild holds the current spine and nothing else.
+pub trait DirSink {
+    fn emit(&mut self, node: DirNode) -> anyhow::Result<()>;
+}
+
+impl DirSink for Vec<DirNode> {
+    fn emit(&mut self, node: DirNode) -> anyhow::Result<()> {
+        self.push(node);
+        Ok(())
+    }
+}
+
+/// One open directory on the spine.
+struct Frame {
+    path: String,
+    /// `name\0kind\0hash` per child seen so far. Bounded by this directory's width, not by the
+    /// corpus: a directory's hash simply cannot be computed before all its children are known.
+    lines: Vec<String>,
+    file_count: i64,
+    total_bytes: i64,
+    /// This frame is an archive whose entries form its contents.
+    is_archive_root: bool,
+}
+
+impl Frame {
+    fn new(path: String, is_archive_root: bool) -> Self {
+        Frame {
+            path,
+            lines: Vec::new(),
+            file_count: 0,
+            total_bytes: 0,
+            is_archive_root,
+        }
+    }
+}
+
+/// Fold path-ordered rows into directory hashes, emitting each node as it is finalised.
+///
+/// `rows` MUST be ordered by `path` under SQLite's BINARY collation. Two properties make this work,
+/// both verified against every row of the live catalogue rather than assumed (see the design spec):
+///
+/// - a directory's descendants are contiguous, because every string with prefix `a/` lies in
+///   `["a/", "a0")` and nothing else does;
+/// - an archive's own row lands immediately before its entries, because an entry's path extends the
+///   archive's own and `/` sorts below any ordinary name character. That is what lets a single row
+///   of lookahead replace a full pre-pass over the corpus.
+///
+/// Returns the number of directories emitted.
+pub fn stream_dir_hashes<I, S>(volume_id: &str, rows: I, sink: &mut S) -> anyhow::Result<usize>
+where
+    I: IntoIterator<Item = anyhow::Result<TreeInput>>,
+    S: DirSink,
+{
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut emitted = 0usize;
+    let mut prev_path: Option<String> = None;
+    let mut pending: Option<TreeInput> = None;
+    let mut iter = rows.into_iter();
+
+    loop {
+        // A row error must abort: hashing the rest would describe a tree that is missing files.
+        // `pending` holds the already-unwrapped lookahead row from the previous iteration.
+        let row = match pending.take() {
+            Some(r) => r,
+            None => match iter.next() {
+                Some(r) => r?,
+                None => break,
+            },
+        };
+        // The fold is silently WRONG on unordered input -- it would close a directory early and
+        // hash a fragment of it, yielding plausible-looking duplicate groups the user would then
+        // act on. One comparison per row is cheap insurance against that.
+        if let Some(prev) = &prev_path {
+            if row.path.as_str() <= prev.as_str() {
+                anyhow::bail!(
+                    "rows are not in ascending path order: {:?} came after {:?}; \
+                     the directory hash fold requires ORDER BY path (BINARY collation)",
+                    row.path,
+                    prev
+                );
+            }
+        }
+        // One row of lookahead: if the next path is inside this one, this row is an archive whose
+        // entries are its contents, so its own content hash is discarded and it becomes a directory.
+        // Compared by byte offset rather than by building "{path}/", which would allocate a string
+        // per file only to throw it away.
+        let next = iter.next().transpose()?;
+        let is_archive = row.is_archive_root
+            && next.as_ref().is_some_and(|n| {
+                n.path.len() > row.path.len() + 1
+                    && n.path.as_bytes()[row.path.len()] == b'/'
+                    && n.path.starts_with(row.path.as_str())
+            });
+        pending = next;
+
+        let parts: Vec<&str> = row.path.split('/').collect();
+        // Directories this row lives in. For an archive root that includes the archive itself.
+        let dir_depth = if is_archive {
+            parts.len()
+        } else {
+            parts.len() - 1
+        };
+
+        // How much of the open spine this row still shares. Frame `i` (ignoring the implicit root
+        // frame at index 0) holds the directory `parts[..=i]`, so the shared depth is however many
+        // leading components still match.
+        let root_offset = usize::from(stack.first().is_some_and(|f| f.path.is_empty()));
+        let mut shared = 0usize;
+        while shared < dir_depth
+            && shared + root_offset < stack.len()
+            && stack[shared + root_offset].path == parts[..=shared].join("/")
+        {
+            shared += 1;
+        }
+
+        // Close everything below the shared prefix, deepest first.
+        while stack.len() > shared + root_offset {
+            let f = stack.pop().expect("len checked above");
+            close_frame(volume_id, f, &mut stack, sink, &mut emitted)?;
+        }
+        // Open frames for the components this row newly enters.
+        for i in shared..dir_depth {
+            if stack.is_empty() {
+                stack.push(Frame::new(String::new(), false)); // implicit volume root
+            }
+            stack.push(Frame::new(
+                parts[..=i].join("/"),
+                is_archive && i + 1 == dir_depth,
+            ));
+        }
+
+        if !is_archive {
+            let name = parts[parts.len() - 1];
+            let top = top_frame(&mut stack);
+            top.lines
+                .push(format!("{name}\u{0}f\u{0}{}", row.content_hash));
+            top.file_count += 1;
+            top.total_bytes += row.size_bytes;
+        }
+        // Moved rather than cloned: `row` is finished with by this point.
+        prev_path = Some(row.path);
+    }
+
+    while let Some(f) = stack.pop() {
+        close_frame(volume_id, f, &mut stack, sink, &mut emitted)?;
+    }
+    Ok(emitted)
+}
+
+/// The frame files are added to. The volume root is implicit and created on demand, so a file at
+/// the top level has somewhere to go.
+fn top_frame(stack: &mut Vec<Frame>) -> &mut Frame {
+    if stack.is_empty() {
+        stack.push(Frame::new(String::new(), false));
+    }
+    stack.last_mut().expect("just ensured non-empty")
+}
+
+/// Hash a finished directory, emit it, and fold it into its parent.
+fn close_frame<S: DirSink>(
+    volume_id: &str,
+    f: Frame,
+    stack: &mut [Frame],
+    sink: &mut S,
+    emitted: &mut usize,
+) -> anyhow::Result<()> {
+    if f.file_count == 0 {
+        return Ok(()); // empty tree: they would all hash alike and mean nothing
+    }
+    // Children are sorted here rather than kept sorted, so the hash does not depend on the order
+    // rows arrived in -- byte order over full paths is not the same as byte order over base names.
+    let mut lines = f.lines;
+    lines.sort();
+    let dir_hash = blake3::hash(lines.join("\n").as_bytes())
+        .to_hex()
+        .to_string();
+
+    let archive_root = stack
+        .iter()
+        .rev()
+        .find(|p| p.is_archive_root)
+        .map(|p| p.path.clone());
+
+    if let Some(parent) = stack.last_mut() {
+        let name = f.path.rsplit('/').next().unwrap_or(&f.path);
+        parent.lines.push(format!("{name}\u{0}d\u{0}{dir_hash}"));
+        parent.file_count += f.file_count;
+        parent.total_bytes += f.total_bytes;
+    }
+
+    sink.emit(DirNode {
+        volume_id: volume_id.to_string(),
+        path: f.path,
+        dir_hash,
+        file_count: f.file_count,
+        total_bytes: f.total_bytes,
+        archive_root,
+    })?;
+    *emitted += 1;
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct TreeGroup {
     pub dir_hash: String,
@@ -434,6 +639,121 @@ mod tests {
         let groups = maximal_groups(&nodes);
         assert_eq!(groups.len(), 1, "and must be reported as one decision");
         assert_eq!(groups[0].members.len(), 2);
+    }
+
+    /// Run both implementations over the same rows and require identical output.
+    ///
+    /// This is the real safety net for the streaming rewrite: the hash definition must not move, or
+    /// every published figure and every stored dir_hash silently changes meaning.
+    fn assert_same(rows: Vec<TreeInput>) {
+        let mut expected = build_dir_hashes("v", rows.clone());
+        let mut sorted = rows;
+        sorted.sort_by(|a, b| a.path.cmp(&b.path));
+        let mut actual: Vec<DirNode> = Vec::new();
+        stream_dir_hashes("v", sorted.into_iter().map(Ok), &mut actual).unwrap();
+        expected.sort_by(|a, b| a.path.cmp(&b.path));
+        actual.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(
+            expected.len(),
+            actual.len(),
+            "different node counts
+expected: {:?}
+actual:   {:?}",
+            expected.iter().map(|n| &n.path).collect::<Vec<_>>(),
+            actual.iter().map(|n| &n.path).collect::<Vec<_>>()
+        );
+        for (e, a) in expected.iter().zip(actual.iter()) {
+            assert_eq!(e, a, "node mismatch at {:?}", e.path);
+        }
+    }
+
+    #[test]
+    fn streaming_matches_the_in_memory_build_for_a_plain_tree() {
+        assert_same(vec![
+            f("v", "top/one.txt", "H1", 10),
+            f("v", "top/sub/two.txt", "H2", 20),
+            f("v", "top/sub/deep/three.txt", "H3", 30),
+            f("v", "other/x.txt", "H4", 40),
+            f("v", "root.txt", "H5", 50),
+        ]);
+    }
+
+    #[test]
+    fn streaming_matches_for_identical_trees_and_odd_names() {
+        // Includes names that stress byte ordering around '/': '.' (0x2E) sorts below it and '0'
+        // (0x30) above, so these interleave with directory contents in a way a naive fold breaks on.
+        assert_same(vec![
+            f("v", "Photos2019/a.jpg", "H1", 10),
+            f("v", "Photos2019/b.jpg", "H2", 20),
+            f("v", "Photos 2019 copy/a.jpg", "H1", 10),
+            f("v", "Photos 2019 copy/b.jpg", "H2", 20),
+            f("v", "a.txt", "H6", 1),
+            f("v", "a/inner.txt", "H7", 2),
+            f("v", "a0.txt", "H8", 3),
+        ]);
+    }
+
+    #[test]
+    fn streaming_matches_when_archives_are_descended() {
+        assert_same(vec![
+            TreeInput {
+                path: "x/one.zip".into(),
+                content_hash: "ZIP_A".into(),
+                size_bytes: 99,
+                is_archive_root: true,
+            },
+            f("v", "x/one.zip/inner.txt", "H1", 10),
+            TreeInput {
+                path: "y/two.zip".into(),
+                content_hash: "ZIP_B".into(),
+                size_bytes: 77,
+                is_archive_root: true,
+            },
+            f("v", "y/two.zip/inner.txt", "H1", 10),
+            // Deeply nested entries, the shape that broke the first implementation.
+            TreeInput {
+                path: "z/deep.zip".into(),
+                content_hash: "ZIP_C".into(),
+                size_bytes: 5,
+                is_archive_root: true,
+            },
+            f("v", "z/deep.zip/Project/.git/config", "H9", 7),
+            f("v", "z/deep.zip/Project/src/main.rs", "HA", 8),
+            // An archive with no entries stays an ordinary file.
+            TreeInput {
+                path: "d/report.docx".into(),
+                content_hash: "DOCX".into(),
+                size_bytes: 5,
+                is_archive_root: true,
+            },
+        ]);
+    }
+
+    #[test]
+    fn unordered_input_is_refused_rather_than_hashed_wrong() {
+        // The fold would close a directory early and hash a fragment of it, producing duplicate
+        // groups that look plausible and are wrong. That must be an error, not a silent result.
+        let rows = vec![
+            f("v", "b/second.txt", "H2", 1),
+            f("v", "a/first.txt", "H1", 1),
+        ];
+        let mut out: Vec<DirNode> = Vec::new();
+        let err = stream_dir_hashes("v", rows.into_iter().map(Ok), &mut out).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ascending path order"), "got: {msg}");
+        assert!(
+            msg.contains("a/first.txt") && msg.contains("b/second.txt"),
+            "the error must name both paths; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_path_is_refused_too() {
+        // Equal paths mean the caller lost a uniqueness guarantee somewhere; folding them would
+        // double-count the file into its directory.
+        let rows = vec![f("v", "a/x.txt", "H1", 1), f("v", "a/x.txt", "H1", 1)];
+        let mut out: Vec<DirNode> = Vec::new();
+        assert!(stream_dir_hashes("v", rows.into_iter().map(Ok), &mut out).is_err());
     }
 
     #[test]
