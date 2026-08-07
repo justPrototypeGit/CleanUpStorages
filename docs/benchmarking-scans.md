@@ -616,3 +616,35 @@ issue.
 
 Re-measure with `examples/validate_trees.rs` against a catalogue copy; it prints the same aggregate
 figures the Python script does, so a memory change that alters behaviour is immediately visible.
+
+### Streaming the rebuild (#50): 160 MB -> 12 MB
+
+Folding path-ordered rows with a stack, emitting each directory the moment the walk leaves it and
+writing it straight to the database. Peak working set on the same live catalogue copy (808,588
+rows, 3 volumes), same harness:
+
+| | peak |
+| --- | --- |
+| materialising every row (#38 as merged) | 160 MB |
+| **streaming, rebuild only** | **12 MB** |
+| streaming, rebuild + the grouping query | 44 MB |
+
+Every aggregate is identical, which is the point -- the hash definition did not move: 80,202 nodes,
+1,458 maximal groups, 4,251 folders, 53.2 GB reclaimable, 1,911 in-archive.
+
+**What the 12 MB does and does not promise.** The fold's resident set is the current root-to-leaf
+spine plus the accumulated child lines of each open directory, so it is bounded by *tree shape*, not
+by corpus size. On this catalogue that shape is: **max depth 21**, **widest directory 7,267 direct
+children**. A 20 TB corpus with similar shape should stay in the same range regardless of file
+count. That is a projection from the design, not a measurement at 50 M files -- what was measured is
+808,588 rows at 12 MB, against 160 MB for the same input before.
+
+SQLite now sorts the result set (the path is computed from two columns, so no index covers it).
+That sort is disk-backed via the temp store, so it does not reintroduce the memory problem, but it
+is real work on tens of millions of rows and has not been timed at that scale.
+
+**The grouping query was deliberately left alone**, and now has a number: `tree_duplicate_groups`
+holds every *twinned* node, 69,115 of them for ~32 MB, so roughly **480 bytes per node**. It grows
+with directory count rather than file count and runs only when the user opens the review page, not
+automatically after every scan. Whether that warrants work depends on how many directories the real
+corpus has; measure before deciding.

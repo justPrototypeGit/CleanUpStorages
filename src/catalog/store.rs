@@ -841,57 +841,60 @@ impl Catalog {
     /// hash is already stored -- this reads rows and sorts, it does not touch the drive, so it
     /// works for a volume that is not currently plugged in.
     pub fn rebuild_directory_trees(&self, volume_id: &str, now: i64) -> anyhow::Result<usize> {
-        let rows: Vec<crate::tree_hash::TreeInput> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT relative_path, container_chain, content_hash, size_bytes
-                   FROM files WHERE volume_id=?1 AND status='active'",
-            )?;
-            let mapped = stmt.query_map(params![volume_id], |r| {
-                let rel: String = r.get(0)?;
-                let chain: Option<String> = r.get(1)?;
-                Ok(crate::tree_hash::TreeInput {
-                    path: match &chain {
-                        Some(c) => format!("{rel}/{c}"),
-                        None => rel,
-                    },
-                    content_hash: r.get(2)?,
-                    size_bytes: r.get(3)?,
-                    // A loose row is only a *candidate* archive root; `build_dir_hashes` drops it
-                    // solely when entry rows actually exist beneath the same path.
-                    is_archive_root: chain.is_none(),
-                })
-            })?;
-            mapped.collect::<Result<Vec<_>, _>>()?
-        };
-        let nodes = crate::tree_hash::build_dir_hashes(volume_id, rows);
-
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM directory_trees WHERE volume_id=?1",
             params![volume_id],
         )?;
-        {
-            let mut ins = tx.prepare(
-                "INSERT INTO directory_trees(volume_id, path, dir_hash, file_count, total_bytes,
-                                             archive_root, computed_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+
+        let emitted = {
+            // ORDER BY is load-bearing, not cosmetic: the fold closes a directory as soon as the
+            // walk leaves it, so unordered rows would hash a fragment of a directory. Default
+            // BINARY collation -- NOCASE would break the contiguity the fold relies on.
+            // `stream_dir_hashes` re-checks the order per row rather than trusting this.
+            let mut stmt = self.conn.prepare(
+                "SELECT CASE WHEN container_chain IS NULL THEN relative_path
+                             ELSE relative_path||'/'||container_chain END AS p,
+                        container_chain IS NULL, content_hash, size_bytes
+                   FROM files WHERE volume_id=?1 AND status='active'
+                  ORDER BY p",
             )?;
-            for n in &nodes {
-                ins.execute(params![
-                    n.volume_id,
-                    n.path,
-                    n.dir_hash,
-                    n.file_count,
-                    n.total_bytes,
-                    n.archive_root,
-                    now
-                ])?;
-            }
-        }
+            let rows = stmt.query_map(params![volume_id], |r| {
+                Ok(crate::tree_hash::TreeInput {
+                    path: r.get(0)?,
+                    // A loose row is only a *candidate* archive root; the fold promotes it to a
+                    // directory only when the very next row turns out to sit inside it.
+                    is_archive_root: r.get::<_, i64>(1)? != 0,
+                    content_hash: r.get(2)?,
+                    size_bytes: r.get(3)?,
+                })
+            })?;
+
+            // Nodes go straight to the database as they are finalised. Collecting them first is
+            // what made this O(corpus) instead of O(tree depth).
+            let mut sink = InsertSink {
+                stmt: tx.prepare(
+                    "INSERT INTO directory_trees(volume_id, path, dir_hash, file_count,
+                                                 total_bytes, archive_root, computed_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                )?,
+                now,
+            };
+            crate::tree_hash::stream_dir_hashes(
+                volume_id,
+                rows.map(|r| r.map_err(anyhow::Error::from)),
+                &mut sink,
+            )?
+        };
+
         tx.commit()?;
-        Ok(nodes.len())
+        Ok(emitted)
     }
 
+    /// Writes each finalised directory node straight into `directory_trees`.
+    ///
+    /// Exists so a rebuild never holds a collection of nodes: on a 20 TB corpus that collection was
+    /// the whole memory problem.
     /// Maximal identical-tree groups across every volume, ranked by reclaimable bytes.
     pub fn tree_duplicate_groups(&self) -> anyhow::Result<Vec<crate::tree_hash::TreeGroup>> {
         let mut stmt = self.conn.prepare(
@@ -913,6 +916,30 @@ impl Catalog {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(crate::tree_hash::maximal_groups(&nodes))
+    }
+}
+
+/// Writes each finalised directory node straight into `directory_trees`.
+///
+/// Exists so a rebuild never holds a collection of nodes: on a 20 TB corpus that collection WAS the
+/// memory problem, at roughly 198 bytes per catalogued file.
+struct InsertSink<'a> {
+    stmt: rusqlite::Statement<'a>,
+    now: i64,
+}
+
+impl crate::tree_hash::DirSink for InsertSink<'_> {
+    fn emit(&mut self, n: crate::tree_hash::DirNode) -> anyhow::Result<()> {
+        self.stmt.execute(params![
+            n.volume_id,
+            n.path,
+            n.dir_hash,
+            n.file_count,
+            n.total_bytes,
+            n.archive_root,
+            self.now
+        ])?;
+        Ok(())
     }
 }
 
