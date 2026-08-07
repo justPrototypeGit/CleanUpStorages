@@ -276,14 +276,16 @@ where
                 );
             }
         }
-        prev_path = Some(row.path.clone());
-
         // One row of lookahead: if the next path is inside this one, this row is an archive whose
         // entries are its contents, so its own content hash is discarded and it becomes a directory.
+        // Compared by byte offset rather than by building "{path}/", which would allocate a string
+        // per file only to throw it away.
         let next = iter.next().transpose()?;
         let is_archive = row.is_archive_root
             && next.as_ref().is_some_and(|n| {
-                n.path.len() > row.path.len() + 1 && n.path.starts_with(&format!("{}/", row.path))
+                n.path.len() > row.path.len() + 1
+                    && n.path.as_bytes()[row.path.len()] == b'/'
+                    && n.path.starts_with(row.path.as_str())
             });
         pending = next;
 
@@ -331,6 +333,8 @@ where
             top.file_count += 1;
             top.total_bytes += row.size_bytes;
         }
+        // Moved rather than cloned: `row` is finished with by this point.
+        prev_path = Some(row.path);
     }
 
     while let Some(f) = stack.pop() {
