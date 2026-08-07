@@ -581,6 +581,14 @@ pub fn run_scan(
         .map_err(|e| tracing::warn!("could not record scan start: {e}"))
         .ok();
 
+    // Beats for as long as this function runs, so a hard-killed scan stops looking alive (#36).
+    // Held in a binding rather than dropped immediately -- `let _ =` would end it at once. Drop
+    // covers the normal, error and panic paths; only a hard kill leaves the file behind, which is
+    // precisely the signal.
+    let _heartbeat = run_id
+        .zip(cat.db_path())
+        .map(|(id, db)| crate::scan_heartbeat::Heartbeat::start(&db, id));
+
     // Owned here, not inside the scan, so a scan that bails part-way still reports what it
     // measured before it died.
     let metrics = crate::scan_metrics::ScanMetrics::new();
