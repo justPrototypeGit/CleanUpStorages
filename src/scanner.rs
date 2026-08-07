@@ -158,6 +158,10 @@ pub fn count_tree(root: &Path, stop: &crate::scan_control::StopFlag) -> TreeTota
 /// file touched this scan gets `last_seen_at == now`, `mark_missing_scanned` (which flags rows
 /// with `last_seen_at < scan_started_at`) only ever catches files genuinely absent this pass.
 ///
+/// The stamp actually used is `Catalog::next_seen_stamp`, which keeps it strictly above anything the
+/// volume already carries. Raw wall-clock seconds broke the sweep whenever two scans shared a second
+/// or the clock moved backwards (#45).
+///
 /// `metrics` is owned by the caller so a scan that bails part-way still yields what it measured
 /// before it died — the multi-day run that fails late is the one most worth measuring.
 #[allow(
@@ -176,6 +180,15 @@ pub fn scan_volume_with_progress(
     stop: &crate::scan_control::StopFlag,
     limits: &ArchiveLimits,
 ) -> anyhow::Result<ScanSummary> {
+    // Monotonic per volume, not raw wall-clock (#45). The sweep below compares
+    // `last_seen_at < scan_started_at`, which a second-resolution clock quietly breaks: two scans in
+    // the same second make `t < t` false, and a clock that moved backwards makes `2000 < 1500`
+    // false. Either way a deleted file stays stale-active, and the catalogue then claims a file is
+    // present when it is gone -- the unsafe direction, since dedup can offer it as the copy to keep.
+    //
+    // Shadowing `now` is deliberate: every row this scan stamps must carry the same value the sweep
+    // compares against, and one binding is how they cannot drift apart.
+    let now = cat.next_seen_stamp(&identity.volume_id, now)?;
     let scan_started_at = now;
     let mut summary = ScanSummary::default();
     let mut in_batch = 0usize;
@@ -1153,6 +1166,108 @@ mod tests {
             status, "active",
             "a returning file MUST revive; the quarantine guard must not strand it"
         );
+    }
+
+    #[test]
+    fn a_deletion_is_swept_even_when_two_scans_share_a_second() {
+        // #45: the sweep compares last_seen_at < scan_started_at, and the stamp came from
+        // second-resolution wall-clock time. Two scans in the same second made `t < t` false, so a
+        // file deleted in between stayed stale-active -- the catalogue asserting a file is present
+        // when it is gone. That is the UNSAFE direction: dedup can then offer it as the safe copy
+        // to keep while the user quarantines a real one.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".cleanupstorages_id"), "vol-1").unwrap();
+        fs::write(root.join("gone.txt"), b"DATA").unwrap();
+        let ident = crate::volume::VolumeIdentity {
+            volume_id: "vol-1".into(),
+            label: "T".into(),
+            identified_by: "marker".into(),
+        };
+        scan_volume(&cat, &root, &ident, false, 1000, &test_limits()).unwrap();
+
+        fs::remove_file(root.join("gone.txt")).unwrap();
+        // The SAME wall-clock second as the first scan.
+        let s = scan_volume(&cat, &root, &ident, false, 1000, &test_limits()).unwrap();
+
+        let status: String = cat
+            .conn
+            .query_row(
+                "SELECT status FROM files WHERE relative_path='gone.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "missing",
+            "a deleted file must be swept, not left active"
+        );
+        assert_eq!(s.marked_missing, 1);
+    }
+
+    #[test]
+    fn a_deletion_is_swept_even_when_the_clock_moves_backwards() {
+        // The other half of #45: NTP correction, a manual change, dual-boot, or a drive carried to
+        // another machine. Last seen at 2000, rescanned with a stamp of 1500: 2000 < 1500 is false,
+        // so the vanish was never registered.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".cleanupstorages_id"), "vol-1").unwrap();
+        fs::write(root.join("gone.txt"), b"DATA").unwrap();
+        let ident = crate::volume::VolumeIdentity {
+            volume_id: "vol-1".into(),
+            label: "T".into(),
+            identified_by: "marker".into(),
+        };
+        scan_volume(&cat, &root, &ident, false, 2000, &test_limits()).unwrap();
+
+        fs::remove_file(root.join("gone.txt")).unwrap();
+        let s = scan_volume(&cat, &root, &ident, false, 1500, &test_limits()).unwrap();
+
+        let status: String = cat
+            .conn
+            .query_row(
+                "SELECT status FROM files WHERE relative_path='gone.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "missing",
+            "a clock moving backwards must not hide a deletion"
+        );
+        assert_eq!(s.marked_missing, 1);
+    }
+
+    #[test]
+    fn a_present_file_is_never_swept_by_the_scan_that_just_saw_it() {
+        // The failure mode of an over-eager fix: changing `<` to `<=` would sweep files the current
+        // scan touched in the same second. Present files must survive every scan, always.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".cleanupstorages_id"), "vol-1").unwrap();
+        fs::write(root.join("here.txt"), b"DATA").unwrap();
+        let ident = crate::volume::VolumeIdentity {
+            volume_id: "vol-1".into(),
+            label: "T".into(),
+            identified_by: "marker".into(),
+        };
+        for stamp in [1000, 1000, 1000, 900] {
+            let s = scan_volume(&cat, &root, &ident, false, stamp, &test_limits()).unwrap();
+            assert_eq!(s.marked_missing, 0, "stamp {stamp} swept a present file");
+        }
+        let status: String = cat
+            .conn
+            .query_row(
+                "SELECT status FROM files WHERE relative_path='here.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "active");
     }
 
     #[test]
