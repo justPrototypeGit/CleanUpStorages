@@ -138,6 +138,11 @@ pub fn cmd_scan(
                     "{}",
                     cat.volume_completeness(&identity.volume_id)?.summary_line()
                 );
+                // Derived from the rows this scan just wrote. Skipped for a stopped scan: its
+                // picture of the volume is incomplete by definition, and hashing a half-seen tree
+                // would invent folders that differ only because the scan never reached the rest.
+                let dirs = cat.rebuild_directory_trees(&identity.volume_id, now)?;
+                tracing::info!(directories = dirs, "rebuilt directory trees");
             }
             print!("{}", s.metrics.report());
         }
@@ -273,6 +278,9 @@ pub fn cmd_quarantine(mount: &Path, ids: &[i64]) -> anyhow::Result<()> {
         "Quarantined {} file(s), skipped {}.",
         out.quarantined, out.skipped
     );
+    // What is active just changed, so any identical-tree group involving these files is stale.
+    // Leaving it would keep offering a pair whose other side is already in _ToDelete.
+    cat.rebuild_directory_trees(&vid, now)?;
     let snap = snapshot(&cfg, now)?;
     println!("Catalog snapshot: {}", snap.display());
     Ok(())

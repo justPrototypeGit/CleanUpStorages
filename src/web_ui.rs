@@ -817,6 +817,13 @@ pub fn review_page(csrf: &str) -> String {
         <option value="104857600">100 MB</option>
       </select></label>
   </div>
+  <section id="treesec" style="display:none;margin-bottom:26px">
+    <h2 style="font-size:15px;margin:0 0 4px">Identical folders</h2>
+    <p class="mut" style="font-size:12px;margin:0 0 12px">Whole folders whose contents match exactly.
+      Confirming one moves the entire folder to <span class="mono">_ToDelete</span> in a single
+      rename — the other copy stays where it is, and nothing is deleted until you purge.</p>
+    <div id="treelist"></div>
+  </section>
   <div id="group"></div>
   <div class="mut" id="upnext" style="font-size:12px;margin-top:14px;text-align:center"></div>
   <div class="rvbar">
@@ -920,6 +927,79 @@ $("#confirm").addEventListener("click",async()=>{
 $("#skip").addEventListener("click",()=>{ idx++; $("#msg").textContent=""; render(); });
 // A plain <select>: enhanceSelect is the Browse page's multi-select widget and the floor is one value.
 $("#minsize").addEventListener("change",()=>{ minSize=Number($("#minsize").value); $("#msg").textContent=""; load(); });
+
+// ---- Identical folders (#38) ----------------------------------------------------------------
+// Shown ABOVE the per-file list because it is the decision worth making first: on a real catalogue
+// this turns ~126,000 individual choices into ~1,500.
+const fmtB=n=>{const u=['B','KB','MB','GB','TB'];let i=0,x=Number(n)||0;
+  while(x>=1024&&i<u.length-1){x/=1024;i++;} return (i===0?x:x.toFixed(1))+' '+u[i];};
+async function loadTrees(){
+  let data; try{ data=await apiGet("/api/tree-duplicates"); }catch(e){ return; }
+  const sec=$("#treesec"), host=$("#treelist");
+  if(!data.groups.length){ sec.style.display="none"; return; }
+  sec.style.display="";
+  host.textContent="";
+  for(const g of data.groups){
+    const box=document.createElement("div");
+    box.className="card";
+    box.style.cssText="padding:12px 14px;margin-bottom:10px";
+    const head=document.createElement("div");
+    head.style.cssText="font-size:13px;margin-bottom:8px";
+    // Blast radius first. The user is about to move thousands of files with one click, and this
+    // line is the whole mitigation for making each decision coarser than one file.
+    head.innerHTML=`<strong>${fmtN(g.file_count)} files</strong> <span class="mut">· ${
+      esc(fmtB(g.reclaimable_bytes))} reclaimable</span>`;
+    box.appendChild(head);
+    for(const m of g.members){
+      const row=document.createElement("div");
+      row.className="row";
+      row.style.cssText="justify-content:space-between;gap:12px;padding:4px 0;flex-wrap:wrap";
+      const label=document.createElement("span");
+      label.className="mono";
+      label.style.cssText="font-size:12px;word-break:break-all";
+      // BOTH full paths, always: folder names are not part of the match, so the path is the only
+      // way to tell which copy is which.
+      label.textContent=m.volume_label+" / "+m.path;
+      row.appendChild(label);
+      if(m.needs_repack){
+        const b=document.createElement("span");
+        b.className="mut"; b.style.fontSize="11.5px";
+        b.textContent="inside "+m.archive+" — needs repack";
+        row.appendChild(b);
+      }else if(!m.mounted){
+        const b=document.createElement("span");
+        b.className="mut"; b.style.fontSize="11.5px";
+        b.textContent="drive not connected";
+        row.appendChild(b);
+      }else{
+        const btn=document.createElement("button");
+        btn.className="linkbtn"; btn.style.fontSize="12.5px";
+        btn.textContent="Quarantine this copy";
+        btn.addEventListener("click",()=>confirmTree(g,m,btn));
+        row.appendChild(btn);
+      }
+      box.appendChild(row);
+    }
+    host.appendChild(box);
+  }
+}
+async function confirmTree(group,member,btn){
+  if(!confirm("Move this entire folder to _ToDelete?\n\n"+member.volume_label+" / "+member.path+
+      "\n"+fmtN(group.file_count)+" files, "+fmtB(member.total_bytes)+
+      "\n\nThe other copy stays where it is. Nothing is deleted until you purge.")) return;
+  btn.disabled=true;
+  try{
+    const r=await apiPost("/api/quarantine-tree",{volume_id:member.volume_id,path:member.path});
+    $("#msg").textContent=fmtN(r.files_updated)+" files moved to "+r.dest+".";
+    await loadTrees();
+  }catch(e){
+    // apiPost throws on non-2xx; a refusal (tree no longer active, wrong drive, drive unplugged)
+    // lands here and must be shown, not swallowed.
+    $("#msg").textContent="Could not quarantine: "+e.message;
+    btn.disabled=false;
+  }
+}
+loadTrees();
 load();"##;
     shell("duplicates", csrf, "Review duplicates", main, script)
 }
