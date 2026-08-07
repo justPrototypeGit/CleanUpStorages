@@ -316,14 +316,15 @@ fn now_secs() -> Result<i64, (StatusCode, String)> {
 /// Best-effort catalog snapshot around a mutation (some handlers call this before the mutation as a
 /// pre-mutation safety net, others after). Never fails the request — a snapshot error is swallowed.
 fn snapshot_best_effort(state: &AppState, now: i64) {
-    if let Ok(cfg) = crate::config::Config::default_paths() {
-        let _ = crate::catalog::backup::snapshot(
-            &state.catalog_path,
-            &cfg.backups_dir(),
-            cfg.snapshot_retention,
-            now,
-        );
-    }
+    // The snapshot goes beside the catalogue THIS request is mutating, derived from
+    // `state.catalog_path` -- never from the ambient configuration.
+    //
+    // Resolving `Config::default_paths()` here was a real defect (#44): it sent the snapshot to
+    // whichever catalogue the environment happened to point at, so `cargo test` wrote into the
+    // user's genuine backups folder and retention then evicted the real pre-migration snapshots.
+    // It was also simply wrong outside tests -- snapshotting catalogue A into catalogue B's backup
+    // directory. Retention is a compile-time constant, so nothing here needs the config at all.
+    let _ = crate::catalog::backup::snapshot_beside(&state.catalog_path, now);
 }
 
 /// Split a comma-separated query param (e.g. `status=active,quarantined`) into a filter vec,
@@ -3211,6 +3212,11 @@ mod tests {
                 prev,
             }
         }
+        /// The directory this guard points CLEANUPSTORAGES_DATA_DIR at, so a test can assert
+        /// nothing was written there.
+        fn path(&self) -> &std::path::Path {
+            self._dir.path()
+        }
     }
     impl Drop for ScopedDataDir {
         fn drop(&mut self) {
@@ -3773,6 +3779,60 @@ mod tests {
             scan_queue: crate::scan_queue::ScanQueue::new(db.clone()),
         };
         (tmp, db, state)
+    }
+
+    #[tokio::test]
+    async fn a_mutation_snapshots_beside_its_own_catalogue_not_the_ambient_one() {
+        // #44: snapshot_best_effort used to resolve Config::default_paths(), so a request that
+        // mutated a temp catalogue wrote its snapshot into whichever data directory the environment
+        // pointed at. In this project that meant `cargo test` evicting the user's genuine
+        // pre-migration snapshots -- the documented rollback path for a schema migration.
+        //
+        // The ambient directory here stands in for the user's real one: it must stay empty.
+        let ambient = ScopedDataDir::new();
+        let (_t, db, state) = seed_dupes();
+
+        let id: i64 = {
+            let cat = crate::catalog::Catalog::open(&db).unwrap();
+            cat.conn
+                .query_row(
+                    "SELECT id FROM files WHERE relative_path='copy/a.jpg'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        let app = build_router_with(state);
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/quarantine")
+                    .header("content-type", "application/json")
+                    .header("x-cleanup-token", "T")
+                    .body(axum::body::Body::from(format!(
+                        r#"{{"quarantine_ids":[{id}]}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+
+        let own = db.parent().unwrap().join("catalog.backups");
+        let n_own = std::fs::read_dir(&own).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(
+            n_own, 1,
+            "the snapshot belongs beside the catalogue being mutated"
+        );
+
+        let n_ambient = std::fs::read_dir(ambient.path().join("catalog.backups"))
+            .map(|d| d.count())
+            .unwrap_or(0);
+        assert_eq!(
+            n_ambient, 0,
+            "nothing may be written to the ambient data directory -- that is the user's real one"
+        );
     }
 
     #[tokio::test]

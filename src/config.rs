@@ -25,6 +25,23 @@ pub(crate) const DEFAULT_DENY: &[&str] = &[
     "ods", "odp", "nupkg", "vsix", "ipa",
 ];
 
+/// How many timestamped snapshots to keep. Not user-configurable, which is the point: anything
+/// needing it can use this constant instead of resolving the whole ambient configuration.
+pub const DEFAULT_SNAPSHOT_RETENTION: usize = 10;
+
+/// Snapshots live beside the catalogue they are snapshots OF.
+///
+/// Derived from the catalogue path rather than from the ambient config, so a process operating on
+/// one catalogue can never write backups next to a different one. That is not a hypothetical: the
+/// web handlers used to resolve the default data directory here, which made `cargo test` write into
+/// the user's real backups folder and evict genuine snapshots (#44).
+pub fn backups_dir_for(catalog_path: &std::path::Path) -> PathBuf {
+    catalog_path
+        .parent()
+        .map(|p| p.join("catalog.backups"))
+        .unwrap_or_else(|| PathBuf::from("catalog.backups"))
+}
+
 impl Config {
     /// Build a Config with default paths in the OS app-data directory.
     pub fn default_paths() -> anyhow::Result<Config> {
@@ -46,7 +63,7 @@ impl Config {
         let s = load_settings(&data_dir.join("settings.json"));
         Config {
             catalog_path: data_dir.join("catalog.db"),
-            snapshot_retention: 10,
+            snapshot_retention: DEFAULT_SNAPSHOT_RETENTION,
             max_archive_depth: s.max_archive_depth.unwrap_or(8),
             archive_buffer_max_bytes: s.archive_buffer_max_bytes.unwrap_or(2 * 1024 * 1024 * 1024),
             archive_total_buffer_bytes: s
@@ -65,10 +82,7 @@ impl Config {
 
     /// Directory holding timestamped catalog snapshots (sibling of the DB file).
     pub fn backups_dir(&self) -> PathBuf {
-        self.catalog_path
-            .parent()
-            .map(|p| p.join("catalog.backups"))
-            .unwrap_or_else(|| PathBuf::from("catalog.backups"))
+        backups_dir_for(&self.catalog_path)
     }
 
     /// Where user settings live: beside the catalog, never on a scanned drive.
