@@ -648,3 +648,33 @@ holds every *twinned* node, 69,115 of them for ~32 MB, so roughly **480 bytes pe
 with directory count rather than file count and runs only when the user opens the review page, not
 automatically after every scan. Whether that warrants work depends on how many directories the real
 corpus has; measure before deciding.
+
+#### A null result: removing the fold's per-row allocations
+
+The streaming fold allocated inside its hot loop -- `parts[..=i].join("/")` to compare against the
+open spine (up to one string per path component per row), a `format!("{path}/")` for the archive
+lookahead, and a clone of each path for the order check. On 50 M files that is on the order of a
+billion throwaway allocations, so removing them looked obviously right.
+
+Measured, interleaved A/B/A/B on the 808,588-row catalogue copy, rebuild only:
+
+| | runs (ms) | mean |
+| --- | --- | --- |
+| with the allocations | 5,876 / 6,218 | ~6,047 |
+| without | 5,507 / 5,980 | ~5,744 |
+
+About 5% apart, against a **within-group spread of 4,473-7,264 ms (62%)**. The difference is inside
+the noise, so it is not a result.
+
+A first, non-interleaved pass had reported the change **35% slower** — pure drift, and a repeat of
+the Task 3 mistake documented above. Sequential A-then-B on this machine is not a measurement.
+
+The index-arithmetic version was therefore **reverted**: it adds byte-offset bookkeeping to a hash
+fold, where a mistake produces wrong hashes, in exchange for nothing that can be demonstrated. Two
+pieces were kept purely because they are simpler than what they replace, with no performance claim
+attached: the lookahead compares a byte instead of building a string, and the order check moves the
+path instead of cloning it.
+
+Note the allocations scale with row count and so does runtime, so this was a ~5% constant factor
+rather than something that degrades at 20 TB. If the rebuild ever does look slow on the real corpus,
+**measure before optimising** -- the sort SQLite performs is the untested part, not this.
