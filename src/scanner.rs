@@ -158,6 +158,10 @@ pub fn count_tree(root: &Path, stop: &crate::scan_control::StopFlag) -> TreeTota
 /// file touched this scan gets `last_seen_at == now`, `mark_missing_scanned` (which flags rows
 /// with `last_seen_at < scan_started_at`) only ever catches files genuinely absent this pass.
 ///
+/// The stamp actually used is `Catalog::next_seen_stamp`, which keeps it strictly above anything the
+/// volume already carries. Raw wall-clock seconds broke the sweep whenever two scans shared a second
+/// or the clock moved backwards (#45).
+///
 /// `metrics` is owned by the caller so a scan that bails part-way still yields what it measured
 /// before it died — the multi-day run that fails late is the one most worth measuring.
 #[allow(
@@ -176,6 +180,15 @@ pub fn scan_volume_with_progress(
     stop: &crate::scan_control::StopFlag,
     limits: &ArchiveLimits,
 ) -> anyhow::Result<ScanSummary> {
+    // Monotonic per volume, not raw wall-clock (#45). The sweep below compares
+    // `last_seen_at < scan_started_at`, which a second-resolution clock quietly breaks: two scans in
+    // the same second make `t < t` false, and a clock that moved backwards makes `2000 < 1500`
+    // false. Either way a deleted file stays stale-active, and the catalogue then claims a file is
+    // present when it is gone -- the unsafe direction, since dedup can offer it as the copy to keep.
+    //
+    // Shadowing `now` is deliberate: every row this scan stamps must carry the same value the sweep
+    // compares against, and one binding is how they cannot drift apart.
+    let now = cat.next_seen_stamp(&identity.volume_id, now)?;
     let scan_started_at = now;
     let mut summary = ScanSummary::default();
     let mut in_batch = 0usize;
@@ -1156,6 +1169,108 @@ mod tests {
     }
 
     #[test]
+    fn a_deletion_is_swept_even_when_two_scans_share_a_second() {
+        // #45: the sweep compares last_seen_at < scan_started_at, and the stamp came from
+        // second-resolution wall-clock time. Two scans in the same second made `t < t` false, so a
+        // file deleted in between stayed stale-active -- the catalogue asserting a file is present
+        // when it is gone. That is the UNSAFE direction: dedup can then offer it as the safe copy
+        // to keep while the user quarantines a real one.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".cleanupstorages_id"), "vol-1").unwrap();
+        fs::write(root.join("gone.txt"), b"DATA").unwrap();
+        let ident = crate::volume::VolumeIdentity {
+            volume_id: "vol-1".into(),
+            label: "T".into(),
+            identified_by: "marker".into(),
+        };
+        scan_volume(&cat, &root, &ident, false, 1000, &test_limits()).unwrap();
+
+        fs::remove_file(root.join("gone.txt")).unwrap();
+        // The SAME wall-clock second as the first scan.
+        let s = scan_volume(&cat, &root, &ident, false, 1000, &test_limits()).unwrap();
+
+        let status: String = cat
+            .conn
+            .query_row(
+                "SELECT status FROM files WHERE relative_path='gone.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "missing",
+            "a deleted file must be swept, not left active"
+        );
+        assert_eq!(s.marked_missing, 1);
+    }
+
+    #[test]
+    fn a_deletion_is_swept_even_when_the_clock_moves_backwards() {
+        // The other half of #45: NTP correction, a manual change, dual-boot, or a drive carried to
+        // another machine. Last seen at 2000, rescanned with a stamp of 1500: 2000 < 1500 is false,
+        // so the vanish was never registered.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".cleanupstorages_id"), "vol-1").unwrap();
+        fs::write(root.join("gone.txt"), b"DATA").unwrap();
+        let ident = crate::volume::VolumeIdentity {
+            volume_id: "vol-1".into(),
+            label: "T".into(),
+            identified_by: "marker".into(),
+        };
+        scan_volume(&cat, &root, &ident, false, 2000, &test_limits()).unwrap();
+
+        fs::remove_file(root.join("gone.txt")).unwrap();
+        let s = scan_volume(&cat, &root, &ident, false, 1500, &test_limits()).unwrap();
+
+        let status: String = cat
+            .conn
+            .query_row(
+                "SELECT status FROM files WHERE relative_path='gone.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "missing",
+            "a clock moving backwards must not hide a deletion"
+        );
+        assert_eq!(s.marked_missing, 1);
+    }
+
+    #[test]
+    fn a_present_file_is_never_swept_by_the_scan_that_just_saw_it() {
+        // The failure mode of an over-eager fix: changing `<` to `<=` would sweep files the current
+        // scan touched in the same second. Present files must survive every scan, always.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".cleanupstorages_id"), "vol-1").unwrap();
+        fs::write(root.join("here.txt"), b"DATA").unwrap();
+        let ident = crate::volume::VolumeIdentity {
+            volume_id: "vol-1".into(),
+            label: "T".into(),
+            identified_by: "marker".into(),
+        };
+        for stamp in [1000, 1000, 1000, 900] {
+            let s = scan_volume(&cat, &root, &ident, false, stamp, &test_limits()).unwrap();
+            assert_eq!(s.marked_missing, 0, "stamp {stamp} swept a present file");
+        }
+        let status: String = cat
+            .conn
+            .query_row(
+                "SELECT status FROM files WHERE relative_path='here.txt'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "active");
+    }
+
+    #[test]
     fn deleted_file_becomes_missing() {
         let (tmp, cat) = setup();
         let root = tmp.path().join("drive");
@@ -1294,43 +1409,27 @@ mod tests {
         assert!(stats.iter().any(|(id, _, _, _)| id == &identity.volume_id));
     }
 
-    #[derive(Clone)]
-    struct CaptureW(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for CaptureW {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(b);
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureW {
-        type Writer = CaptureW;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     #[test]
-    fn run_scan_logs_volume_resolution() {
-        // Serialize with other subscriber-installing tests (tracing's interest cache is global).
-        let _tracing_lock = crate::observability::tracing_test_guard();
+    fn run_scan_records_the_resolved_volume() {
+        // Was `run_scan_logs_volume_resolution`, which captured tracing output and failed
+        // intermittently under parallel execution (#39). tracing's max level is process-GLOBAL --
+        // the maximum over registered subscribers -- and a thread-local default does not raise it,
+        // so while other tests ran the `info!` could be filtered out before reaching this test's
+        // subscriber. The assertion then failed on an empty string rather than on wrong content.
+        //
+        // A test that fails randomly teaches people to re-run red builds instead of reading them,
+        // which on this project means the next real failure gets waved through as "the flaky one".
+        //
+        // So it asserts the same facts where they are actually durable. The log line reports
+        // volume_id, label and identified_by, and `upsert_volume` persists exactly those on the
+        // next statement -- with no dependence on global logging state.
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("drive");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("x.txt"), b"hi").unwrap();
         let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
 
-        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sub = tracing_subscriber::fmt()
-            .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
-            .with_writer(CaptureW(buf.clone()))
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(sub);
-
-        run_scan(
+        let out = run_scan(
             &cat,
             &root,
             false,
@@ -1341,10 +1440,21 @@ mod tests {
             &test_limits(),
         )
         .unwrap();
-        let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+
+        let (identity, _summary) = out.expect("a writable drive must resolve to a volume");
+        let (stored_label, identified_by): (String, String) = cat
+            .conn
+            .query_row(
+                "SELECT label, identified_by FROM volumes WHERE volume_id=?1",
+                [&identity.volume_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("the resolved volume must be recorded in the catalogue");
+        assert_eq!(stored_label, identity.label);
+        assert_eq!(identified_by, identity.identified_by);
         assert!(
-            logged.to_lowercase().contains("volume"),
-            "expected a volume info line: {logged}"
+            !identity.volume_id.is_empty(),
+            "a resolved volume needs an id"
         );
     }
 
