@@ -588,7 +588,18 @@ impl Catalog {
     ///
     /// The stamp stays exactly wall-clock whenever the clock is sane. It only runs ahead when the
     /// clock is the thing that is wrong, and a monotonic "last seen" is the more useful reading of
-    /// that column anyway.
+    /// that column anyway. One consequence worth knowing: a clock that was once set far into the
+    /// FUTURE pins every later stamp above that value permanently, because the column it reads can
+    /// only go up. That is the price of never letting the sweep silently no-op.
+    ///
+    /// Cost: this walks every row for the volume, because `idx_files_volume` does not cover
+    /// `last_seen_at`. Measured on the live catalogue -- 3.07 s cold for 400,000 rows, 119 ms warm
+    /// -- which extrapolates to roughly six minutes at the 50 million rows a 20 TB corpus implies.
+    /// It runs once per scan, against a scan measured in days, and is **zero on a fresh catalogue**
+    /// because there are no rows to walk. Caching the value per volume would make it O(1) but needs
+    /// an invariant this code does not currently have: `update_archive_hash` stamps an ACTIVE row
+    /// with wall-clock time outside any scan, so a cached per-volume maximum could fall behind the
+    /// rows it is meant to bound. Tracked separately rather than bolted onto a correctness fix.
     pub fn next_seen_stamp(&self, volume_id: &str, now: i64) -> anyhow::Result<i64> {
         let highest: Option<i64> = self.conn.query_row(
             "SELECT MAX(last_seen_at) FROM files WHERE volume_id=?1",
