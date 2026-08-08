@@ -572,6 +572,46 @@ impl Catalog {
         Ok(())
     }
 
+    /// A `last_seen_at` stamp for a new scan of this volume: wall-clock time, but never less than
+    /// one past anything the volume already carries.
+    ///
+    /// The missing-file sweep flags rows with `last_seen_at < scan_started_at`. With a raw
+    /// second-resolution clock that comparison silently stops working in two ordinary situations
+    /// (#45): two scans within the same second make `t < t` false, and a clock that moved backwards
+    /// makes `2000 < 1500` false. In both cases a deleted file stays **stale-active** -- the
+    /// catalogue asserting a file is present when it is gone, which is the unsafe direction here,
+    /// because deduplication can then offer it as the safe copy to keep while the user quarantines
+    /// a real one.
+    ///
+    /// Making the stamp strictly greater restores the comparison without touching `<` itself.
+    /// Changing `<` to `<=` would NOT do: it would sweep the files the current scan just touched.
+    ///
+    /// The stamp stays exactly wall-clock whenever the clock is sane. It only runs ahead when the
+    /// clock is the thing that is wrong, and a monotonic "last seen" is the more useful reading of
+    /// that column anyway. One consequence worth knowing: a clock that was once set far into the
+    /// FUTURE pins every later stamp above that value permanently, because the column it reads can
+    /// only go up. That is the price of never letting the sweep silently no-op.
+    ///
+    /// Cost: this walks every row for the volume, because `idx_files_volume` does not cover
+    /// `last_seen_at`. Measured on the live catalogue -- 3.07 s cold for 400,000 rows, 119 ms warm
+    /// -- which extrapolates to roughly six minutes at the 50 million rows a 20 TB corpus implies.
+    /// It runs once per scan, against a scan measured in days, and is **zero on a fresh catalogue**
+    /// because there are no rows to walk. Caching the value per volume would make it O(1) but needs
+    /// an invariant this code does not currently have: `update_archive_hash` stamps an ACTIVE row
+    /// with wall-clock time outside any scan, so a cached per-volume maximum could fall behind the
+    /// rows it is meant to bound. Tracked separately rather than bolted onto a correctness fix.
+    pub fn next_seen_stamp(&self, volume_id: &str, now: i64) -> anyhow::Result<i64> {
+        let highest: Option<i64> = self.conn.query_row(
+            "SELECT MAX(last_seen_at) FROM files WHERE volume_id=?1",
+            params![volume_id],
+            |r| r.get(0),
+        )?;
+        Ok(match highest {
+            Some(h) if h >= now => h + 1,
+            _ => now,
+        })
+    }
+
     /// Quarantine a row while KEEPING its `container_chain`.
     ///
     /// `mark_quarantined` clears the chain, which is right when an entry has been extracted into a
