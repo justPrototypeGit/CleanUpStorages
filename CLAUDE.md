@@ -73,6 +73,22 @@ Actionable work is tracked as **GitHub issues** (`gh issue list`), not scattered
 - The **reliability constraint** above binds every issue that touches file operations — a fix that
   could lose or corrupt data is never "done", regardless of the issue text.
 
+## Building in public
+
+Finished work is post material. After anything notable merges — a feature, a fix with a real number,
+a decision reversed, a measurement that surprised — append the raw material to
+[posts/POST-MATERIAL.md](posts/POST-MATERIAL.md) **as part of finishing the work**, not later: the
+hook, the figures with their source, and the honest beat. `posts/` is gitignored, so drafts stay
+local while the practice stays documented.
+
+Draft a full post only when there is a genuine story — a surprise, a reversal, a null result, or a
+number that changes what someone would do. Routine merges get a material line, not a post. The
+series is worth reading precisely because it is not a changelog.
+
+The rules that keep it honest live in [posts/ROADMAP.md](posts/ROADMAP.md): never invent a number,
+every figure traces to a recorded run, say what was **not** verified, and if a post needs a number
+that does not exist yet then it is not ready — it goes back to the trigger list.
+
 ## Documentation map
 
 - Approved design spec: `docs/superpowers/specs/2026-07-04-cleanupstorages-design.md`
