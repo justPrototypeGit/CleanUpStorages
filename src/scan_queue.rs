@@ -295,6 +295,29 @@ impl ScanQueue {
             // temp catalogue wrote its snapshot next to the user's real one, and retention then
             // evicted genuine snapshots. `cfg` is still right for the archive limits above.
             let _ = crate::catalog::backup::snapshot_beside(&catalog_path, now);
+
+            // Rebuild the identical-folder index for the volume this job scanned.
+            //
+            // The CLI's `cmd_scan` already did this; the queue -- which is how the web UI runs
+            // every scan -- did not, so a user who scans from the Scan page got an empty
+            // `directory_trees` and the whole duplicate-collapse feature silently produced
+            // nothing. Found on a real 4 TB scan, where the table came back with zero rows (#38's
+            // wiring covered only one of the two ways a scan can start).
+            //
+            // Skipped for a stopped scan, matching the CLI: a partial pass has not seen the whole
+            // volume, and hashing a half-seen tree would invent folders that differ only because
+            // the scan never reached the rest of them.
+            if let Some((identity, summary)) = scanned.as_ref() {
+                if !summary.stopped {
+                    match cat.rebuild_directory_trees(&identity.volume_id, now) {
+                        Ok(n) => tracing::info!(directories = n, "rebuilt directory trees"),
+                        // Best-effort, like the snapshot above: this is derived data that the next
+                        // scan recomputes, and failing the job over it would be worse.
+                        Err(e) => tracing::warn!("could not rebuild directory trees: {e}"),
+                    }
+                }
+            }
+
             let (hashed, skipped, errors, archive_entries) = counters_for_job.snapshot();
             Ok(match scanned {
                 Some((_id, s)) => ScanResult {
