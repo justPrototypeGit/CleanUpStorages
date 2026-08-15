@@ -36,3 +36,6 @@ StitchExport/
 
 # LinkedIn / marketing post drafts — local only, not part of the project
 posts/
+
+# Local, non-public working notes loaded alongside CLAUDE.md.
+CLAUDE.local.md
