@@ -823,6 +823,7 @@ pub fn review_page(csrf: &str) -> String {
       Confirming one moves the entire folder to <span class="mono">_ToDelete</span> in a single
       rename — the other copy stays where it is, and nothing is deleted until you purge.</p>
     <div id="treelist"></div>
+  <div id="treeblocked"></div>
   </section>
   <div id="group"></div>
   <div class="mut" id="upnext" style="font-size:12px;margin-top:14px;text-align:center"></div>
@@ -935,11 +936,34 @@ const fmtB=n=>{const u=['B','KB','MB','GB','TB'];let i=0,x=Number(n)||0;
   while(x>=1024&&i<u.length-1){x/=1024;i++;} return (i===0?x:x.toFixed(1))+' '+u[i];};
 async function loadTrees(){
   let data; try{ data=await apiGet("/api/tree-duplicates"); }catch(e){ return; }
-  const sec=$("#treesec"), host=$("#treelist");
+  const sec=$("#treesec"), host=$("#treelist"), blocked=$("#treeblocked");
   if(!data.groups.length){ sec.style.display="none"; return; }
   sec.style.display="";
-  host.textContent="";
-  for(const g of data.groups){
+  host.textContent=""; blocked.textContent="";
+  // Split rather than sort-and-hope. On the real catalogue 1,273 of 2,792 groups have every copy
+  // inside an archive, so they cannot be quarantined at all; leaving them interleaved buries the
+  // 1,519 you can act on. They stay visible, with the reason, but out of the way (#59).
+  const act=data.groups.filter(g=>g.actionable), lock=data.groups.filter(g=>!g.actionable);
+  const lockBytes=lock.reduce((a,g)=>a+g.reclaimable_bytes,0);
+  if(lock.length){
+    const d=document.createElement("details");
+    d.style.cssText="margin-top:14px";
+    const sum=document.createElement("summary");
+    sum.style.cssText="cursor:pointer;font-size:13px;color:var(--mut)";
+    sum.textContent=lock.length.toLocaleString()+" more folders are duplicated only inside archives ("
+      +fmtB(lockBytes)+") — these need a repack, not a move";
+    d.appendChild(sum);
+    const inner=document.createElement("div");
+    inner.style.cssText="margin-top:10px";
+    d.appendChild(inner);
+    blocked.appendChild(d);
+    renderGroups(lock, inner);
+  }
+  renderGroups(act, host);
+}
+
+function renderGroups(groups, host){
+  for(const g of groups){
     const box=document.createElement("div");
     box.className="card";
     box.style.cssText="padding:12px 14px;margin-bottom:10px";

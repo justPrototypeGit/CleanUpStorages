@@ -270,6 +270,16 @@ impl ScanQueue {
             // queue's `recent` list (see `error_result` below).
             // It also removes a real race: the two old calls could disagree if the config changed
             // between them.
+            // Same guard as the CLI (#60): the in-process queue serialises its own jobs, but
+            // nothing stops a CLI scan running while the web UI is open, and that collision used
+            // to surface as `database is locked` minutes in.
+            if let Some((id, other, started_at)) = cat.running_scan()? {
+                let mins = (now.saturating_sub(started_at)) / 60;
+                anyhow::bail!(
+                    "a scan is already running against this catalogue (run #{id}, {other},                      started {mins} minutes ago); wait for it to finish or stop it first"
+                );
+            }
+
             let cfg = crate::config::Config::default_paths()?;
             let limits = crate::archive::ArchiveLimits::from_config(&cfg);
             let progress: &dyn crate::scanner::Progress = counters_for_job.as_ref();
