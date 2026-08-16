@@ -72,6 +72,16 @@ pub fn cmd_scan(
 ) -> anyhow::Result<()> {
     let (cfg, cat) = open_catalog_checked()?;
     let now = now_secs();
+
+    // Refuse a collision up front rather than dying on the write lock minutes later (#60). One
+    // writer is the correct design for a SQLite catalogue; the defect was that the user found out
+    // via `database is locked`, four minutes into walking a 4 TB drive.
+    if let Some((id, other, started_at)) = cat.running_scan()? {
+        let mins = now.saturating_sub(started_at) / 60;
+        anyhow::bail!(
+            "a scan is already running against this catalogue (run #{id}, {other}, started {mins}              minutes ago). Wait for it to finish or stop it first -- two scans cannot write to the              catalogue at once."
+        );
+    }
     let stop = crate::scan_control::install_signal_handler();
     let progress = crate::scan_control::CliProgress::new();
 

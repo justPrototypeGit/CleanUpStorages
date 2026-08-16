@@ -947,6 +947,13 @@ struct TreeGroupDto {
     dir_hash: String,
     reclaimable_bytes: i64,
     file_count: i64,
+    /// True when at least one copy is a loose folder, i.e. something can actually be quarantined
+    /// while another copy survives.
+    ///
+    /// On the first real 4 TB scan, 73% of rendered folder entries were inside archives and could
+    /// not be acted on at all (#59). A correct list that is mostly unactionable is not a worklist,
+    /// so the client ranks and groups on this rather than showing everything at one level.
+    actionable: bool,
     members: Vec<TreeMemberDto>,
 }
 
@@ -970,16 +977,12 @@ async fn api_tree_duplicates(
         .map(|(id, label, _, _)| (id, label))
         .collect();
     let mounts = state.mounts.snapshot();
-    let groups = cat
+    let mut groups: Vec<TreeGroupDto> = cat
         .tree_duplicate_groups()
         .map_err(err500)?
         .into_iter()
-        .map(|g| TreeGroupDto {
-            dir_hash: g.dir_hash,
-            reclaimable_bytes: g.reclaimable_bytes,
-            // Every member of a group holds the same tree, so any member's count describes them all.
-            file_count: g.members.first().map(|m| m.file_count).unwrap_or(0),
-            members: g
+        .map(|g| {
+            let members: Vec<TreeMemberDto> = g
                 .members
                 .iter()
                 .map(|m| TreeMemberDto {
@@ -994,9 +997,25 @@ async fn api_tree_duplicates(
                     path: m.path.clone(),
                     total_bytes: m.total_bytes,
                 })
-                .collect(),
+                .collect();
+            TreeGroupDto {
+                dir_hash: g.dir_hash,
+                reclaimable_bytes: g.reclaimable_bytes,
+                // Every member of a group holds the same tree, so any member's count describes all.
+                file_count: g.members.first().map(|m| m.file_count).unwrap_or(0),
+                actionable: members.iter().any(|m| !m.needs_repack),
+                members,
+            }
         })
         .collect();
+
+    // Actionable first, then by size within each half. Sorting here rather than in the client keeps
+    // the two consumers -- page and any future CLI -- from disagreeing about what "first" means.
+    groups.sort_by(|a, b| {
+        b.actionable
+            .cmp(&a.actionable)
+            .then(b.reclaimable_bytes.cmp(&a.reclaimable_bytes))
+    });
     Ok(Json(TreeDuplicatesDto { groups }))
 }
 
@@ -3841,6 +3860,48 @@ mod tests {
         );
     }
 
+    // Two identical loose folders (actionable) PLUS a pair that exists only inside an archive
+    // (blocked), so a test can tell the two apart.
+    fn seed_identical_archive_trees() -> (tempfile::TempDir, PathBuf, AppState) {
+        let (tmp, db, state) = seed_identical_trees();
+        {
+            let cat = crate::catalog::Catalog::open(&db).unwrap();
+            // One archive holding the same folder twice under different names. Its own row makes it
+            // an archive; the entries make it a directory.
+            cat.upsert_file(
+                &crate::catalog::models::NewFile {
+                    volume_id: "vol-1".into(),
+                    relative_path: "backup.zip".into(),
+                    filename: "backup.zip".into(),
+                    extension: "zip".into(),
+                    size_bytes: 9,
+                    content_hash: "ZIPHASH".into(),
+                    created_time: None,
+                    modified_time: None,
+                    accessed_time: None,
+                    category: crate::category::Category::Other,
+                    container_chain: None,
+                },
+                100,
+            )
+            .unwrap();
+            for chain in ["Alpha/x.txt", "Beta/x.txt"] {
+                cat.conn
+                    .execute(
+                        "INSERT INTO files(volume_id, relative_path, filename, extension,
+                             size_bytes, content_hash, category, container_chain, status,
+                             first_seen_at, last_seen_at)
+                         VALUES ('vol-1','backup.zip','x.txt','txt',64,'INNERHASH','document',
+                                 ?1,'active',100,100)",
+                        rusqlite::params![chain],
+                    )
+                    .unwrap();
+            }
+            cat.rebuild_directory_trees("vol-1", 100).unwrap();
+        }
+        (tmp, db, state)
+    }
+
     #[tokio::test]
     async fn tree_duplicates_lists_a_group_with_its_blast_radius() {
         let (_t, _db, state) = seed_identical_trees();
@@ -3856,6 +3917,40 @@ mod tests {
         assert_eq!(m["volume_label"], "Photos HDD");
         assert_eq!(m["needs_repack"], false);
         assert_eq!(m["mounted"], true);
+    }
+
+    #[tokio::test]
+    async fn tree_duplicates_flags_and_ranks_actionable_groups_first() {
+        // #59: on the real 4 TB scan, 73% of rendered folder entries were inside archives and could
+        // not be acted on. A group is actionable only when at least one copy is a loose folder --
+        // something that can actually be quarantined while another copy survives.
+        let (_t, _db, state) = seed_identical_archive_trees();
+        let v = get_json_state(state, "/api/tree-duplicates").await;
+        let groups = v["groups"].as_array().unwrap();
+        assert!(!groups.is_empty());
+        for g in groups {
+            let any_loose = g["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["needs_repack"] == false);
+            assert_eq!(
+                g["actionable"], any_loose,
+                "actionable must mean 'at least one copy can be moved'"
+            );
+        }
+        // Actionable groups sort ahead of blocked ones, whatever their size.
+        let flags: Vec<bool> = groups
+            .iter()
+            .map(|g| g["actionable"].as_bool().unwrap())
+            .collect();
+        let first_blocked = flags.iter().position(|a| !a);
+        if let Some(i) = first_blocked {
+            assert!(
+                flags[i..].iter().all(|a| !a),
+                "an actionable group must never sort after a blocked one: {flags:?}"
+            );
+        }
     }
 
     #[tokio::test]
