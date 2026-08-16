@@ -90,6 +90,44 @@ impl Catalog {
     }
 
     /// Most recent runs, newest first.
+    /// A scan that is genuinely running right now, if any: `(id, root_path, started_at)`.
+    ///
+    /// One writer is the correct design for a SQLite catalogue -- the scanner holds a write
+    /// transaction almost continuously, so a second scanner simply cannot proceed. The defect this
+    /// exists to fix is that the collision used to be discovered four minutes in, as
+    /// `database is locked`, which tells the user nothing about what happened (#60).
+    ///
+    /// Liveness comes from the heartbeat added for #36, so a run left `running` by a hard kill is
+    /// correctly NOT treated as blocking.
+    pub fn running_scan(&self) -> anyhow::Result<Option<(i64, String, i64)>> {
+        let db_path = match self.db_path() {
+            Some(p) => p,
+            // An in-memory catalogue has no directory to hold heartbeats, so it cannot host a
+            // second process either. Nothing to block on.
+            None => return Ok(None),
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, root_path, started_at FROM scan_runs
+              WHERE status='running' ORDER BY started_at DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows.into_iter().find(|(id, _, started_at)| {
+            crate::scan_heartbeat::is_alive(&db_path, *id, *started_at, now)
+        }))
+    }
+
     pub fn recent_scan_runs(&self, limit: usize) -> anyhow::Result<Vec<ScanRun>> {
         // A 'running' row whose heartbeat has gone stale is REPORTED as interrupted here and
         // nowhere else, so the Scan page and the CLI cannot disagree. Nothing is written back: a
@@ -191,6 +229,42 @@ mod tests {
         assert_eq!(runs[0].status, "running");
         assert_eq!(runs[0].finished_at, None);
         assert_eq!(runs[0].root_path, "D:/drive");
+    }
+
+    #[test]
+    fn a_live_scan_blocks_a_second_one_and_a_dead_one_does_not() {
+        // #60: a second scan used to run for minutes and then die on `database is locked`. It now
+        // refuses immediately. The other half matters just as much -- a run left `running` by a
+        // hard kill must NOT block scanning forever, or one power cut locks the tool out.
+        let (tmp, cat) = open();
+        let db = tmp.path().join("c.db");
+
+        assert!(cat.running_scan().unwrap().is_none(), "nothing running yet");
+
+        // Started long ago -- like the real 12.75-hour scan -- so the only thing keeping it alive
+        // is the heartbeat itself, not `is_alive`'s grace window for freshly-started runs.
+        let id = cat
+            .start_scan_run(Some("v1"), "D:/drive", now_secs() - 86_400, false)
+            .unwrap();
+        let _hb = crate::scan_heartbeat::Heartbeat::start(&db, id);
+        let live = cat.running_scan().unwrap();
+        assert!(live.is_some(), "a beating scan must block a second one");
+        assert_eq!(
+            live.unwrap().1,
+            "D:/drive",
+            "and must name the other scan's path"
+        );
+
+        // A run stamped long ago with nothing beating for it is a hard kill, not a live scan.
+        let dead = cat
+            .start_scan_run(Some("v1"), "E:/other", now_secs() - 86_400, false)
+            .unwrap();
+        assert_ne!(dead, id);
+        drop(_hb);
+        assert!(
+            cat.running_scan().unwrap().is_none(),
+            "a hard-killed run must not lock the tool out of ever scanning again"
+        );
     }
 
     #[test]
