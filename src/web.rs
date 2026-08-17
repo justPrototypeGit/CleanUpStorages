@@ -960,6 +960,16 @@ struct TreeGroupDto {
 #[derive(Serialize)]
 struct TreeDuplicatesDto {
     groups: Vec<TreeGroupDto>,
+    /// Total groups available, so the client knows whether asking for more is worthwhile.
+    total: usize,
+    /// Groups before this page, echoed back so a client cannot lose its place.
+    offset: usize,
+}
+
+#[derive(Deserialize)]
+struct PageParams {
+    limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 /// Maximal identical-folder groups, ranked by reclaimable bytes.
@@ -968,6 +978,7 @@ struct TreeDuplicatesDto {
 /// into about 1,458. The per-file list remains for what does not collapse.
 async fn api_tree_duplicates(
     State(state): State<AppState>,
+    Query(p): Query<PageParams>,
 ) -> Result<Json<TreeDuplicatesDto>, (StatusCode, String)> {
     let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
     // `effective_labels`, NOT `volume_stats`: the latter returns the DETECTED label, so two
@@ -1015,7 +1026,19 @@ async fn api_tree_duplicates(
             .cmp(&a.actionable)
             .then(b.reclaimable_bytes.cmp(&a.reclaimable_bytes))
     });
-    Ok(Json(TreeDuplicatesDto { groups }))
+
+    // Page AFTER sorting, so the first page is the most valuable groups rather than an arbitrary
+    // slice. On the real catalogue the whole set is 2.6 MB and the top 20 groups carry 63% of all
+    // reclaimable space, so the default page is where nearly all the value is.
+    let total = groups.len();
+    let offset = p.offset.unwrap_or(0).min(total);
+    let limit = p.limit.unwrap_or(100).clamp(1, 1000);
+    let groups = groups.into_iter().skip(offset).take(limit).collect();
+    Ok(Json(TreeDuplicatesDto {
+        groups,
+        total,
+        offset,
+    }))
 }
 
 #[derive(Deserialize)]
