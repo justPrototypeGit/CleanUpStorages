@@ -970,12 +970,11 @@ async fn api_tree_duplicates(
     State(state): State<AppState>,
 ) -> Result<Json<TreeDuplicatesDto>, (StatusCode, String)> {
     let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
-    let labels: std::collections::HashMap<String, String> = cat
-        .volume_stats()
-        .map_err(err500)?
-        .into_iter()
-        .map(|(id, label, _, _)| (id, label))
-        .collect();
+    // `effective_labels`, NOT `volume_stats`: the latter returns the DETECTED label, so two
+    // drives both first seen as `D:\` render as identical rows with identical buttons and the
+    // user cannot tell which physical drive a Quarantine acts on (#62). The name set on the
+    // Drives page exists precisely to disambiguate this, and this view was ignoring it.
+    let labels = cat.effective_labels().map_err(err500)?;
     let mounts = state.mounts.snapshot();
     let mut groups: Vec<TreeGroupDto> = cat
         .tree_duplicate_groups()
@@ -3917,6 +3916,26 @@ mod tests {
         assert_eq!(m["volume_label"], "Photos HDD");
         assert_eq!(m["needs_repack"], false);
         assert_eq!(m["mounted"], true);
+    }
+
+    #[tokio::test]
+    async fn tree_duplicates_shows_the_name_the_user_set_not_the_detected_label() {
+        // #62: both real drives were first seen as `D:\`, so a cross-drive pair rendered as two
+        // identical rows with identical Quarantine buttons -- no way to tell which physical drive
+        // was about to be emptied, across 255 groups worth 1.86 TB. The display name exists to
+        // disambiguate exactly this, and this view was reading the detected label instead.
+        let (_t, db, state) = seed_identical_trees();
+        {
+            let cat = crate::catalog::Catalog::open(&db).unwrap();
+            cat.set_volume_meta("vol-1", Some("Uni Big"), None, 200)
+                .unwrap();
+        }
+        let v = get_json_state(state, "/api/tree-duplicates").await;
+        let m = &v["groups"][0]["members"][0];
+        assert_eq!(
+            m["volume_label"], "Uni Big",
+            "the folder view must show the name the user set, or two drives are indistinguishable"
+        );
     }
 
     #[tokio::test]
