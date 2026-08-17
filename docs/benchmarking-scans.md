@@ -728,3 +728,24 @@ It adds one more index to maintain on the insert path, which #26 worked to make 
 paid per rescan rather than continuously, and this corpus is now catalogued, so the trade is
 different from what it would have been six months ago. **Time a full rescan before assuming it is
 negligible.**
+
+### Batching the folder view
+
+The endpoint was fast but still shipped everything: 2.6 MB and thousands of rows built into the DOM
+at once. It now takes `limit`/`offset` and returns `total`, paging **after** sorting so the first
+page is the most valuable groups rather than an arbitrary slice.
+
+| | payload |
+| --- | --- |
+| unpaged (as it was) | 2.6 MB |
+| default page of 100 | **0.08 MB** |
+
+`limit` is clamped to 1000, so a client cannot ask for the whole set by accident.
+
+The page loads one batch and offers "Load more", rather than infinite scroll. This is a worklist
+where the next action may be deleting 749 GB, and a control the user presses is easier to reason
+about than rows appearing while they are reading a path.
+
+Worth keeping in proportion: the measured concentration says the **top 20 groups carry 63%** of all
+reclaimable space, so the default first page already contains essentially everything worth acting
+on.
