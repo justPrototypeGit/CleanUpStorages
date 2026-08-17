@@ -356,7 +356,45 @@ impl Catalog {
         Ok(out)
     }
 
+    /// Recompute the stored per-volume totals.
+    ///
+    /// Called at the same points that rebuild `directory_trees` -- after a completed scan, after
+    /// quarantine, after purge -- because those are exactly when the totals change. Derived data:
+    /// safe to drop, and a rescan always corrects it. Nothing destructive reads it, so a stale
+    /// total is a display problem and never a safety one.
+    pub fn refresh_volume_totals(&self, volume_id: &str) -> anyhow::Result<()> {
+        self.conn.execute(
+            "UPDATE volumes SET
+                 active_files = (SELECT COUNT(*) FROM files
+                                  WHERE volume_id=?1 AND status='active'),
+                 active_bytes = (SELECT IFNULL(SUM(size_bytes),0) FROM files
+                                  WHERE volume_id=?1 AND status='active')
+               WHERE volume_id=?1",
+            params![volume_id],
+        )?;
+        Ok(())
+    }
+
     pub fn volume_stats(&self) -> anyhow::Result<Vec<(String, String, i64, i64)>> {
+        // Stored totals when they exist. On the real catalogue the live aggregate below takes ~3 s
+        // because it walks 3.1M rows for two numbers that change only when a scan runs; reading
+        // them back is a two-row lookup. A volume whose totals were never computed (an existing
+        // catalogue, before its next scan) falls through to the live query, so this is never wrong,
+        // only sometimes slow.
+        let mut pre = self.conn.prepare(
+            "SELECT volume_id, COALESCE(NULLIF(display_name,''), label), active_files, active_bytes
+               FROM volumes ORDER BY label",
+        )?;
+        let rows: Vec<(String, String, Option<i64>, Option<i64>)> = pre
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !rows.is_empty() && rows.iter().all(|(_, _, f, b)| f.is_some() && b.is_some()) {
+            return Ok(rows
+                .into_iter()
+                .map(|(id, label, f, b)| (id, label, f.unwrap_or(0), b.unwrap_or(0)))
+                .collect());
+        }
+
         let mut stmt = self.conn.prepare(
             "SELECT v.volume_id, v.label,
                     count(f.id) FILTER (WHERE f.status='active'),
@@ -2144,6 +2182,44 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "active", "a returning file must come back to life");
+    }
+
+    #[test]
+    fn volume_stats_uses_stored_totals_and_falls_back_when_absent() {
+        // The totals are derived: refreshed where directory_trees is, and safe to be absent.
+        // A catalogue that predates the columns must still report correct numbers -- slowly is
+        // fine, wrong is not.
+        let (_t, cat) = open_tmp();
+        put(&cat, "vol-1", "a.txt", "H1", 10, 100);
+        put(&cat, "vol-1", "b.txt", "H2", 25, 100);
+
+        // Nothing stored yet: the live aggregate must still be right.
+        let s = cat.volume_stats().unwrap();
+        assert_eq!(s[0].2, 2, "fallback must count active files");
+        assert_eq!(s[0].3, 35, "fallback must sum active bytes");
+
+        cat.refresh_volume_totals("vol-1").unwrap();
+        let s = cat.volume_stats().unwrap();
+        assert_eq!(
+            (s[0].2, s[0].3),
+            (2, 35),
+            "stored totals must match the live aggregate"
+        );
+
+        // And the stored path is genuinely being used: poison the column and watch it come back.
+        cat.conn
+            .execute(
+                "UPDATE volumes SET active_files=999 WHERE volume_id='vol-1'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            cat.volume_stats().unwrap()[0].2,
+            999,
+            "volume_stats must be reading the stored column, not recomputing"
+        );
+        cat.refresh_volume_totals("vol-1").unwrap();
+        assert_eq!(cat.volume_stats().unwrap()[0].2, 2, "a refresh corrects it");
     }
 
     #[test]

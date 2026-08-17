@@ -152,6 +152,7 @@ pub fn cmd_scan(
                 // picture of the volume is incomplete by definition, and hashing a half-seen tree
                 // would invent folders that differ only because the scan never reached the rest.
                 let dirs = cat.rebuild_directory_trees(&identity.volume_id, now)?;
+                cat.refresh_volume_totals(&identity.volume_id)?;
                 tracing::info!(directories = dirs, "rebuilt directory trees");
             }
             print!("{}", s.metrics.report());
@@ -291,6 +292,7 @@ pub fn cmd_quarantine(mount: &Path, ids: &[i64]) -> anyhow::Result<()> {
     // What is active just changed, so any identical-tree group involving these files is stale.
     // Leaving it would keep offering a pair whose other side is already in _ToDelete.
     cat.rebuild_directory_trees(&vid, now)?;
+    cat.refresh_volume_totals(&vid)?;
     let snap = snapshot(&cfg, now)?;
     println!("Catalog snapshot: {}", snap.display());
     Ok(())
@@ -386,8 +388,33 @@ pub fn cmd_repack(mount: &Path, entry_id: i64) -> anyhow::Result<()> {
 }
 
 pub fn cmd_browse(open: bool) -> anyhow::Result<()> {
-    let (cfg, cat) = open_catalog_checked()?;
+    // Deliberately NOT `open_catalog_checked`: PRAGMA integrity_check over a 3.9 GB catalogue takes
+    // 80 seconds, and it ran before the port opened, on every launch, to re-verify something that
+    // had not changed since last time. That was the single worst number in the UI.
+    //
+    // The check still runs -- on a background thread, once the server is already answering -- and
+    // still reports. What moved is only the blocking. Nothing destructive is reachable from the web
+    // UI without its own guard, and every CLI verb that mutates still checks synchronously first,
+    // because there the user is already waiting on a long operation.
+    let (cfg, cat) = open_catalog()?;
     drop(cat); // handlers open their own short-lived connections
+
+    let check_path = cfg.catalog_path.clone();
+    std::thread::spawn(move || match Catalog::open_readonly(&check_path) {
+        Ok(cat) => match cat.integrity_ok() {
+            Ok(true) => tracing::info!("catalog integrity check passed"),
+            // Loud, and it names the recovery path. A corrupt catalogue must never be quiet just
+            // because the check moved off the startup path.
+            Ok(false) => tracing::error!(
+                "CATALOG FAILED ITS INTEGRITY CHECK -- restore the newest snapshot from {}",
+                crate::config::backups_dir_for(&check_path)
+                    .join("")
+                    .display()
+            ),
+            Err(e) => tracing::warn!("could not run the catalog integrity check: {e}"),
+        },
+        Err(e) => tracing::warn!("could not open the catalog to check its integrity: {e}"),
+    });
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
