@@ -319,6 +319,7 @@ impl ScanQueue {
             // the scan never reached the rest of them.
             if let Some((identity, summary)) = scanned.as_ref() {
                 if !summary.stopped {
+                    let _ = cat.refresh_volume_totals(&identity.volume_id);
                     match cat.rebuild_directory_trees(&identity.volume_id, now) {
                         Ok(n) => tracing::info!(directories = n, "rebuilt directory trees"),
                         // Best-effort, like the snapshot above: this is derived data that the next

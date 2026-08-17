@@ -1059,6 +1059,7 @@ async fn api_quarantine_tree(
         let out = crate::tree_quarantine::quarantine_tree(&cat, &mount, &vid, &path, now)?;
         // The group the user just acted on is stale now; rebuild before anyone reads it again.
         cat.rebuild_directory_trees(&vid, now)?;
+        cat.refresh_volume_totals(&vid)?;
         Ok::<_, anyhow::Error>(out)
     })
     .await

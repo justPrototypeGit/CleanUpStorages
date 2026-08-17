@@ -678,3 +678,53 @@ path instead of cloning it.
 Note the allocations scale with row count and so does runtime, so this was a ~5% constant factor
 rather than something that degrades at 20 TB. If the rebuild ever does look slow on the real corpus,
 **measure before optimising** -- the sort SQLite performs is the untested part, not this.
+
+## Web UI responsiveness (#28)
+
+Measured on the real catalogue: 3,123,556 rows, 5.62 TB, two drives. Same machine, same catalogue
+copy, before and after.
+
+| | before | after |
+| --- | --- | --- |
+| `browse` start → listening (first run) | 80,000 ms | 26,059 ms |
+| `browse` start → listening (**subsequent**) | 80,000 ms | **1,387 ms** |
+| `GET /api/drives` | 15,956 ms | **105 ms** |
+| `GET /api/duplicates?limit=50` | 14,542 ms | **95 ms** |
+| `GET /api/stats` | 10,022 ms | **101 ms** |
+| `GET /api/volumes` | 4,046 ms | **101 ms** |
+| `GET /api/search` | 3,810 ms | **103 ms** |
+| `GET /api/tree-duplicates` | 3,507 ms | **94 ms** |
+
+Response bytes are unchanged, and the figures they carry are identical: 101,022 duplicate groups,
+2.61 TB reclaimable, 1,946 tree groups of which 1,201 actionable at 2.39 TB.
+
+### What was actually wrong
+
+Not payload size. `/api/stats` took ten seconds to produce **401 bytes**. Every HTML page already
+rendered in 79–96 ms; the whole problem was in the API calls.
+
+**Aggregates were not covered by their indexes.** `volume_stats` used `idx_files_volume`, which
+carries only `volume_id`, so SQLite read `status` and `size_bytes` from the table for all 3.1 M
+rows. The tell was `status counts`, whose index happens to cover it: 186 ms against seconds for its
+neighbours.
+
+One covering index on `(status, container_chain, content_hash, size_bytes)` fixed the duplicate
+queries outright — grouping **2,779 → 51 ms**, member lookup **3,039 → 2 ms**. It costs **+511 MB**
+(3.95 → 4.46 GB) and about 15 s to build once.
+
+**Per-volume totals were recomputed on every page load** and change only when a scan, quarantine or
+purge runs. A covering index alone still left a 3.1 M-row GROUP BY at 2.9 s, so they are stored on
+`volumes` instead and refreshed at the same points as `directory_trees`. `volume_stats` falls back
+to the live aggregate when they are absent, so an older catalogue is slow rather than wrong.
+
+**The 80 s was `PRAGMA integrity_check`** over a 3.9 GB file, running before the port opened, on
+every launch, to re-verify something unchanged since last time. It now runs on a background thread
+after the server is answering. It still runs, still reports, and still gates every destructive CLI
+verb synchronously — only the blocking moved.
+
+### The index is not free
+
+It adds one more index to maintain on the insert path, which #26 worked to make cheap. That cost is
+paid per rescan rather than continuously, and this corpus is now catalogued, so the trade is
+different from what it would have been six months ago. **Time a full rescan before assuming it is
+negligible.**
