@@ -934,12 +934,21 @@ $("#minsize").addEventListener("change",()=>{ minSize=Number($("#minsize").value
 // this turns ~126,000 individual choices into ~1,500.
 const fmtB=n=>{const u=['B','KB','MB','GB','TB'];let i=0,x=Number(n)||0;
   while(x>=1024&&i<u.length-1){x/=1024;i++;} return (i===0?x:x.toFixed(1))+' '+u[i];};
-async function loadTrees(){
-  let data; try{ data=await apiGet("/api/tree-duplicates"); }catch(e){ return; }
+let treeOffset=0, treeTotal=0;
+async function loadTrees(more){
+  // Batched, not all at once: the full set is ~2.6 MB and thousands of rows, and the top of the
+  // list carries nearly all the reclaimable space. Fetch a page, render it, and ask for the next
+  // one only if the user actually wants it.
+  if(!more) treeOffset=0;
+  let data; try{
+    data=await apiGet("/api/tree-duplicates?limit=100&offset="+treeOffset);
+  }catch(e){ return; }
+  treeTotal=data.total;
   const sec=$("#treesec"), host=$("#treelist"), blocked=$("#treeblocked");
-  if(!data.groups.length){ sec.style.display="none"; return; }
+  if(!data.groups.length && !more){ sec.style.display="none"; return; }
   sec.style.display="";
-  host.textContent=""; blocked.textContent="";
+  if(!more){ host.textContent=""; blocked.textContent=""; }
+  treeOffset += data.groups.length;
   // Split rather than sort-and-hope. On the real catalogue 1,273 of 2,792 groups have every copy
   // inside an archive, so they cannot be quarantined at all; leaving them interleaved buries the
   // 1,519 you can act on. They stay visible, with the reason, but out of the way (#59).
@@ -957,12 +966,26 @@ async function loadTrees(){
     inner.style.cssText="margin-top:10px";
     d.appendChild(inner);
     blocked.appendChild(d);
-    renderGroups(lock, inner);
+    renderGroups(lock, inner, false);
   }
-  renderGroups(act, host);
+  renderGroups(act, host, !!more);
+
+  // A "Load more" button rather than infinite scroll: this is a worklist, and a control the user
+  // presses is easier to reason about than rows appearing while they read a path they may be about
+  // to delete.
+  const old=document.getElementById("treemore"); if(old) old.remove();
+  if(treeOffset < treeTotal){
+    const b=document.createElement("button");
+    b.id="treemore"; b.className="linkbtn"; b.style.cssText="margin-top:12px;font-size:12.5px";
+    b.textContent="Load more ("+(treeTotal-treeOffset).toLocaleString()+" groups left)";
+    b.addEventListener("click", async ()=>{ b.disabled=true; b.textContent="Loading...";
+      await loadTrees(true); });
+    host.parentNode.insertBefore(b, host.nextSibling);
+  }
 }
 
-function renderGroups(groups, host){
+function renderGroups(groups, host, append){
+  if(!append) host.textContent="";
   for(const g of groups){
     const box=document.createElement("div");
     box.className="card";

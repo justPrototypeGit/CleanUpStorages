@@ -31,6 +31,12 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
             original_path  TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_files_hash ON files(content_hash);
+        -- Covers the duplicate queries end to end, so SQLite never touches the table for them.
+        -- Measured on the real catalogue (3.1M rows): grouping 2,779 -> 51 ms, member lookup
+        -- 3,039 -> 2 ms. Costs ~511 MB and ~15 s to build. Worth it because those two queries are
+        -- what the review page is made of, and the scanning this index taxes is essentially done.
+        CREATE INDEX IF NOT EXISTS idx_files_dedup
+            ON files(status, container_chain, content_hash, size_bytes);
         CREATE INDEX IF NOT EXISTS idx_files_volume ON files(volume_id);
         CREATE INDEX IF NOT EXISTS idx_files_status ON files(status);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_files_loose_identity
@@ -145,6 +151,11 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
     ensure_column(conn, "volumes", "last_scanned_path", "TEXT")?;
     ensure_column(conn, "volumes", "display_name", "TEXT")?;
     ensure_column(conn, "volumes", "description", "TEXT")?;
+    // Derived per-volume totals, so the Drives and Overview pages stop aggregating 3.1M rows on
+    // every load. NULL means "not computed yet" and callers fall back to the live query, which is
+    // what an existing catalogue sees until its next scan.
+    ensure_column(conn, "volumes", "active_files", "INTEGER")?;
+    ensure_column(conn, "volumes", "active_bytes", "INTEGER")?;
     ensure_column(conn, "scan_errors", "phase", "TEXT")?;
     ensure_column(conn, "scan_errors", "kind", "TEXT")?;
 
