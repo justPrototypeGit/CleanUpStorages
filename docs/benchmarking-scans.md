@@ -749,3 +749,36 @@ about than rows appearing while they are reading a path.
 Worth keeping in proportion: the measured concentration says the **top 20 groups carry 63%** of all
 reclaimable space, so the default first page already contains essentially everything worth acting
 on.
+
+### A caching layer that was reverted, and a measurement that lied
+
+While verifying the numbers above I saw `/api/stats` take **8.8 s** and `/api/drives` **17.3 s** on
+the same server and catalogue that had just answered both in ~100 ms. Both drives had been connected
+in between.
+
+Chasing it in isolation, `archive_locked_bytes` — the third query inside `duplicate_totals`, which
+groups 2.28 M archive rows and cannot use the covering index's order because
+`container_chain IS NOT NULL` is a range — measured **2,301 ms** in a standalone SQLite session. So I
+built a `catalog_stats` cache for it, refreshed at the same points as the volume totals.
+
+**Measured through the server, the cache made no difference:**
+
+| | /api/stats | /api/duplicates |
+| --- | --- | --- |
+| without the cache | 71 ms | 61 ms |
+| with the cache | 99 ms | 89 ms |
+
+The 2.3 s was an artefact of *how I measured it*: a standalone Python session opens a fresh SQLite
+connection per query with a cold page cache, while the server keeps one warm across requests. The
+query is genuinely expensive from cold and genuinely cheap in the process that actually runs it.
+
+So the cache was **reverted** — a table, a refresh, four call sites and a test, for a benefit that
+could not be demonstrated.
+
+The 8.8 s / 17.3 s readings are best explained as transient I/O contention from two external drives
+being connected and indexed by the OS. `/api/drives` has a real, repeatable cost of its own: it calls
+`disk_capacity` on each mounted volume, and spun-down external HDDs take seconds to answer. That is
+physical latency, not query cost, and it is worth handling separately.
+
+**The lesson, again:** a measurement taken outside the process that will run the code can be wrong by
+two orders of magnitude in either direction. Measure where the work happens.
