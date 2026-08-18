@@ -84,6 +84,11 @@ enum Command {
         /// Current mount path of the drive to forget.
         mount: std::path::PathBuf,
     },
+    /// Drop catalogued system folders ($RECYCLE.BIN, System Volume Information) from every drive.
+    ///
+    /// Scans skip these folders, but entries catalogued before that was true stay behind and
+    /// crowd out real files in Browse. This clears them without waiting for a full rescan.
+    Tidy,
     /// Set a drive's custom name and/or description (shown in the UI).
     Rename {
         /// Current mount path of the drive.
@@ -119,6 +124,7 @@ fn main() -> anyhow::Result<()> {
         Command::Purge { .. } => "purge",
         Command::Repack { .. } => "repack",
         Command::Forget { .. } => "forget",
+        Command::Tidy => "tidy",
         Command::Rename { .. } => "rename",
     };
     // Groups a command's log events under `command{name=...}`. Note: this uses a thread-local
@@ -150,6 +156,7 @@ fn main() -> anyhow::Result<()> {
         Command::Purge { mount, all } => commands::cmd_purge(mount.as_deref(), all),
         Command::Repack { mount, entry_id } => commands::cmd_repack(&mount, entry_id),
         Command::Forget { mount } => commands::cmd_forget(&mount),
+        Command::Tidy => commands::cmd_tidy(),
         Command::Rename {
             mount,
             name,

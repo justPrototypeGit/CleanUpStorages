@@ -20,7 +20,7 @@ section of [CONTRIBUTING.md](CONTRIBUTING.md).
 - Web UI: `cleanupstorages browse` (serves 127.0.0.1, opens a browser) — six pages (Overview, Browse,
   Duplicates, Drives, Scan, Console), all self-contained (no CDN/fonts/build step).
 - CLI verbs: `scan`, `search`, `status`, `duplicates`, `quarantine`, `purge` (`--all`), `repack`, `forget`,
-  `browse`. Global `-v/--verbose`; `RUST_LOG` overrides.
+  `tidy`, `browse`. Global `-v/--verbose`; `RUST_LOG` overrides.
 - Safe end-to-end walkthrough: [docs/TESTING-GUIDE.md](docs/TESTING-GUIDE.md) (+ `scripts/make-test-sandbox.ps1`).
 
 ## Project goal

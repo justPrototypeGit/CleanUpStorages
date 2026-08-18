@@ -350,6 +350,46 @@ pub fn cmd_forget(mount: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Drop catalogued system folders from every known volume, then rebuild what depended on them.
+///
+/// Scans skip these folders now, but a catalogue built before that still holds their entries --
+/// on the real corpus, 77,493 `$RECYCLE.BIN` rows, which sort ahead of every real path (`$` sorts
+/// before letters) and so filled the Browse listing entirely. Deleting the rows is cheap; waiting
+/// for a rescan of several TB to do the same thing is not, which is why this exists as its own verb.
+///
+/// Nothing on disk is touched -- this only forgets entries. Directory trees and volume totals are
+/// derived from the rows, so both are rebuilt for any volume that actually lost some.
+pub fn cmd_tidy() -> anyhow::Result<()> {
+    let (cfg, cat) = open_catalog()?;
+    let now = now_secs();
+    let snap = snapshot(&cfg, now)?;
+    println!("Catalog snapshot (pre-tidy): {}", snap.display());
+
+    let labels = cat.effective_labels()?;
+    let mut total = 0usize;
+    let mut drives = 0usize;
+    for (vid, label) in &labels {
+        let removed = cat.forget_system_paths(vid)?;
+        if removed == 0 {
+            continue;
+        }
+        total += removed;
+        drives += 1;
+        cat.rebuild_directory_trees(vid, now)?;
+        cat.refresh_volume_totals(vid)?;
+        println!("{label}: forgot {removed} system-folder entries");
+    }
+
+    if total == 0 {
+        println!("Nothing to tidy: no system-folder entries are catalogued.");
+    } else {
+        println!(
+            "Forgot {total} system-folder entries across {drives} drive(s). Files on disk are untouched."
+        );
+    }
+    Ok(())
+}
+
 pub fn cmd_rename(
     mount: &Path,
     name: Option<&str>,

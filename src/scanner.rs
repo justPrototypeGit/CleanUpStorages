@@ -67,12 +67,24 @@ fn unix_secs(t: std::io::Result<std::time::SystemTime>) -> Option<i64> {
         .map(|d| d.as_secs() as i64)
 }
 
-/// True if `path` is the identity marker file or lives under a `_ToDelete` quarantine dir.
+/// Directories that are the operating system's business, not the user's data.
+///
+/// `$RECYCLE.BIN` holds files Windows already considers DELETED, and `System Volume Information`
+/// holds restore points. Cataloguing them was never intended, and on the real drives it did active
+/// harm: 77,493 recycle-bin rows, and because `$` sorts before every letter they filled the entire
+/// Browse page, which showed nothing else. They also formed 85 duplicate groups made only of
+/// deleted files, offering the user decisions about data they had already thrown away.
+const SYSTEM_DIRS: &[&str] = &["$RECYCLE.BIN", "System Volume Information"];
+
+/// True if `path` is the identity marker file, lives under a `_ToDelete` quarantine dir, or lives
+/// under a system directory the tool has no business cataloguing.
 fn should_skip(path: &Path, file_name: &std::ffi::OsStr) -> bool {
     file_name == crate::volume::MARKER
-        || path
-            .components()
-            .any(|c| c.as_os_str() == crate::volume::QUARANTINE_DIR)
+        || path.components().any(|c| {
+            let s = c.as_os_str();
+            s == crate::volume::QUARANTINE_DIR
+                || SYSTEM_DIRS.iter().any(|d| s.eq_ignore_ascii_case(d))
+        })
 }
 
 /// Opens `path` for the top-level archive-detection peek. Factored out purely so a test can force
@@ -188,6 +200,16 @@ pub fn scan_volume_with_progress(
     //
     // Shadowing `now` is deliberate: every row this scan stamps must carry the same value the sweep
     // compares against, and one binding is how they cannot drift apart.
+    // Rows for directories we no longer walk. Without this they would be swept to `missing` on
+    // this very scan -- an alarm about files Windows already deleted (#66 follow-up).
+    match cat.forget_system_paths(&identity.volume_id) {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(rows = n, "dropped catalogued system-directory rows"),
+        // Loud, not swallowed: the first version of this silently failed on a malformed
+        // SQL escape and the rows simply stayed.
+        Err(e) => tracing::error!("could not drop system-directory rows: {e}"),
+    }
+
     let now = cat.next_seen_stamp(&identity.volume_id, now)?;
     let scan_started_at = now;
     let mut summary = ScanSummary::default();
@@ -1268,6 +1290,66 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "active");
+    }
+
+    #[test]
+    fn system_directories_are_not_catalogued_and_existing_rows_are_dropped() {
+        // On the real drives 77,493 $RECYCLE.BIN rows were catalogued. Because `$` sorts before
+        // every letter they filled the whole Browse page, which showed nothing else, and they
+        // formed 85 duplicate groups made entirely of files Windows had already deleted.
+        let (tmp, cat) = setup();
+        let root = tmp.path().join("drive");
+        fs::create_dir_all(root.join("$RECYCLE.BIN/S-1-5-21")).unwrap();
+        fs::create_dir_all(root.join("System Volume Information")).unwrap();
+        fs::create_dir_all(root.join("Photos")).unwrap();
+        fs::write(root.join(".cleanupstorages_id"), "vol-1").unwrap();
+        fs::write(root.join("$RECYCLE.BIN/S-1-5-21/$RABC.txt"), b"deleted").unwrap();
+        fs::write(root.join("System Volume Information/tracking.log"), b"sys").unwrap();
+        fs::write(root.join("Photos/keep.jpg"), b"REAL").unwrap();
+
+        // A row that predates the rule, exactly as the live catalogue had.
+        cat.upsert_file(
+            &NewFile {
+                volume_id: "vol-1".into(),
+                relative_path: "$RECYCLE.BIN/S-1-5-21/old.bin".into(),
+                filename: "old.bin".into(),
+                extension: "bin".into(),
+                size_bytes: 9,
+                content_hash: "OLD".into(),
+                created_time: None,
+                modified_time: None,
+                accessed_time: None,
+                category: Category::Other,
+                container_chain: None,
+            },
+            100,
+        )
+        .unwrap();
+
+        let ident = crate::volume::VolumeIdentity {
+            volume_id: "vol-1".into(),
+            label: "T".into(),
+            identified_by: "marker".into(),
+        };
+        let s = scan_volume(&cat, &root, &ident, false, 200, &test_limits()).unwrap();
+
+        let paths: Vec<String> = cat
+            .conn
+            .prepare("SELECT relative_path FROM files")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            paths,
+            vec!["Photos/keep.jpg".to_string()],
+            "only real data may be catalogued; system dirs and their old rows must be gone"
+        );
+        assert_eq!(
+            s.marked_missing, 0,
+            "the dropped rows must NOT be reported as missing -- that is an alarm about files              Windows already deleted"
+        );
     }
 
     #[test]

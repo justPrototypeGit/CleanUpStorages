@@ -1035,14 +1035,12 @@ async function confirmTree(group,member,btn){
   // The confirm stays per item: the blast radius must be shown before anything is queued. What
   // changed is what happens after -- the request only ENQUEUES, so the reviewer can confirm the
   // next folder straight away instead of waiting out a move of 326,569 files (#66).
-  if(!confirm("Move this entire folder to _ToDelete?
-
-"+member.volume_label+" / "+member.path+
-      "
-"+fmtN(group.file_count)+" files, "+fmtB(member.total_bytes)+
-      "
-
-The other copy stays where it is. Nothing is deleted until you purge.")) return;
+  // The line breaks below MUST stay as the two-character escape \n. A real newline inside this
+  // string is a JavaScript syntax error, which kills the whole page script -- including the
+  // per-file duplicate list, which then silently renders nothing.
+  if(!confirm("Move this entire folder to _ToDelete?\n\n"+member.volume_label+" / "+member.path+
+      "\n"+fmtN(group.file_count)+" files, "+fmtB(member.total_bytes)+
+      "\n\nThe other copy stays where it is. Nothing is deleted until you purge.")) return;
   btn.disabled=true; btn.textContent="Queued";
   try{
     await apiPost("/api/quarantine-tree",{volume_id:member.volume_id,path:member.path});
@@ -1603,4 +1601,62 @@ async function exec(line){
 $("#cmd").addEventListener("keydown",e=>{ if(e.key==="Enter"){ const v=e.target.value; e.target.value=""; if(v.trim())exec(v.trim()); }});
 print(HELP);"##;
     shell("console", csrf, "Console", main, script)
+}
+
+#[cfg(test)]
+mod tests {
+    /// Parse every page's JavaScript and fail if any of it is not valid.
+    ///
+    /// This exact defect shipped. A line break written into the Rust raw string where the
+    /// two-character escape was meant left `confirm("...` unterminated — a JavaScript syntax error,
+    /// so the whole page script failed to parse and every list on the page rendered nothing, the
+    /// duplicates list included, with no error the user could see.
+    ///
+    /// Nothing else in the build looks at this JavaScript. A hand-rolled scanner was tried first and
+    /// produced false positives on regex literals (`/[&<>"']/g`), because telling a regex from a
+    /// division needs real parsing — so this shells out to a real parser rather than approximating
+    /// one badly.
+    ///
+    /// Skips, loudly, when `node` is unavailable: a missing tool must not look like a pass.
+    fn js_of(page: &str) -> String {
+        page.split("<script>")
+            .skip(1)
+            .filter_map(|s| s.split("</script>").next())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn every_page_emits_parseable_javascript() {
+        let probe = std::process::Command::new("node").arg("--version").output();
+        if probe.is_err() {
+            eprintln!("SKIPPED: `node` not on PATH, cannot parse-check page JavaScript");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        for (name, html) in [
+            ("overview", super::overview_page("t")),
+            ("browse", super::browse_page("t")),
+            ("review", super::review_page("t")),
+            ("drives", super::drives_page("t")),
+            ("scan", super::scan_page("t")),
+        ] {
+            let js = js_of(&html);
+            assert!(!js.is_empty(), "{name}: no <script> found to check");
+            let path = dir.path().join(format!("{name}.js"));
+            std::fs::write(&path, &js).unwrap();
+
+            let out = std::process::Command::new("node")
+                .arg("--check")
+                .arg(&path)
+                .output()
+                .expect("node --check should run");
+            assert!(
+                out.status.success(),
+                "{name} page emits invalid JavaScript, which silently blanks the whole page:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
 }
