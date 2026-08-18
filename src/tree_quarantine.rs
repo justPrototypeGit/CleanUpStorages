@@ -6,6 +6,7 @@
 
 use crate::catalog::models::FileStatus;
 use crate::catalog::Catalog;
+use rusqlite::OptionalExtension;
 use std::path::Path;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -92,6 +93,60 @@ pub fn quarantine_tree(
             "{p} is {}, no longer active; refusing to quarantine this tree",
             s.as_str()
         );
+    }
+
+    // Never stage the LAST copy. `quarantine_files` has always refused to move a file with no
+    // surviving duplicate; the tree path never had the equivalent, and the review queue turned that
+    // from "four deliberate clicks with a wait between each" into four fast ones (#66). Verified on
+    // a sandbox: queueing all four copies of a folder left the drive holding nothing but _ToDelete.
+    //
+    // The check uses the catalogue's directory hash to find twins, then asks the LIVE `files` rows
+    // whether any twin is still active -- `directory_trees` is only rebuilt when the queue drains,
+    // so it can list a twin that was quarantined moments ago. Re-hashing every file the way the
+    // single-file path does is not proportionate for a 326,569-file tree; agreeing with the
+    // catalogue about which copies still exist is.
+    if let Some(hash) = cat
+        .conn
+        .query_row(
+            "SELECT dir_hash FROM directory_trees WHERE volume_id=?1 AND path=?2",
+            rusqlite::params![expected_volume_id, tree_path],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        let mut stmt = cat.conn.prepare(
+            "SELECT volume_id, path FROM directory_trees
+              WHERE dir_hash=?1 AND NOT (volume_id=?2 AND path=?3)",
+        )?;
+        let twins = stmt
+            .query_map(
+                rusqlite::params![hash, expected_volume_id, tree_path],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut survivor = None;
+        for (vid, p) in &twins {
+            let like = like_prefix(p);
+            let live: i64 = cat.conn.query_row(
+                "SELECT COUNT(*) FROM files
+                  WHERE volume_id=?1 AND status='active'
+                    AND (relative_path=?2 OR relative_path LIKE ?3 ESCAPE '\\')",
+                rusqlite::params![vid, p, like],
+                |r| r.get(0),
+            )?;
+            if live > 0 {
+                survivor = Some((vid.clone(), p.clone()));
+                break;
+            }
+        }
+        if survivor.is_none() {
+            anyhow::bail!(
+                "refusing to quarantine {tree_path}: it is the last remaining copy. \
+                 {} identical folder(s) were catalogued, but none of them still has active \
+                 files -- quarantining this one would stage every copy for deletion.",
+                twins.len()
+            );
+        }
     }
 
     let src = mount_root.join(tree_path);
@@ -187,6 +242,17 @@ pub fn quarantine_tree(
         files_updated,
         dest_relative_path: dest_rel,
     })
+}
+
+/// `path` turned into a LIKE pattern matching everything beneath it.
+///
+/// `%` and `_` are legal filename characters, so an unescaped path would match unrelated files —
+/// which on this code path decides whether a surviving copy exists.
+fn like_prefix(path: &str) -> String {
+    path.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+        + "/%"
 }
 
 /// The archive strictly containing `tree_path`, if any.
@@ -593,6 +659,56 @@ mod tests {
             )
             .unwrap();
         assert_eq!(quarantined, 0, "no row may be left half-updated");
+    }
+
+    #[test]
+    fn the_last_remaining_copy_is_refused() {
+        // Found by driving the real queue on a sandbox: quarantining all copies of a folder left
+        // the drive holding nothing but _ToDelete. `quarantine_files` has always refused to move a
+        // file with no survivor; the tree path had no equivalent, and the review queue turned four
+        // deliberate clicks into four fast ones (#66).
+        let (tmp, cat, root) = drive_with_tree();
+        // A second, identical folder so the pair is a real duplicate group.
+        fs::create_dir_all(root.join("twin/sub")).unwrap();
+        fs::write(root.join("twin/a.txt"), b"AAA").unwrap();
+        fs::write(root.join("twin/sub/b.txt"), b"BBB").unwrap();
+        for (p, h) in [("twin/a.txt", "HA"), ("twin/sub/b.txt", "HB")] {
+            cat.upsert_file(
+                &NewFile {
+                    volume_id: "vol-1".into(),
+                    relative_path: p.into(),
+                    filename: p.rsplit('/').next().unwrap().into(),
+                    extension: "txt".into(),
+                    size_bytes: 3,
+                    content_hash: h.into(),
+                    created_time: None,
+                    modified_time: None,
+                    accessed_time: None,
+                    category: Category::Document,
+                    container_chain: None,
+                },
+                100,
+            )
+            .unwrap();
+        }
+        cat.rebuild_directory_trees("vol-1", 100).unwrap();
+
+        // First copy: allowed, because the twin survives.
+        quarantine_tree(&cat, &root, "vol-1", "copy", 200).unwrap();
+        assert!(root.join("_ToDelete/copy/a.txt").is_file());
+
+        // Second copy: refused. Note directory_trees still lists BOTH -- it is only rebuilt when
+        // the queue drains -- so the guard has to consult the live rows, not the stale index.
+        let err = quarantine_tree(&cat, &root, "vol-1", "twin", 300).unwrap_err();
+        assert!(
+            err.to_string().contains("last remaining copy"),
+            "got: {err}"
+        );
+        assert!(
+            root.join("twin/a.txt").is_file(),
+            "the survivor must still be on the drive"
+        );
+        let _ = tmp;
     }
 
     #[test]

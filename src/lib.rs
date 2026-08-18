@@ -9,6 +9,7 @@ pub mod mounts;
 pub mod observability;
 pub mod purge;
 pub mod quarantine;
+pub mod quarantine_queue;
 pub mod repack;
 pub mod scan_control;
 pub mod scan_heartbeat;
