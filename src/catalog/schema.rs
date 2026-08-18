@@ -148,6 +148,7 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<()> {
     ))?;
     rebuild_fts_if_stale(conn)?;
     ensure_column(conn, "files", "original_path", "TEXT")?;
+    ensure_browse_parents(conn)?;
     ensure_column(conn, "volumes", "last_scanned_path", "TEXT")?;
     ensure_column(conn, "volumes", "display_name", "TEXT")?;
     ensure_column(conn, "volumes", "description", "TEXT")?;
@@ -246,6 +247,74 @@ fn rebuild_fts_if_stale(conn: &Connection) -> rusqlite::Result<()> {
         COMMIT;
         "#,
     )
+}
+
+/// Where a row is *shown*: a quarantined file sits under `_ToDelete` on disk but belongs, on
+/// screen, to the folder it was taken from.
+pub(crate) const DISPLAY_LOCATION_SQL: &str = "CASE WHEN original_path IS NOT NULL \
+     AND container_chain IS NULL THEN original_path ELSE relative_path END";
+
+/// The parent folder of `expr`, or `''` for something sitting at the volume root.
+///
+/// `rtrim(X, Y)` strips any trailing characters that appear in `Y`; passing `X` with its slashes
+/// removed strips exactly the last path segment, leaving `a/b/`, and the final slash is then cut.
+/// SQLite has no `reverse`, so this is the way to take a suffix off in pure SQL.
+fn parent_of(expr: &str) -> String {
+    format!(
+        "CASE WHEN instr({expr},'/')=0 THEN '' ELSE \
+         substr(rtrim({expr}, replace({expr},'/','')), 1, \
+         length(rtrim({expr}, replace({expr},'/','')))-1) END"
+    )
+}
+
+/// The parent columns and indexes that make Browse expand a folder in constant time.
+///
+/// Browse asks for one level at a time. Without an indexed parent that means a range scan over
+/// every descendant, which on the real catalogue meant a folder holding 846,167 rows took ~2 s to
+/// open no matter how few files were actually in it.
+///
+/// These are *generated* columns rather than maintained ones deliberately. Every place that moves a
+/// file -- scan, quarantine, tree-quarantine, repack -- would otherwise have to remember to update
+/// them, and a single missed site would make files silently vanish from the folder the user is
+/// looking at. SQLite derives them instead, so there is no site to miss.
+///
+/// The sort column belongs *in* the index. Measured on the real catalogue: with
+/// `(volume_id, display_parent)` alone the planner ignored the index and recomputed the expression
+/// for every row -- 7,487 ms for one folder. Adding `relative_path` took the same query to 0 ms.
+/// Building both indexes costs ~41 s and ~300 MB, once.
+fn ensure_browse_parents(conn: &Connection) -> rusqlite::Result<()> {
+    if !has_column(conn, "files", "display_parent")? {
+        conn.execute_batch(&format!(
+            "ALTER TABLE files ADD COLUMN display_parent TEXT
+                 GENERATED ALWAYS AS ({}) VIRTUAL;",
+            parent_of(&format!("({DISPLAY_LOCATION_SQL})"))
+        ))?;
+    }
+    if !has_column(conn, "directory_trees", "parent_path")? {
+        conn.execute_batch(&format!(
+            "ALTER TABLE directory_trees ADD COLUMN parent_path TEXT
+                 GENERATED ALWAYS AS ({}) VIRTUAL;",
+            parent_of("path")
+        ))?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_files_display_parent
+             ON files(volume_id, display_parent, relative_path);
+         CREATE INDEX IF NOT EXISTS idx_directory_trees_parent
+             ON directory_trees(volume_id, parent_path, total_bytes DESC);",
+    )
+}
+
+/// `pragma_table_xinfo`, not `pragma_table_info`: the latter omits generated columns entirely, so
+/// it reports a `display_parent` that plainly exists as missing and the next `ALTER TABLE` fails
+/// with "duplicate column name" -- which, running inside `Catalog::open`, breaks every open.
+fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT count(*) FROM pragma_table_xinfo(?1) WHERE name=?2",
+        rusqlite::params![table, column],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
 }
 
 /// Add `<table>.<column> <decl>` if it does not already exist (idempotent, data-preserving).
@@ -497,6 +566,35 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1, "a current index must not be rebuilt on every open");
+    }
+
+    /// Opening a catalogue twice must work. It did not: `pragma_table_info` does not list generated
+    /// columns, so the second open decided `display_parent` was missing, re-ran `ALTER TABLE`, and
+    /// failed with "duplicate column name". Because this runs inside `Catalog::open`, that broke
+    /// every open of an existing catalogue -- the tests that caught it hung rather than failed,
+    /// waiting forever on a scan that could no longer start.
+    #[test]
+    fn reopening_a_catalogue_is_idempotent_despite_generated_columns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("c.db");
+        drop(crate::catalog::Catalog::open(&db).unwrap());
+        let cat = crate::catalog::Catalog::open(&db)
+            .expect("a second open must not try to re-add the generated columns");
+
+        for (table, column) in [
+            ("files", "display_parent"),
+            ("directory_trees", "parent_path"),
+        ] {
+            let n: i64 = cat
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_xinfo(?1) WHERE name=?2",
+                    rusqlite::params![table, column],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{table}.{column} must exist exactly once");
+        }
     }
 
     #[test]

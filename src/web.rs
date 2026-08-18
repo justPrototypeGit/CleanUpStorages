@@ -62,6 +62,7 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/search", get(api_search))
         .route("/api/status-counts", get(api_status_counts))
         .route("/api/volumes", get(api_volumes))
+        .route("/api/folder", get(api_folder))
         .route("/api/stats", get(api_stats))
         .route("/api/activity", get(api_activity))
         .route("/api/drives", get(api_drives))
@@ -416,6 +417,92 @@ fn volume_dtos(cat: &Catalog) -> anyhow::Result<Vec<VolumeDto>> {
             }
         })
         .collect())
+}
+
+#[derive(serde::Deserialize)]
+struct FolderParams {
+    volume: String,
+    #[serde(default)]
+    path: String,
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+#[derive(serde::Serialize)]
+struct FolderDirDto {
+    name: String,
+    path: String,
+    file_count: i64,
+    total_bytes: i64,
+}
+
+#[derive(serde::Serialize)]
+struct FolderDto {
+    dirs: Vec<FolderDirDto>,
+    files: Vec<HitDto>,
+    /// True when the page filled up, so the caller knows to offer "load more" rather than guess.
+    more_dirs: bool,
+    more_files: bool,
+}
+
+/// One level of one drive's folder tree.
+///
+/// Browse used to build its whole tree client-side from a fixed slice of a path-ordered search.
+/// That made every folder size a partial sum of the loaded rows and dropped any drive with nothing
+/// in the slice -- on the real catalogue, the 4.75 TB drive vanished entirely because 39,171 rows
+/// from the other drive sorted ahead of its first path. Serving one level at a time from
+/// `directory_trees` means sizes are the folder's own and every drive is always present.
+async fn api_folder(
+    State(state): State<AppState>,
+    Query(p): Query<FolderParams>,
+) -> Result<Json<FolderDto>, (axum::http::StatusCode, String)> {
+    let cat = Catalog::open_readonly(&state.catalog_path).map_err(err500)?;
+    let limit = p.limit.unwrap_or(200).clamp(1, 1000);
+    let offset = p.offset.unwrap_or(0);
+
+    // Ask for one more than requested: if it comes back, there is another page.
+    let mut dirs = cat
+        .folder_children(&p.volume, &p.path, limit + 1, offset)
+        .map_err(err500)?;
+    let more_dirs = dirs.len() > limit;
+    dirs.truncate(limit);
+
+    let mut files = cat
+        .folder_files(&p.volume, &p.path, limit + 1, offset)
+        .map_err(err500)?;
+    let more_files = files.len() > limit;
+    files.truncate(limit);
+
+    let labels = cat.effective_labels().map_err(err500)?;
+    let hashes: Vec<String> = files.iter().map(|f| f.content_hash.clone()).collect();
+    let dupes = cat.duplicate_counts(&hashes).map_err(err500)?;
+    let files = files
+        .into_iter()
+        .map(|f| {
+            let mut dto = HitDto::from(f);
+            dto.volume_label = labels
+                .get(&dto.volume_id)
+                .cloned()
+                .unwrap_or_else(|| dto.volume_id.clone());
+            dto.copies = dupes.get(&dto.content_hash).copied();
+            dto
+        })
+        .collect();
+
+    Ok(Json(FolderDto {
+        dirs: dirs
+            .into_iter()
+            .map(|d| FolderDirDto {
+                name: d.name,
+                path: d.path,
+                file_count: d.file_count,
+                total_bytes: d.total_bytes,
+            })
+            .collect(),
+        files,
+        more_dirs,
+        more_files,
+    }))
 }
 
 async fn api_volumes(
@@ -1860,6 +1947,124 @@ mod tests {
             .expect("the copy on the unplugged drive must still be listed");
         assert_eq!(offline["mounted"], false, "and be marked as unreachable");
         assert!(arr.iter().any(|m| m["mounted"] == true));
+    }
+
+    /// Two drives whose paths do not interleave, with far more rows than any one page.
+    ///
+    /// This is the shape that broke on the real catalogue: Browse fetched a fixed slice of a
+    /// path-ordered search and rebuilt the tree from it, so the drive whose paths sorted later --
+    /// 4.75 TB of it -- was simply absent from the response and never drawn. Sizes were wrong for
+    /// the same reason: the drive that *did* appear was totalled from the loaded rows alone, showing
+    /// 114.6 GB against a real 1.87 TB.
+    fn seed_two_drives_that_do_not_interleave() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("c.db");
+        {
+            let cat = crate::catalog::Catalog::open(&db).unwrap();
+            for (vid, label) in [("vol-early", "Sorts First"), ("vol-late", "Sorts Last")] {
+                cat.upsert_volume(&crate::catalog::models::Volume {
+                    volume_id: vid.into(),
+                    label: label.into(),
+                    identified_by: "marker".into(),
+                    first_seen_at: 1,
+                    last_seen_at: 1,
+                })
+                .unwrap();
+            }
+            // Every path on vol-early sorts before every path on vol-late.
+            for (vid, top, n, size) in [
+                ("vol-early", "aaa", 60usize, 7i64),
+                ("vol-late", "zzz", 5, 11),
+            ] {
+                for i in 0..n {
+                    cat.upsert_file(
+                        &crate::catalog::models::NewFile {
+                            volume_id: vid.into(),
+                            relative_path: format!("{top}/{i:04}/f.txt"),
+                            filename: "f.txt".into(),
+                            extension: "txt".into(),
+                            size_bytes: size,
+                            content_hash: format!("{vid}-{i}"),
+                            created_time: Some(1),
+                            modified_time: Some(1),
+                            accessed_time: None,
+                            category: crate::category::Category::Document,
+                            container_chain: None,
+                        },
+                        100,
+                    )
+                    .unwrap();
+                }
+                cat.rebuild_directory_trees(vid, 200).unwrap();
+                cat.refresh_volume_totals(vid).unwrap();
+            }
+        }
+        (tmp, db)
+    }
+
+    #[tokio::test]
+    async fn every_drive_is_listed_however_its_paths_sort() {
+        let (_t, db) = seed_two_drives_that_do_not_interleave();
+        let v = get_json(&db, "/api/volumes").await;
+        let labels: Vec<&str> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["label"].as_str().unwrap())
+            .collect();
+        assert!(
+            labels.contains(&"Sorts First") && labels.contains(&"Sorts Last"),
+            "both drives must be offered, got {labels:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_drives_total_is_its_own_not_the_rows_that_happened_to_load() {
+        let (_t, db) = seed_two_drives_that_do_not_interleave();
+        let v = get_json(&db, "/api/volumes").await;
+        let late = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["label"] == "Sorts Last")
+            .expect("the later-sorting drive must be present");
+        assert_eq!(late["active_files"], 5);
+        assert_eq!(late["active_bytes"], 55, "5 files x 11 bytes");
+    }
+
+    /// A folder page is bounded, and says so, instead of silently truncating the tree.
+    #[tokio::test]
+    async fn a_folder_page_is_bounded_and_reports_that_there_is_more() {
+        let (_t, db) = seed_two_drives_that_do_not_interleave();
+        let v = get_json(&db, "/api/folder?volume=vol-early&path=aaa&limit=10").await;
+        assert_eq!(v["dirs"].as_array().unwrap().len(), 10);
+        assert_eq!(
+            v["more_dirs"], true,
+            "60 subfolders exist, 10 were returned"
+        );
+
+        let rest = get_json(
+            &db,
+            "/api/folder?volume=vol-early&path=aaa&limit=100&offset=10",
+        )
+        .await;
+        assert_eq!(rest["dirs"].as_array().unwrap().len(), 50);
+        assert_eq!(rest["more_dirs"], false);
+    }
+
+    /// The later-sorting drive is reachable on its own terms, with real totals.
+    #[tokio::test]
+    async fn the_later_sorting_drive_can_be_expanded_with_true_totals() {
+        let (_t, db) = seed_two_drives_that_do_not_interleave();
+        let v = get_json(&db, "/api/folder?volume=vol-late&path=").await;
+        let dirs = v["dirs"].as_array().unwrap();
+        assert_eq!(dirs.len(), 1);
+        assert_eq!(dirs[0]["name"], "zzz");
+        assert_eq!(dirs[0]["file_count"], 5);
+        assert_eq!(
+            dirs[0]["total_bytes"], 55,
+            "the folder's whole subtree, not a loaded slice"
+        );
     }
 
     #[tokio::test]

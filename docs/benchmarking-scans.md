@@ -782,3 +782,40 @@ physical latency, not query cost, and it is worth handling separately.
 
 **The lesson, again:** a measurement taken outside the process that will run the code can be wrong by
 two orders of magnitude in either direction. Measure where the work happens.
+
+## Browse: one level at a time (#69)
+
+Browse used to rebuild the whole folder tree in the browser from `/api/search?limit=3000`, ordered
+by `relative_path` with no volume in the sort. It never worked at scale — small test corpora hid it,
+because 3,000 rows covered everything. On the real catalogue (2.67M rows, 5.6 TB) it dropped the
+4.75 TB drive entirely (39,171 rows from the other drive sort before its first path) and reported
+1.87 TB as 114.6 GB, that being the sum of exactly the 3,000 rows it had loaded.
+
+It now loads one level at a time from `directory_trees`, keyed on indexed generated columns
+(`files.display_parent`, `directory_trees.parent_path`).
+
+| Request (warm) | Before | After |
+| --- | ---: | ---: |
+| root of a drive | 1,666 ms | 3 ms |
+| folder holding 846,167 rows | 2,140 ms | 12 ms |
+| a mid-depth folder | 1,198 ms | 3 ms |
+| `/api/search?q=thesis&limit=500` | 1,300 ms | 5 ms |
+
+One-time cost on first open of an existing catalogue: ~82 s, ~700 MB.
+
+### Two things the measurement contradicted
+
+**The sort column belongs in the index.** Indexing `(volume_id, display_parent)` and expecting an
+instant equality lookup measured **7,487 ms** — worse than the range scan it replaced. `EXPLAIN QUERY
+PLAN` showed the planner ignoring the index (`SEARCH files USING INDEX idx_files_location`) and
+recomputing the generated expression for every row, because `ORDER BY relative_path` could not be
+satisfied from it. With `relative_path` added to the index: **0 ms**. Dropping the `ORDER BY`
+entirely also gave 0 ms, which is what identified the cause.
+
+**The remaining second was never in the folder query.** After the index landed, two folders were
+still ~1.2 s while others were 3 ms. Profiling the three parts separately: dirs 15 ms, files 0 ms,
+`duplicate_counts` **1,332 ms**. The planner was choosing `idx_files_dedup` on `status=?` and walking
+2.6M active rows instead of five lookups on `idx_files_hash` (1 ms). That cost was not new and not
+specific to Browse — it had been on every `/api/search` all along, unnoticed because it was never the
+thing being measured. Pinned with `INDEXED BY`; `query_plan_uses_the_hash_index` fails if the plan
+changes, since a timing assertion would be flaky.

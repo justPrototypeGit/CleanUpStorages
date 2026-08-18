@@ -370,6 +370,7 @@ function fmtDate(t){return t?new Date(t*1000).toISOString().slice(0,10):"—";}
 function fmtAgo(t){if(!t)return"—";const s=Math.max(0,Math.floor(Date.now()/1000-t));if(s<60)return s+"s ago";const m=Math.floor(s/60);if(m<60)return m+"m ago";const h=Math.floor(m/60);if(h<24)return h+"h ago";const d=Math.floor(h/24);if(d<7)return d+"d ago";return fmtDate(t);}
 function hueOf(s){let h=0;for(let i=0;i<String(s).length;i++)h=(h*31+String(s).charCodeAt(i))>>>0;return h%360;}
 function driveColor(id){return `hsl(${hueOf(id)},46%,52%)`;}
+const fmtN=n=>Number(n).toLocaleString();
 function dupColor(hash){return `hsl(${hueOf(hash)},42%,56%)`;}
 async function apiGet(u){const r=await fetch(u);if(!r.ok)throw new Error(await r.text());return r.json();}
 async function apiPost(u,body){const r=await fetch(u,{method:"POST",headers:{"content-type":"application/json","x-cleanup-token":CSRF},body:JSON.stringify(body||{})});if(!r.ok)throw new Error(await r.text());return r.json();}
@@ -685,11 +686,101 @@ function rangeParams(p){
   $("#datenote").hidden = (from===null && to===null);
   return (minS||maxS||from!==null||to!==null);
 }
+// --- lazy browse: one folder level at a time, straight from the catalogue ---
+//
+// The tree is NOT reconstructed from a search result. Doing that summed each folder from whatever
+// rows the page had loaded and dropped any drive with nothing in the slice -- on the real
+// catalogue the 4.75 TB drive vanished, because 39,171 rows from the other drive sorted ahead of
+// its first path, and the drive that did show read 114.6 GB against a real 1.87 TB.
+const PAGE=200;
+function renderDirRow(volumeId,dir){
+  return `<details class="folder" data-vol="${esc(volumeId)}" data-path="${esc(dir.path)}">`
+    +`<summary><span class="material-symbols-outlined fico" style="font-size:17px!important">folder</span>`
+    +`${esc(dir.name)} <span class="mut mono" style="font-size:11px">${fmtSize(dir.total_bytes)}`
+    +` · ${fmtN(dir.file_count)} file${dir.file_count===1?"":"s"}</span></summary>`
+    +`<div class="branch"><div class="mut" style="padding:4px 8px">Loading…</div></div></details>`;
+}
+// Archive entries carry their archive's path, so they arrive in the same folder as the archive
+// itself. Group them under one node instead of listing each entry at the folder's top level.
+function renderFileRows(files){
+  const archives=new Map(); let html="";
+  for(const h of files){
+    if(!h.container_chain) continue;
+    const key=h.relative_path;
+    if(!archives.has(key)) archives.set(key,[]);
+    archives.get(key).push(h);
+  }
+  for(const h of files){
+    if(h.container_chain) continue;
+    const inner=archives.get(h.relative_path);
+    if(inner){
+      const rows=inner.map(e=>renderLeaf({name:e.container_chain,hit:e})).join("");
+      html+=`<details class="folder"><summary><span class="material-symbols-outlined fico" style="font-size:17px!important">folder_zip</span>`
+        +`${esc(h.filename)} <span class="mut mono" style="font-size:11px">${fmtSize(h.size_bytes)}</span></summary>`
+        +`<div class="branch">${rows}</div></details>`;
+      archives.delete(h.relative_path);
+      continue;
+    }
+    html+=renderLeaf({name:h.filename,hit:h});
+  }
+  // Entries whose archive row itself is not in this folder (never expected, but do not drop files).
+  for(const [path,inner] of archives){
+    const rows=inner.map(e=>renderLeaf({name:e.container_chain,hit:e})).join("");
+    html+=`<details class="folder"><summary><span class="material-symbols-outlined fico" style="font-size:17px!important">folder_zip</span>`
+      +`${esc(String(path).split('/').pop())}</summary><div class="branch">${rows}</div></details>`;
+  }
+  return html;
+}
+async function loadLevel(volumeId,path,into,offset){
+  const p=new URLSearchParams({volume:volumeId,path:path,limit:String(PAGE),offset:String(offset||0)});
+  const data=await apiGet("/api/folder?"+p.toString());
+  const html=data.dirs.map(d=>renderDirRow(volumeId,d)).join("")+renderFileRows(data.files);
+  const more=(data.more_dirs||data.more_files)
+    ? `<button type="button" class="linkbtn loadmore" data-vol="${esc(volumeId)}" data-path="${esc(path)}" data-offset="${(offset||0)+PAGE}">Load more</button>`
+    : "";
+  if(offset){ into.querySelector(".loadmore")?.remove(); into.insertAdjacentHTML("beforeend",html+more); }
+  else into.innerHTML=(html||'<div class="mut" style="padding:4px 8px">This folder is empty.</div>')+more;
+}
+// Drive headers take their totals from the catalogue, never from the rows on screen.
+async function renderDrives(){
+  const vols=await apiGet("/api/volumes");
+  const wanted=F.volume.length?vols.filter(v=>F.volume.includes(v.volume_id)):vols;
+  if(!wanted.length){ $("#results").innerHTML='<div class="mut" style="padding:12px">No drives catalogued yet.</div>'; $("#count").textContent=""; return; }
+  $("#count").textContent=wanted.length+" drive"+(wanted.length===1?"":"s")
+    +" · "+fmtN(wanted.reduce((a,v)=>a+(v.active_files||0),0))+" files";
+  $("#results").innerHTML=wanted.map(v=>{
+    const name=v.display_name||v.label||v.volume_id;
+    return `<details class="drive" data-vol="${esc(v.volume_id)}" data-path="">`
+      +`<summary><span class="dot" style="background:${driveColor(v.volume_id)}"></span>`
+      +`<b>${esc(name)}</b> <span class="mut">${fmtSize(v.active_bytes)} · ${fmtN(v.active_files)} files</span></summary>`
+      +`<div class="branch"><div class="mut" style="padding:4px 8px">Loading…</div></div></details>`;
+  }).join("");
+}
+// One fetch per folder, the first time it is opened.
+$("#results").addEventListener("toggle",async e=>{
+  const el=e.target;
+  if(!(el instanceof HTMLDetailsElement)||!el.open||el.dataset.loaded) return;
+  if(el.dataset.vol===undefined) return;
+  el.dataset.loaded="1";
+  const box=el.querySelector(":scope > .branch");
+  try{ await loadLevel(el.dataset.vol,el.dataset.path||"",box,0); }
+  catch(err){ box.innerHTML='<div class="mut" style="padding:4px 8px">Could not load this folder: '+esc(String(err))+'</div>'; delete el.dataset.loaded; }
+},true);
+$("#results").addEventListener("click",async e=>{
+  const btn=e.target.closest(".loadmore"); if(!btn) return;
+  const box=btn.parentElement; const off=Number(btn.dataset.offset)||0;
+  btn.textContent="Loading…"; btn.disabled=true;
+  try{ await loadLevel(btn.dataset.vol,btn.dataset.path,box,off); }
+  catch(err){ btn.disabled=false; btn.textContent="Load more — "+String(err); }
+});
 async function run(){ try{
   const p=new URLSearchParams(); const q=$("#q").value.trim(); if(q)p.set("q",q);
   for(const k of ["volume","category","status"]){ if(F[k].length) p.set(k,F[k].join(",")); }
   const ranged=rangeParams(p);
   $("#rangetoggle").classList.toggle("has-sel",ranged);
+  // Nothing to search for: show the drives and let the user walk into them. Any query or filter is
+  // a real search, and a search result legitimately is a capped, flat set of matches.
+  if(!q && !ranged && !F.category.length && !F.status.length){ await renderDrives(); return; }
   p.set("limit","3000");
   const hits=await apiGet("/api/search?"+p.toString());
   $("#count").textContent=hits.length+" result"+(hits.length===1?"":"s")+(hits.length>=3000?" (showing first 3000 — refine your search)":"");
@@ -837,7 +928,6 @@ pub fn review_page(csrf: &str) -> String {
 </div>"##;
     let script = r##"
 let groups=[],idx=0,keepId=null,totals=null,next=null,minSize=1048576,exhausted=false;
-const fmtN=n=>Number(n).toLocaleString();
 // One ranked page at a time: the catalogue can hold hundreds of thousands of groups.
 async function loadPage(reset){
   if(reset){ groups=[]; idx=0; next=null; exhausted=false; }
