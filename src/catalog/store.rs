@@ -610,6 +610,36 @@ impl Catalog {
         Ok(())
     }
 
+    /// Drop rows for paths the scanner no longer visits because they belong to the operating
+    /// system (`$RECYCLE.BIN`, `System Volume Information`).
+    ///
+    /// Deleted rather than swept to `missing`, which is what would otherwise happen once the
+    /// scanner stops walking them. "Missing" means *your file is not where the catalogue says it
+    /// is* -- an alarm. These are files Windows itself already deleted, and 77,493 of them raising
+    /// that alarm would be noise that trains the user to ignore the real ones.
+    ///
+    /// Safe to delete: nothing on disk is touched, and the rows describe data the tool should never
+    /// have catalogued. A rescan re-adds them only if this rule changes.
+    pub fn forget_system_paths(&self, volume_id: &str) -> anyhow::Result<usize> {
+        let mut removed = 0usize;
+        for dir in ["$RECYCLE.BIN", "System Volume Information"] {
+            // No ESCAPE clause: neither name contains a LIKE metacharacter (`%` or `_`), and the
+            // first attempt here wrote `ESCAPE '\'` in a Rust string, where `\'` is an escaped
+            // quote -- so SQLite received `ESCAPE ''`, errored, and the failure was swallowed by a
+            // best-effort caller. Anything added to this list must be checked for `%` and `_`.
+            debug_assert!(
+                !dir.contains('%') && !dir.contains('_'),
+                "system dir name contains a LIKE metacharacter and needs escaping: {dir}"
+            );
+            removed += self.conn.execute(
+                "DELETE FROM files
+                  WHERE volume_id=?1 AND (relative_path=?2 OR relative_path LIKE ?3)",
+                params![volume_id, dir, format!("{dir}/%")],
+            )?;
+        }
+        Ok(removed)
+    }
+
     /// A `last_seen_at` stamp for a new scan of this volume: wall-clock time, but never less than
     /// one past anything the volume already carries.
     ///
