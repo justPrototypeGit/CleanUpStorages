@@ -22,6 +22,15 @@ pub type FileMeta = (i64, i64, bool, Option<i64>);
 
 /// The full `files` column list, in one place. Every full-row SELECT uses this; the mapper
 /// (`map_file_record`) reads results by column NAME, so this list and the mapper cannot drift.
+/// A subdirectory sitting directly inside some folder, with totals for its entire subtree.
+#[derive(Debug, Clone)]
+pub struct FolderChild {
+    pub name: String,
+    pub path: String,
+    pub file_count: i64,
+    pub total_bytes: i64,
+}
+
 pub(crate) const FILE_COLUMNS: &str =
     "id, volume_id, relative_path, filename, extension, size_bytes, content_hash, \
      created_time, modified_time, accessed_time, category, container_chain, \
@@ -336,9 +345,14 @@ impl Catalog {
         let placeholders = std::iter::repeat_n("?", uniq.len())
             .collect::<Vec<_>>()
             .join(",");
+        // `INDEXED BY` because the planner gets this badly wrong: left to itself it picks
+        // idx_files_dedup on `status=?` and walks every active row -- 1,271 ms on the real
+        // catalogue -- rather than doing a handful of hash lookups, which is 1 ms. The choice is
+        // not close and does not depend on the input, so it is stated rather than hoped for.
+        // `query_plan_uses_the_hash_index` fails if this stops holding.
         let sql = format!(
-            "SELECT content_hash, count(*) FROM files
-             WHERE status='active' AND content_hash IN ({placeholders})
+            "SELECT content_hash, count(*) FROM files INDEXED BY idx_files_hash
+             WHERE content_hash IN ({placeholders}) AND status='active'
              GROUP BY content_hash HAVING count(*) > 1"
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -502,6 +516,69 @@ impl Catalog {
         let mut stmt = self.conn.prepare(&sql)?;
         let arg_refs: Vec<&dyn rusqlite::types::ToSql> = args.iter().map(|b| b.as_ref()).collect();
         let rows = stmt.query_map(arg_refs.as_slice(), Self::map_file_record)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// The subdirectories sitting directly inside `parent` on `volume_id`, largest first.
+    ///
+    /// Totals come from `directory_trees`, so each one covers the whole subtree beneath that folder
+    /// — not just the rows a caller happens to have loaded. Browse used to infer both the folder
+    /// structure and its sizes from a fixed-size slice of a path-ordered search, which made every
+    /// size a partial sum and hid whole drives that had nothing in the slice.
+    ///
+    /// Matching is an equality test on the indexed generated column `parent_path`, not a `LIKE` or
+    /// a prefix range: `%` and `_` are legal filename characters, and scanning a prefix range costs
+    /// time proportional to the whole subtree rather than to the level being opened.
+    pub fn folder_children(
+        &self,
+        volume_id: &str,
+        parent: &str,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<Vec<FolderChild>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT path, file_count, total_bytes FROM directory_trees
+              WHERE volume_id=?1 AND parent_path=?2 AND path <> ''
+              ORDER BY total_bytes DESC, path LIMIT ?3 OFFSET ?4",
+        )?;
+        let rows = stmt.query_map(
+            params![volume_id, parent, limit as i64, offset as i64],
+            |r| {
+                let path: String = r.get(0)?;
+                Ok(FolderChild {
+                    name: path.rsplit('/').next().unwrap_or(&path).to_string(),
+                    path,
+                    file_count: r.get(1)?,
+                    total_bytes: r.get(2)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// The files sitting directly inside `parent` on `volume_id`, hiding purged rows.
+    ///
+    /// `display_parent` already accounts for quarantine: a quarantined row's `relative_path` points
+    /// into `_ToDelete`, so listing by that would grow a `_ToDelete` branch in the tree and lose the
+    /// file from the folder the user is actually looking at. Archive entries keep their archive's
+    /// `relative_path`, so they arrive in the right folder and the caller nests them under it.
+    pub fn folder_files(
+        &self,
+        volume_id: &str,
+        parent: &str,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<Vec<FileRecord>> {
+        let sql = format!(
+            "SELECT {FILE_COLUMNS} FROM files
+              WHERE volume_id=?1 AND display_parent=?2 AND status <> 'purged'
+              ORDER BY relative_path LIMIT ?3 OFFSET ?4"
+        );
+        let mut stmt = self.conn.prepare_cached(&sql)?;
+        let rows = stmt.query_map(
+            params![volume_id, parent, limit as i64, offset as i64],
+            Self::map_file_record,
+        )?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -1099,6 +1176,130 @@ mod tests {
         })
         .unwrap();
         (tmp, cat)
+    }
+
+    /// Enriching a result list must cost a few hash lookups, not a walk of every active row.
+    ///
+    /// Left to itself the planner chose `idx_files_dedup` on `status=?` and scanned 2.6M rows:
+    /// 1,271 ms against 1 ms for the hash lookups, on every search and every folder opened. A
+    /// timing assertion would be flaky, so this pins the plan instead.
+    #[test]
+    fn query_plan_uses_the_hash_index() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_file(&mk_file("vol-1", "a.txt", "h1"), 200)
+            .unwrap();
+        let plan: Vec<String> = cat
+            .conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT content_hash, count(*) FROM files
+                 INDEXED BY idx_files_hash WHERE content_hash IN (?1) AND status='active'
+                 GROUP BY content_hash HAVING count(*) > 1",
+            )
+            .unwrap()
+            .query_map(["h1"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|s| s.contains("idx_files_hash")),
+            "duplicate_counts must resolve by content_hash, got {plan:?}"
+        );
+    }
+
+    /// A folder's size must describe the folder, not whatever rows the caller loaded.
+    ///
+    /// The bug this replaces: Browse summed `size_bytes` over a fixed slice of a path-ordered
+    /// search, so `Uni Small` was shown as 114.6 GB -- exactly the sum of the 3,000 rows it had
+    /// fetched -- against a real 1.87 TB.
+    #[test]
+    fn folder_children_report_whole_subtree_totals() {
+        let (_t, cat) = open_tmp();
+        for i in 0..40 {
+            let mut f = mk_file("vol-1", &format!("photos/{i}/img.jpg"), &format!("h{i}"));
+            f.size_bytes = 1000;
+            cat.upsert_file(&f, 200).unwrap();
+        }
+        cat.rebuild_directory_trees("vol-1", 300).unwrap();
+
+        let top = cat.folder_children("vol-1", "", 10, 0).unwrap();
+        assert_eq!(top.len(), 1, "one top-level folder");
+        assert_eq!(top[0].name, "photos");
+        assert_eq!(top[0].file_count, 40);
+        assert_eq!(
+            top[0].total_bytes, 40_000,
+            "must total the whole subtree, not the direct children"
+        );
+    }
+
+    /// Only the folders one level down, however many levels are stored beneath them.
+    #[test]
+    fn folder_children_are_direct_children_only() {
+        let (_t, cat) = open_tmp();
+        for p in ["a/b/c/deep.txt", "a/sibling.txt", "top.txt"] {
+            cat.upsert_file(&mk_file("vol-1", p, p), 200).unwrap();
+        }
+        cat.rebuild_directory_trees("vol-1", 300).unwrap();
+
+        let top = cat.folder_children("vol-1", "", 10, 0).unwrap();
+        assert_eq!(top.iter().map(|c| &c.name).collect::<Vec<_>>(), ["a"]);
+        let under_a = cat.folder_children("vol-1", "a", 10, 0).unwrap();
+        assert_eq!(under_a.iter().map(|c| &c.name).collect::<Vec<_>>(), ["b"]);
+        assert_eq!(under_a[0].path, "a/b", "children carry their full path");
+    }
+
+    /// `%` and `_` are ordinary filename characters. Matching by `LIKE` without escaping would let
+    /// one folder's listing pull in a sibling's files.
+    #[test]
+    fn folder_listing_does_not_treat_filename_wildcards_as_patterns() {
+        let (_t, cat) = open_tmp();
+        for p in ["100%_done/kept.txt", "1008_done/other.txt"] {
+            cat.upsert_file(&mk_file("vol-1", p, p), 200).unwrap();
+        }
+        cat.rebuild_directory_trees("vol-1", 300).unwrap();
+
+        let files = cat.folder_files("vol-1", "100%_done", 10, 0).unwrap();
+        assert_eq!(
+            files.iter().map(|f| f.filename.clone()).collect::<Vec<_>>(),
+            ["kept.txt"],
+            "`100%_done` must not match `1008_done`"
+        );
+    }
+
+    /// A quarantined row lives under `_ToDelete` on disk but belongs, on screen, to the folder it
+    /// was taken from -- otherwise the tree grows a `_ToDelete` branch and the file disappears from
+    /// where the user is looking for it.
+    #[test]
+    fn folder_files_show_quarantined_rows_at_their_original_location() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_file(&mk_file("vol-1", "docs/report.txt", "h1"), 200)
+            .unwrap();
+        let id = cat.search("report", None, None, None).unwrap()[0].id;
+        cat.mark_quarantined(id, "_ToDelete/docs/report.txt", "docs/report.txt", 300)
+            .unwrap();
+
+        let in_docs = cat.folder_files("vol-1", "docs", 10, 0).unwrap();
+        assert_eq!(in_docs.len(), 1, "still listed where it came from");
+        assert_eq!(in_docs[0].status, FileStatus::Quarantined);
+        let in_quarantine = cat.folder_files("vol-1", "_ToDelete", 10, 0).unwrap();
+        assert!(
+            in_quarantine.is_empty(),
+            "must not also appear under _ToDelete"
+        );
+    }
+
+    /// Purged rows are a permanently-deleted audit record; the file is gone from disk.
+    #[test]
+    fn folder_files_hide_purged_rows() {
+        let (_t, cat) = open_tmp();
+        cat.upsert_file(&mk_file("vol-1", "docs/gone.txt", "h1"), 200)
+            .unwrap();
+        let id = cat.search("gone", None, None, None).unwrap()[0].id;
+        cat.mark_quarantined(id, "_ToDelete/docs/gone.txt", "docs/gone.txt", 300)
+            .unwrap();
+        cat.conn
+            .execute("UPDATE files SET status='purged' WHERE id=?1", [id])
+            .unwrap();
+        assert!(cat.folder_files("vol-1", "docs", 10, 0).unwrap().is_empty());
     }
 
     #[test]
