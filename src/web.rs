@@ -25,6 +25,8 @@ pub struct AppState {
     pub mounts: crate::mounts::MountResolver,
     pub csrf_token: String,
     pub scan_queue: std::sync::Arc<crate::scan_queue::ScanQueue>,
+    /// Serial worker for folder quarantines, so confirming one does not block the next (#66).
+    pub quarantine_queue: std::sync::Arc<crate::quarantine_queue::QuarantineQueue>,
 }
 
 impl AppState {
@@ -36,6 +38,12 @@ impl AppState {
             },
             csrf_token: uuid::Uuid::new_v4().to_string(),
             scan_queue: crate::scan_queue::ScanQueue::new(catalog_path.clone()),
+            quarantine_queue: crate::quarantine_queue::QuarantineQueue::new(
+                catalog_path.clone(),
+                crate::mounts::MountResolver::Live {
+                    catalog_path: catalog_path.clone(),
+                },
+            ),
             catalog_path,
         }
     }
@@ -61,6 +69,7 @@ pub fn build_router_with(state: AppState) -> Router {
         .route("/api/duplicates", get(api_duplicates))
         .route("/api/tree-duplicates", get(api_tree_duplicates))
         .route("/api/quarantine-tree", post(api_quarantine_tree))
+        .route("/api/quarantine/status", get(api_quarantine_status))
         .route("/api/copies", get(api_copies))
         .route("/api/volumes/:id/errors", get(api_volume_errors))
         .route("/api/preview/:id", get(api_preview))
@@ -1048,52 +1057,45 @@ struct QuarantineTreeReq {
 }
 
 #[derive(Serialize)]
-struct QuarantineTreeResultDto {
-    files_updated: usize,
-    dest: String,
+struct QuarantineQueuedDto {
+    queued: bool,
+    /// How many items are ahead of this one; 0 means it starts next.
+    position: usize,
 }
 
 /// Move one redundant folder into `_ToDelete` with a single rename.
 ///
 /// The mount is resolved from the volume id server-side rather than accepted from the client: a
 /// caller-supplied path would let a request rename a directory on any drive it could name.
+/// Enqueue a folder quarantine and return immediately.
+///
+/// Returns the queue position rather than the outcome. Reviewing 1,201 folders one blocking request
+/// at a time was the complaint this answers (#66): the reviewer confirms an item and moves on, and
+/// the worker drains the queue in order.
+///
+/// Nothing is validated here beyond the CSRF gate. Every safety check -- the drive marker, the tree
+/// still being wholly `active`, the destination not already claimed -- happens in
+/// `tree_quarantine::quarantine_tree` immediately before it acts, which is the only place they are
+/// not already stale.
 async fn api_quarantine_tree(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Json<QuarantineTreeReq>,
-) -> Result<Json<QuarantineTreeResultDto>, (StatusCode, String)> {
+) -> Result<Json<QuarantineQueuedDto>, (StatusCode, String)> {
     check_csrf(&headers, &state)?;
-
-    let mount = state
-        .mounts
-        .resolve(&body.volume_id)
-        .ok_or((StatusCode::CONFLICT, "drive not connected".to_string()))?;
-    let now = now_secs()?;
-
-    // A tree can hold six figures of rows; the rename is instant but the bookkeeping is not. Off
-    // the async worker, or the whole UI stops responding.
-    let (vid, path, cat_path) = (
-        body.volume_id.clone(),
-        body.path.clone(),
-        state.catalog_path.clone(),
-    );
-    let joined = tokio::task::spawn_blocking(move || {
-        let cat = Catalog::open(&cat_path)?;
-        let out = crate::tree_quarantine::quarantine_tree(&cat, &mount, &vid, &path, now)?;
-        // The group the user just acted on is stale now; rebuild before anyone reads it again.
-        cat.rebuild_directory_trees(&vid, now)?;
-        cat.refresh_volume_totals(&vid)?;
-        Ok::<_, anyhow::Error>(out)
-    })
-    .await
-    .map_err(|e| err500(anyhow::anyhow!("tree quarantine task failed: {e}")))?;
-
-    let out = joined.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    snapshot_best_effort(&state, now);
-    Ok(Json(QuarantineTreeResultDto {
-        files_updated: out.files_updated,
-        dest: out.dest_relative_path,
+    let position = state
+        .quarantine_queue
+        .enqueue(body.volume_id.clone(), body.path.clone());
+    Ok(Json(QuarantineQueuedDto {
+        queued: true,
+        position,
     }))
+}
+
+async fn api_quarantine_status(
+    State(state): State<AppState>,
+) -> Json<crate::quarantine_queue::QuarantineStatus> {
+    Json(state.quarantine_queue.status())
 }
 
 #[derive(serde::Serialize)]
@@ -1626,6 +1628,7 @@ async fn api_pick_folder(
 pub async fn serve(catalog_path: PathBuf, open: bool) -> anyhow::Result<()> {
     let state = AppState::new_live(catalog_path);
     tokio::spawn(state.scan_queue.clone().run_worker());
+    tokio::spawn(state.quarantine_queue.clone().run_worker());
     let app = build_router_with(state);
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
     let url = format!("http://{}", listener.local_addr()?);
@@ -1982,9 +1985,15 @@ mod tests {
         mounts.insert("vol-1".to_string(), drive);
         let state = AppState {
             catalog_path: db.clone(),
-            mounts: crate::mounts::MountResolver::Fixed(mounts),
+            mounts: crate::mounts::MountResolver::Fixed(mounts.clone()),
             csrf_token: "T".into(),
             scan_queue: crate::scan_queue::ScanQueue::new(db.clone()),
+            // Same resolver the rest of the state uses. Handing the queue an empty one would make
+            // every job fail with "drive not connected" while the request path looked fine.
+            quarantine_queue: crate::quarantine_queue::QuarantineQueue::new(
+                db.clone(),
+                crate::mounts::MountResolver::Fixed(mounts),
+            ),
         };
         (tmp, db, state)
     }
@@ -2604,9 +2613,15 @@ mod tests {
         mounts.insert("vol-1".to_string(), drive.clone());
         let state = AppState {
             catalog_path: db.clone(),
-            mounts: crate::mounts::MountResolver::Fixed(mounts),
+            mounts: crate::mounts::MountResolver::Fixed(mounts.clone()),
             csrf_token: "T".into(),
             scan_queue: crate::scan_queue::ScanQueue::new(db.clone()),
+            // Same resolver the rest of the state uses. Handing the queue an empty one would make
+            // every job fail with "drive not connected" while the request path looked fine.
+            quarantine_queue: crate::quarantine_queue::QuarantineQueue::new(
+                db.clone(),
+                crate::mounts::MountResolver::Fixed(mounts),
+            ),
         };
 
         let cat = crate::catalog::Catalog::open_readonly(&db).unwrap();
@@ -2678,6 +2693,12 @@ mod tests {
             mounts: crate::mounts::MountResolver::Fixed(std::collections::HashMap::new()),
             csrf_token: "T".into(),
             scan_queue: crate::scan_queue::ScanQueue::new(db.clone()),
+            // Same (empty) resolver the rest of this state uses: these fixtures deliberately mount
+            // nothing, and the queue must agree with the request path about that.
+            quarantine_queue: crate::quarantine_queue::QuarantineQueue::new(
+                db.clone(),
+                crate::mounts::MountResolver::Fixed(std::collections::HashMap::new()),
+            ),
         };
 
         let (status, _) = post_json(
@@ -2731,9 +2752,15 @@ mod tests {
         mounts.insert("vol-1".to_string(), drive.clone());
         let state = AppState {
             catalog_path: db.clone(),
-            mounts: crate::mounts::MountResolver::Fixed(mounts),
+            mounts: crate::mounts::MountResolver::Fixed(mounts.clone()),
             csrf_token: "T".into(),
             scan_queue: crate::scan_queue::ScanQueue::new(db.clone()),
+            // Same resolver the rest of the state uses. Handing the queue an empty one would make
+            // every job fail with "drive not connected" while the request path looked fine.
+            quarantine_queue: crate::quarantine_queue::QuarantineQueue::new(
+                db.clone(),
+                crate::mounts::MountResolver::Fixed(mounts),
+            ),
         };
 
         let cat = crate::catalog::Catalog::open_readonly(&db).unwrap();
@@ -2796,9 +2823,16 @@ mod tests {
             mounts: crate::mounts::MountResolver::Fixed(std::collections::HashMap::new()),
             csrf_token: "T".into(),
             scan_queue: crate::scan_queue::ScanQueue::new(db.clone()),
+            // Same (empty) resolver the rest of this state uses: these fixtures deliberately mount
+            // nothing, and the queue must agree with the request path about that.
+            quarantine_queue: crate::quarantine_queue::QuarantineQueue::new(
+                db.clone(),
+                crate::mounts::MountResolver::Fixed(std::collections::HashMap::new()),
+            ),
         };
         // must run the worker for the enqueued job to progress
         tokio::spawn(state.scan_queue.clone().run_worker());
+        tokio::spawn(state.quarantine_queue.clone().run_worker());
 
         let (status, json) = post_json(
             state.clone(),
@@ -3822,9 +3856,15 @@ mod tests {
         mounts.insert("vol-1".to_string(), drive);
         let state = AppState {
             catalog_path: db.clone(),
-            mounts: crate::mounts::MountResolver::Fixed(mounts),
+            mounts: crate::mounts::MountResolver::Fixed(mounts.clone()),
             csrf_token: "T".into(),
             scan_queue: crate::scan_queue::ScanQueue::new(db.clone()),
+            // Same resolver the rest of the state uses. Handing the queue an empty one would make
+            // every job fail with "drive not connected" while the request path looked fine.
+            quarantine_queue: crate::quarantine_queue::QuarantineQueue::new(
+                db.clone(),
+                crate::mounts::MountResolver::Fixed(mounts),
+            ),
         };
         (tmp, db, state)
     }
@@ -4022,8 +4062,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quarantine_tree_moves_the_folder_and_clears_the_group() {
+    async fn quarantining_is_queued_and_the_worker_completes_it() {
+        // The POST now ENQUEUES rather than doing the work, so a reviewer can confirm the next
+        // folder immediately instead of waiting (#66). The request returns a position; the worker
+        // does the move. Both halves matter, so this drives the whole path.
         let (_t, db, state) = seed_identical_trees();
+        tokio::spawn(state.quarantine_queue.clone().run_worker());
         let app = build_router_with(state.clone());
         let res = app
             .oneshot(
@@ -4040,14 +4084,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), axum::http::StatusCode::OK);
-        assert!(_t.path().join("driveA/_ToDelete/copy/a.txt").is_file());
+        let bytes = axum::body::to_bytes(res.into_body(), 100_000)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["queued"], true,
+            "the request must return immediately, queued"
+        );
+        assert_eq!(v["position"], 0, "nothing else pending, so it starts next");
+
+        // The worker runs on its own; wait for the move rather than assuming an instant.
+        let moved = _t.path().join("driveA/_ToDelete/copy/a.txt");
+        for _ in 0..200 {
+            if moved.is_file() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            moved.is_file(),
+            "the queued quarantine must actually happen"
+        );
         assert!(!_t.path().join("driveA/copy").exists());
 
-        // The endpoint rebuilds the trees, so the group must be gone -- otherwise the UI would keep
-        // offering a pair whose other side is already in _ToDelete.
-        let v = get_json_state(state, "/api/tree-duplicates").await;
-        assert!(v["groups"].as_array().unwrap().is_empty());
-        let _ = db;
+        let cat = crate::catalog::Catalog::open(&db).unwrap();
+        let rows = cat.quarantined_rows("vol-1").unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the catalogue must be updated, not just the disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn several_folders_can_be_queued_without_waiting_for_each_other() {
+        // The actual complaint: with 1,201 decisions to make, confirming one must not block the
+        // next. Three requests, none of which waits for the work to finish.
+        let (_t, _db, state) = seed_identical_trees();
+        let q = state.quarantine_queue.clone();
+        for p in ["copy", "orig", "copy"] {
+            let app = build_router_with(state.clone());
+            let res = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("POST")
+                        .uri("/api/quarantine-tree")
+                        .header("content-type", "application/json")
+                        .header("x-cleanup-token", "T")
+                        .body(axum::body::Body::from(format!(
+                            r#"{{"volume_id":"vol-1","path":"{p}"}}"#
+                        )))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), axum::http::StatusCode::OK);
+        }
+        // Worker deliberately not started: this asserts the REQUESTS do not block on the work.
+        let st = q.status();
+        assert_eq!(
+            st.pending.len(),
+            2,
+            "two distinct folders queued; the repeated one must not queue twice"
+        );
     }
 
     #[tokio::test]
