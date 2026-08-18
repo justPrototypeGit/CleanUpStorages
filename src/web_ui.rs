@@ -822,7 +822,8 @@ pub fn review_page(csrf: &str) -> String {
     <p class="mut" style="font-size:12px;margin:0 0 12px">Whole folders whose contents match exactly.
       Confirming one moves the entire folder to <span class="mono">_ToDelete</span> in a single
       rename — the other copy stays where it is, and nothing is deleted until you purge.</p>
-    <div id="treelist"></div>
+    <div class="mut" id="qstatus" style="display:none;font-size:12.5px;margin-bottom:10px"></div>
+  <div id="treelist"></div>
   <div id="treeblocked"></div>
   </section>
   <div id="group"></div>
@@ -1031,22 +1032,60 @@ function renderGroups(groups, host, append){
   }
 }
 async function confirmTree(group,member,btn){
-  if(!confirm("Move this entire folder to _ToDelete?\n\n"+member.volume_label+" / "+member.path+
-      "\n"+fmtN(group.file_count)+" files, "+fmtB(member.total_bytes)+
-      "\n\nThe other copy stays where it is. Nothing is deleted until you purge.")) return;
-  btn.disabled=true;
+  // The confirm stays per item: the blast radius must be shown before anything is queued. What
+  // changed is what happens after -- the request only ENQUEUES, so the reviewer can confirm the
+  // next folder straight away instead of waiting out a move of 326,569 files (#66).
+  if(!confirm("Move this entire folder to _ToDelete?
+
+"+member.volume_label+" / "+member.path+
+      "
+"+fmtN(group.file_count)+" files, "+fmtB(member.total_bytes)+
+      "
+
+The other copy stays where it is. Nothing is deleted until you purge.")) return;
+  btn.disabled=true; btn.textContent="Queued";
   try{
-    const r=await apiPost("/api/quarantine-tree",{volume_id:member.volume_id,path:member.path});
-    $("#msg").textContent=fmtN(r.files_updated)+" files moved to "+r.dest+".";
-    await loadTrees();
+    await apiPost("/api/quarantine-tree",{volume_id:member.volume_id,path:member.path});
+    pollQuarantine();
   }catch(e){
-    // apiPost throws on non-2xx; a refusal (tree no longer active, wrong drive, drive unplugged)
-    // lands here and must be shown, not swallowed.
-    $("#msg").textContent="Could not quarantine: "+e.message;
-    btn.disabled=false;
+    // apiPost throws on non-2xx; a rejected REQUEST lands here. Failures from the worker surface
+    // through the status poll instead, since by then the request has long since returned.
+    $("#msg").textContent="Could not queue: "+e.message;
+    btn.disabled=false; btn.textContent="Quarantine this copy";
   }
 }
+
+let qTimer=null, qWasBusy=false;
+async function pollQuarantine(){
+  if(qTimer) return;                       // one poller is enough
+  const tick=async()=>{
+    let st; try{ st=await apiGet("/api/quarantine/status"); }catch(e){ return; }
+    const busy=!!st.running || st.pending.length>0;
+    const bar=$("#qstatus");
+    if(busy){
+      const now=st.running?st.running.path:"";
+      bar.textContent="Quarantining "+now+(st.pending.length?" — "+st.pending.length+" queued":"");
+      bar.style.display="";
+    }else{ bar.style.display="none"; }
+    // Worker failures have to reach the user: they clicked, and it did not happen. A tree that is
+    // no longer wholly active, or a drive swapped mid-queue, is refused rather than forced.
+    const failed=st.recent.filter(r=>r.error_message);
+    if(failed.length){
+      $("#msg").textContent=failed.length+" could not be quarantined — "+failed[0].error_message;
+    }else if(st.recent.length){
+      const done=st.recent.filter(r=>!r.error_message).length;
+      $("#msg").textContent=done+" folder"+(done===1?"":"s")+" moved to _ToDelete.";
+    }
+    // Refresh only once the queue drains: the worker rebuilds the folder index at that point, so
+    // reloading earlier would show a list that is about to change again.
+    if(qWasBusy && !busy){ clearInterval(qTimer); qTimer=null; await loadTrees(); }
+    qWasBusy=busy;
+  };
+  await tick();
+  qTimer=setInterval(tick, 1500);
+}
 loadTrees();
+pollQuarantine();
 load();"##;
     shell("duplicates", csrf, "Review duplicates", main, script)
 }
