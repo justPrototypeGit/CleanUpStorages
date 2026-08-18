@@ -126,15 +126,7 @@ pub fn quarantine_tree(
             .collect::<Result<Vec<_>, _>>()?;
         let mut survivor = None;
         for (vid, p) in &twins {
-            let like = like_prefix(p);
-            let live: i64 = cat.conn.query_row(
-                "SELECT COUNT(*) FROM files
-                  WHERE volume_id=?1 AND status='active'
-                    AND (relative_path=?2 OR relative_path LIKE ?3 ESCAPE '\\')",
-                rusqlite::params![vid, p, like],
-                |r| r.get(0),
-            )?;
-            if live > 0 {
+            if tree_is_live(cat, vid, p)? {
                 survivor = Some((vid.clone(), p.clone()));
                 break;
             }
@@ -242,6 +234,50 @@ pub fn quarantine_tree(
         files_updated,
         dest_relative_path: dest_rel,
     })
+}
+
+/// Does `tree_path` on `volume_id` still hold at least one active file?
+///
+/// Two storage shapes, because a folder inside an archive is not stored under its own path: its
+/// rows carry the ARCHIVE in `relative_path` and the path within it in `container_chain`. Asking
+/// only the loose question -- `relative_path LIKE '<tree>/%'` -- reports every archived copy as
+/// gone, which made the last-copy guard refuse the one loose copy of a folder whose other copies
+/// all lived in zips. On the real catalogue that is most of them: 39,788 of 55,511 duplicated
+/// folders have every copy inside an archive. It refused too much rather than too little, so
+/// nothing was ever at risk, but it blocked the review work it was meant to protect.
+///
+/// The archive is always one of the `/`-separated prefixes of the path, so the prefixes are walked
+/// rather than deriving it from `directory_trees.archive_root` -- that column is not always
+/// populated, and a guard that silently depends on it fails open in exactly the confusing way this
+/// is fixing. Each probe is an equality on `(volume_id, relative_path)`, which both file indexes
+/// cover.
+fn tree_is_live(cat: &Catalog, volume_id: &str, tree_path: &str) -> anyhow::Result<bool> {
+    let loose: i64 = cat.conn.query_row(
+        "SELECT COUNT(*) FROM files
+          WHERE volume_id=?1 AND status='active'
+            AND (relative_path=?2 OR relative_path LIKE ?3 ESCAPE '\\')",
+        rusqlite::params![volume_id, tree_path, like_prefix(tree_path)],
+        |r| r.get(0),
+    )?;
+    if loose > 0 {
+        return Ok(true);
+    }
+    for (idx, _) in tree_path.match_indices('/') {
+        let (archive, rest) = tree_path.split_at(idx);
+        let inner = &rest[1..];
+        let n: i64 = cat.conn.query_row(
+            "SELECT COUNT(*) FROM files
+              WHERE volume_id=?1 AND status='active' AND relative_path=?2
+                AND container_chain IS NOT NULL
+                AND (container_chain=?3 OR container_chain LIKE ?4 ESCAPE '\\')",
+            rusqlite::params![volume_id, archive, inner, like_prefix(inner)],
+            |r| r.get(0),
+        )?;
+        if n > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// `path` turned into a LIKE pattern matching everything beneath it.
@@ -709,6 +745,58 @@ mod tests {
             "the survivor must still be on the drive"
         );
         let _ = tmp;
+    }
+
+    /// The loose copy of a folder whose only other copies are inside zips must still be movable.
+    ///
+    /// Reported from the real catalogue: a folder with four surviving twins, every one of them
+    /// inside an archive, and the single actionable button in the group refused with "it is the
+    /// last remaining copy". The guard looked for twins by `relative_path`, but an archived twin
+    /// stores the ARCHIVE in `relative_path` and its own path in `container_chain`, so every twin
+    /// read as gone. Nothing was ever at risk -- it refused too much, not too little -- but it
+    /// blocked most of the review work: 39,788 of 55,511 duplicated folders on that catalogue have
+    /// every copy inside an archive.
+    #[test]
+    fn the_loose_copy_can_move_when_its_only_twins_are_inside_archives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("drive");
+        fs::create_dir_all(root.join("loose/Photos")).unwrap();
+        fs::write(root.join(".cleanupstorages_id"), "vol-1").unwrap();
+        fs::write(root.join("loose/Photos/a.txt"), b"AAA").unwrap();
+        fs::write(root.join("backup.zip"), b"ZIP").unwrap();
+        let cat = Catalog::open(&tmp.path().join("c.db")).unwrap();
+        cat.upsert_volume(&Volume {
+            volume_id: "vol-1".into(),
+            label: "D".into(),
+            identified_by: "marker".into(),
+            first_seen_at: 1,
+            last_seen_at: 1,
+        })
+        .unwrap();
+        // The loose copy, and the same content inside a zip. Identical hashes, so the two folders
+        // are twins; only the loose one can ever be renamed.
+        cat.conn
+            .execute_batch(
+                "INSERT INTO files(volume_id, relative_path, filename, extension, size_bytes,
+                     content_hash, category, container_chain, status, first_seen_at, last_seen_at)
+                 VALUES ('vol-1','loose/Photos/a.txt','a.txt','txt',3,'H','document',NULL,
+                         'active',100,100);
+                 INSERT INTO files(volume_id, relative_path, filename, extension, size_bytes,
+                     content_hash, category, container_chain, status, first_seen_at, last_seen_at)
+                 VALUES ('vol-1','backup.zip','a.txt','txt',3,'H','document','Photos/a.txt',
+                         'active',100,100);",
+            )
+            .unwrap();
+        cat.rebuild_directory_trees("vol-1", 150).unwrap();
+
+        let out = quarantine_tree(&cat, &root, "vol-1", "loose/Photos", 200)
+            .expect("the archived twin is a surviving copy, so this must be allowed");
+        assert_eq!(out.files_updated, 1);
+        assert!(
+            !root.join("loose/Photos").exists(),
+            "the loose copy must have moved"
+        );
+        assert!(root.join("backup.zip").exists(), "the archive is untouched");
     }
 
     #[test]
