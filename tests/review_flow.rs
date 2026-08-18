@@ -16,7 +16,11 @@ fn start(state_db: std::path::PathBuf, drive: std::path::PathBuf) -> std::net::S
                 catalog_path: state_db.clone(),
                 mounts: cleanupstorages::mounts::MountResolver::Fixed(mounts),
                 csrf_token: "TESTTOKEN".to_string(),
-                scan_queue: cleanupstorages::scan_queue::ScanQueue::new(state_db),
+                scan_queue: cleanupstorages::scan_queue::ScanQueue::new(state_db.clone()),
+                quarantine_queue: cleanupstorages::quarantine_queue::QuarantineQueue::new(
+                    state_db,
+                    cleanupstorages::mounts::MountResolver::Fixed(Default::default()),
+                ),
             };
             let app = cleanupstorages::web::build_router_with(state);
             let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))

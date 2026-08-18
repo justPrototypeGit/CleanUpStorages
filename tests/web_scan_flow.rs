@@ -18,6 +18,10 @@ fn start(db: std::path::PathBuf) -> std::net::SocketAddr {
                 ),
                 csrf_token: "TESTTOKEN".to_string(),
                 scan_queue: cleanupstorages::scan_queue::ScanQueue::new(db.clone()),
+                quarantine_queue: cleanupstorages::quarantine_queue::QuarantineQueue::new(
+                    db.clone(),
+                    cleanupstorages::mounts::MountResolver::Fixed(std::collections::HashMap::new()),
+                ),
             };
             tokio::spawn(state.scan_queue.clone().run_worker());
             let app = cleanupstorages::web::build_router_with(state);
